@@ -1531,7 +1531,7 @@ TEST(ParameterValidation, AnAllowlistedTopicWithNoRuleTakesItsTypesDefaultRate) 
   auto node = std::make_shared<cognitive3d_ros::Cognitive3DNode>(options);
   ASSERT_EQ(node->configure().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE)
       << node->configure_error();
-  EXPECT_DOUBLE_EQ(node->resolved_plan().Resolve("/odom", "nav_msgs/msg/Odometry").rate_hz, 10.0);
+  EXPECT_DOUBLE_EQ(node->resolved_plan().Resolve("/odom", "nav_msgs/msg/Odometry").rate_hz, 30.0);
   EXPECT_DOUBLE_EQ(
       node->resolved_plan().Resolve("/joint_states", "sensor_msgs/msg/JointState").rate_hz, 2.0);
   node->cleanup();
@@ -3351,7 +3351,7 @@ TEST(GazeFrame, TheFrameItsConventionAndItsFailuresAreRecordedUnderTheGazeFrameN
 
 // The node gates every camera frame and every translated message on when it ARRIVED, by its own
 // clock. A camera whose driver never sets the stamp therefore records at its configured rate
-// rather than one frame per session, and an allowlisted odometry topic at its type's 10 Hz.
+// rather than one frame per session, and an allowlisted odometry topic at its type's 30 Hz.
 TEST(NodeRateGates, AZeroStampedCameraAndAnOdometryTopicAreGatedOnArrival) {
   const auto dir = fs::temp_directory_path() / ("c3d_arrival_" + std::to_string(::getpid()));
   fs::create_directories(dir);
@@ -3405,15 +3405,19 @@ TEST(NodeRateGates, AZeroStampedCameraAndAnOdometryTopicAreGatedOnArrival) {
   frame.data.assign(8 * 8 * 3, 64);
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(6000);
   auto next_frame = std::chrono::steady_clock::now();
+  auto next_odometry = next_frame;
   int published = 0;
   while (std::chrono::steady_clock::now() < deadline) {
-    if (std::chrono::steady_clock::now() >= next_frame) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= next_frame) {
       image->publish(frame);
-      nav_msgs::msg::Odometry speed;
+      next_frame += std::chrono::milliseconds(50);
+    }
+    if (now >= next_odometry) {
+      nav_msgs::msg::Odometry speed;  // a new value each time: sensors are change-gated
       speed.twist.twist.linear.x = 0.01 * published++;
       odometry->publish(speed);
-      odometry->publish(speed);
-      next_frame += std::chrono::milliseconds(50);
+      next_odometry += std::chrono::milliseconds(10);
     }
     executor.spin_some(std::chrono::milliseconds(5));
   }
@@ -3434,8 +3438,8 @@ TEST(NodeRateGates, AZeroStampedCameraAndAnOdometryTopicAreGatedOnArrival) {
       }
     }
   }
-  EXPECT_GE(speeds, 30u) << "odometry at 40 Hz into its type's 10 Hz gate";
-  EXPECT_LE(speeds, 62u);
+  EXPECT_GE(speeds, 90u) << "odometry at 100 Hz into its type's 30 Hz gate";
+  EXPECT_LE(speeds, 186u) << "a 30 Hz gate over about six seconds";
   std::error_code ec;
   fs::remove_all(dir, ec);
 }
@@ -3512,8 +3516,8 @@ TEST(NodeRateGates, UnderSimTimeOnWireTheRateIsPerSimulatedSecond) {
       }
     }
   }
-  EXPECT_GE(speeds, 5u) << "the odometry topic was barely recorded";
-  EXPECT_LE(speeds, 16u) << "10 Hz per simulated second, over about one simulated second";
+  EXPECT_GE(speeds, 15u) << "the odometry topic was barely recorded";
+  EXPECT_LE(speeds, 40u) << "30 Hz per simulated second, over about one simulated second";
   std::error_code ec;
   fs::remove_all(dir, ec);
 }

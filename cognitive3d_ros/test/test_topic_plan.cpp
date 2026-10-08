@@ -77,8 +77,6 @@ TEST(TopicPlan, BulkTypeCanBeOptedInByExactTopic) {
 
 TEST(TopicPlan, TypeDefaultsAreConservative) {
   double rate = 0.0;
-  EXPECT_EQ(DefaultIngestForType("tf2_msgs/msg/TFMessage", &rate), Ingest::kDownsample);
-  EXPECT_DOUBLE_EQ(rate, 10.0);
   EXPECT_EQ(DefaultIngestForType("sensor_msgs/msg/PointCloud2", &rate), Ingest::kRefuse);
   EXPECT_EQ(DefaultIngestForType("sensor_msgs/msg/LaserScan", &rate), Ingest::kDeriveMetrics);
   EXPECT_EQ(DefaultIngestForType("sensor_msgs/msg/CameraInfo", &rate), Ingest::kMetadataOnce);
@@ -187,8 +185,29 @@ TEST(TopicPlan, ParseIngestRejectsGarbage) {
   EXPECT_FALSE(ParseIngest("everything_please", &out));
 }
 
+// The rates the documentation states for each message type. The robot's motion and its plain
+// sensors record at the pose timeline's 30 Hz; batteries and laser scan summaries at 1 Hz, as does
+// every other type, tf among them.
+TEST(TopicPlan, TypeDefaultRates) {
+  const auto rate_of = [](const std::string& type) {
+    double rate = 0.0;
+    DefaultIngestForType(type, &rate);
+    return rate;
+  };
+  for (const char* type : {"nav_msgs/msg/Odometry", "sensor_msgs/msg/JointState",
+                           "sensor_msgs/msg/Imu", "std_msgs/msg/Float32",
+                           "std_msgs/msg/Int32MultiArray"}) {
+    EXPECT_DOUBLE_EQ(rate_of(type), 30.0) << type;
+  }
+  for (const char* type : {"sensor_msgs/msg/BatteryState", "sensor_msgs/msg/LaserScan",
+                           "nav2_msgs/msg/BehaviorTreeLog", "tf2_msgs/msg/TFMessage",
+                           "geometry_msgs/msg/Twist"}) {
+    EXPECT_DOUBLE_EQ(rate_of(type), 1.0) << type;
+  }
+}
+
 // An allowlist entry with no rule of its own takes its message type's default, so `/odom` in the
-// minimal file records at odometry's 10 Hz rather than a flat 1 Hz.
+// minimal file records at odometry's 30 Hz rather than a flat 1 Hz.
 TEST(TopicPlan, AValueTheRuleLeavesOutIsTheMessageTypesDefault) {
   TopicPlan plan;
   TopicRule odom;
@@ -204,7 +223,7 @@ TEST(TopicPlan, AValueTheRuleLeavesOutIsTheMessageTypesDefault) {
   plan.AddRule(joints);
 
   const TopicRule resolved_odom = plan.Resolve("/odom", "nav_msgs/msg/Odometry");
-  EXPECT_DOUBLE_EQ(resolved_odom.rate_hz, 10.0);
+  EXPECT_DOUBLE_EQ(resolved_odom.rate_hz, 30.0);
   EXPECT_EQ(resolved_odom.ingest, Ingest::kDownsample);
   EXPECT_TRUE(resolved_odom.rate_from_type);
   EXPECT_TRUE(resolved_odom.ingest_from_type);

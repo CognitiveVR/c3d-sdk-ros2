@@ -666,32 +666,32 @@ TEST_F(TranslatorTest, ImuAndScanEachDecimateToTheConfiguredRate) {
 }
 
 // A source at the gate's own rate is delivered at that rate, jitter and all, so the message type
-// defaults the reference file states -- odometry 10 Hz, joint states 5 Hz -- are what a session
+// defaults the reference file states -- odometry and joint states at 30 Hz -- are what a session
 // carries. Scheduling each deadline from the accepted time would deliver about two thirds.
 TEST_F(TranslatorTest, ASourceAtTheGateRateIsDeliveredAtThatRate) {
   OdometryTranslator odometry;
   JointStateTranslator joints;
-  for (int i = 0; i < 200; ++i) {  // twenty seconds at 10 Hz, arriving up to 2 ms either side
+  for (int i = 0; i < 600; ++i) {  // twenty seconds at 30 Hz, arriving up to 2 ms either side
     nav_msgs::msg::Odometry message;
     message.twist.twist.linear.x = 0.01 * i;  // a new value each time: sensors are change-gated
     const double jitter = (i % 2 == 0 ? 1.0 : -1.0) * 0.0005 * (i % 5);
-    odometry.Translate(Serialize(message), Ctx("/odom", 1000.0 + 0.1 * i + jitter, 10.0),
+    odometry.Translate(Serialize(message), Ctx("/odom", 1000.0 + i / 30.0 + jitter, 30.0),
                        *runner_);
   }
-  for (int i = 0; i < 100; ++i) {  // twenty seconds at 5 Hz
+  for (int i = 0; i < 600; ++i) {
     sensor_msgs::msg::JointState message;
     message.name = {"j1"};
     message.effort = {1.0 + i};
     const double jitter = (i % 2 == 0 ? -1.0 : 1.0) * 0.0005 * (i % 5);
-    joints.Translate(Serialize(message), Ctx("/joint_states", 1000.0 + 0.2 * i + jitter, 5.0),
-                     *runner_);
+    joints.Translate(Serialize(message),
+                     Ctx("/joint_states", 1000.0 + i / 30.0 + jitter, 30.0), *runner_);
   }
   Flush();
   const auto series = SensorSeriesIn(*transport_);
   ASSERT_EQ(series.count("odom.speed"), 1u);
-  EXPECT_GE(series.at("odom.speed").size(), 195u) << "of 200 at 10 Hz into a 10 Hz gate";
+  EXPECT_GE(series.at("odom.speed").size(), 585u) << "of 600 at 30 Hz into a 30 Hz gate";
   ASSERT_EQ(series.count("joints.effort_rms"), 1u);
-  EXPECT_GE(series.at("joints.effort_rms").size(), 97u) << "of 100 at 5 Hz into a 5 Hz gate";
+  EXPECT_GE(series.at("joints.effort_rms").size(), 585u) << "of 600 at 30 Hz into a 30 Hz gate";
 }
 
 // A translator's gate reads the arrival clock the node hands it, never the time a record

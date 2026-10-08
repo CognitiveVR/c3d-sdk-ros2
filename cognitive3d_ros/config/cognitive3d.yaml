@@ -68,7 +68,7 @@
     # type's default.
     # topic_config:
     #   odom:
-    #     rate_hz: -1.0                 # 0 or less: the type's default (odometry 10 Hz)
+    #     rate_hz: -1.0                 # 0 or less: the type's default (odometry 30 Hz)
     #     ingest: ""                    # only refuse and full_ingest have an effect
     #     series: ""                    # Float32 and Int32MultiArray topics only
     #     qos:
