@@ -84,16 +84,30 @@ struct PoseSamplerConfig {
   // sets it from `rate_hz` with StaleTransformAfterSeconds. A static transform, stamped zero, is
   // never stale.
   double stale_transform_after_s = 0.0;
-  // A map-frame position moving further than this between samples is a
-  // relocalisation jump, not motion.
+
+  // How far apart, on the wire's clock, the two poses a relocalisation check compares are: about
+  // this far at a `rate_hz` of 10 or more, and consecutive samples below it (see
+  // RelocalisationCheckDue). The thresholds below are sized against it, which is why it is not a
+  // parameter.
   //
-  // Per SAMPLE, not per second, so the legitimate motion it has to clear scales
-  // with `rate_hz`: at the default 10 Hz a 0.5 m step is 5 m/s, faster than any
-  // indoor base. Halving the sample rate doubles what one honest sample covers.
+  // Consecutive samples are the wrong pair at a higher rate. A localiser that future-dates its
+  // transform, as nav2_amcl does by its `transform_tolerance`, is interpolated by tf2 between two
+  // of its updates, so one correction reaches the pose as a ramp an update period long. Behind
+  // scans at 7 Hz, a 90 degree correction sampled at 30 Hz is about 25 degrees per sample, and no
+  // per-sample threshold that also lets a fast turn through can see it.
+  static constexpr double kRelocalisationCheckIntervalS = 0.1;
+
+  // A map-frame position moving further than this between two relocalisation
+  // checks is a relocalisation jump, not motion.
+  //
+  // Per CHECK, not per second, so the legitimate motion it has to clear is what a
+  // base covers in one check interval: 0.1 s at 10 Hz and above, where a 0.5 m
+  // step is 5 m/s, faster than any indoor base. Below 10 Hz the interval is one
+  // sample, and halving the sample rate doubles what one honest sample covers.
   double relocalisation_jump_m = 0.5;
 
-  // A map-frame ORIENTATION turning further than this between samples is a
-  // relocalisation jump, not rotation.
+  // A map-frame ORIENTATION turning further than this between two relocalisation
+  // checks is a relocalisation jump, not rotation.
   //
   // Position alone cannot see the jump this exists for. A localiser that
   // re-registers against a rotationally ambiguous room re-estimates its yaw by
@@ -103,18 +117,20 @@ struct PoseSamplerConfig {
   // an unannotated turn corrupts the spatial timeline itself rather than inflating
   // a travel metric.
   //
-  // 45 degrees, per sample, chosen against both sides:
-  //   - Legitimate rotation has to pass underneath it. At the default 10 Hz a
-  //     base spinning at its own limit -- 1.90 rad/s, 109 deg/s, a TurtleBot 4
-  //     flat out -- covers 11 degrees per sample, and 45 leaves room for a timer
-  //     that slipped a whole period and for a base twice that fast. Sustained,
-  //     45 degrees per sample is 450 deg/s, which no ground robot does.
+  // 45 degrees, per check, chosen against both sides:
+  //   - Legitimate rotation has to pass underneath it. A base spinning at its own
+  //     limit -- 1.90 rad/s, 109 deg/s, a TurtleBot 4 flat out -- covers 11
+  //     degrees in 0.1 s, and 45 leaves room for a check that came a whole period
+  //     late and for a base twice that fast. Sustained, 45 degrees per 0.1 s is
+  //     450 deg/s, which no ground robot does.
   //   - A real jump has to reach it. A localiser re-registering against an
   //     ambiguous room re-estimates its yaw by a right angle, so the threshold
-  //     sits at half of that with the margin on the right side.
-  // Like `relocalisation_jump_m` this is per sample, so lowering `rate_hz` from
-  // the default requires raising this with it: each sample then covers more of a
-  // turn, and a fast one would read as a jump.
+  //     sits at half of that with the margin on the right side. A correction that
+  //     tf2 spreads over longer than one interval is split between two checks and
+  //     can reach the threshold in neither, at any `rate_hz`.
+  // Like `relocalisation_jump_m` this is per check, so a `rate_hz` below 10 Hz
+  // requires raising this with it: each sample then covers more of a turn, and a
+  // fast one would read as a jump.
   double relocalisation_jump_deg = 45.0;
 
   std::string robot_display_name = "Robot";
@@ -136,6 +152,12 @@ struct PoseSamplerConfig {
 // ten sample periods, and never under five seconds, which clears a localiser that publishes at
 // 0.5 Hz without future-dating its transform.
 double StaleTransformAfterSeconds(double rate_hz);
+
+// Whether a relocalisation check is due, `elapsed_s` after the pose it compares against. Due at
+// kRelocalisationCheckIntervalS less a tenth of a sample period (of the interval, below 10 Hz),
+// so a sample that arrives a little early is still the one checked: a 30 Hz timer checks every
+// third sample and never slips to every sixth, and below 10 Hz every sample is checked.
+bool RelocalisationCheckDue(double elapsed_s, double rate_hz);
 
 // The event-cap source key the pose channel's own events are charged to. Not a
 // topic name and unable to collide with one, because these come from the tf tree.
@@ -243,10 +265,14 @@ class PoseSampler {
   std::string active_reference_frame_;
   bool have_last_ = false;
   c3d::Vec3 last_position_;
-  // Guarded by `have_last_`, like `last_position_`, and set in the same place:
-  // a rotation kept across a frame change would compare an orientation in `map`
-  // against one in `odom` and report the difference between the frames as a jump.
-  c3d::Quat last_rotation_;
+  // The pose the next relocalisation check compares against, and the wire time it was taken at.
+  // Cleared wherever `have_last_` is: a pose kept across a frame change would compare `map`
+  // against `odom` and report the difference between the frames as a jump, and one kept across
+  // a stale stretch or a session restart would report the motion in between as one.
+  bool have_jump_anchor_ = false;
+  c3d::Vec3 jump_anchor_position_;
+  c3d::Quat jump_anchor_rotation_;
+  double jump_anchor_time_ = 0.0;
   std::uint64_t relocalisation_jumps_ = 0;
   std::uint64_t lookup_failures_ = 0;
   std::uint64_t stale_transforms_ = 0;

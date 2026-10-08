@@ -212,8 +212,15 @@ double StaleTransformAfterSeconds(double rate_hz) {
   return std::max(5.0, periods);
 }
 
+bool RelocalisationCheckDue(double elapsed_s, double rate_hz) {
+  constexpr double kInterval = PoseSamplerConfig::kRelocalisationCheckIntervalS;
+  const double period = rate_hz > 0.0 ? 1.0 / rate_hz : kInterval;
+  return elapsed_s >= kInterval - 0.1 * std::min(kInterval, period);
+}
+
 void PoseSampler::Reset() {
   have_last_ = false;
+  have_jump_anchor_ = false;
   relocalisation_jumps_ = 0;
   lookup_failures_ = 0;
   stale_transforms_ = 0;
@@ -400,6 +407,7 @@ bool PoseSampler::Sample(double wire_time, SessionRunner& runner, std::string* s
       // The next fresh pose is compared with nothing, rather than with a pose from before the
       // gap: a robot that moved while its transform was stale did not jump.
       have_last_ = false;
+      have_jump_anchor_ = false;
       if (status_out) {
         std::ostringstream stale;
         stale << used_frame << " -> " << config_.robot_frame << " has not advanced for "
@@ -425,6 +433,7 @@ bool PoseSampler::Sample(double wire_time, SessionRunner& runner, std::string* s
       RecordEvent(wire_time, runner, "robot.reference_frame_changed", position, true,
                   std::move(props));
       have_last_ = false;
+      have_jump_anchor_ = false;
     } else if (!config_.preferred_reference_frame.empty() &&
                used_frame != config_.preferred_reference_frame) {
       // STARTING on the fallback is not a transition, so the branch above cannot see it -- and it
@@ -452,12 +461,24 @@ bool PoseSampler::Sample(double wire_time, SessionRunner& runner, std::string* s
   // One event type for both, and one counter. A reader already handling
   // `robot.localisation_jump` keeps working and gains a property; a second event
   // name would have to be discovered before it could be ignored.
-  if (have_last_ && used_frame == config_.preferred_reference_frame) {
-    const double dx = position.x - last_position_.x;
-    const double dy = position.y - last_position_.y;
-    const double dz = position.z - last_position_.z;
+  //
+  // Compared with the pose one check interval back, not with the previous sample,
+  // and then compared from here: a correction tf2 spreads over a few samples is
+  // seen whole, and a discrete one is seen once. A wire time earlier than the
+  // anchor's is a clock that went back, and the anchor is taken again.
+  const bool on_preferred_frame = used_frame == config_.preferred_reference_frame;
+  if (on_preferred_frame && (!have_jump_anchor_ || wire_time < jump_anchor_time_)) {
+    have_jump_anchor_ = true;
+    jump_anchor_position_ = position;
+    jump_anchor_rotation_ = rotation;
+    jump_anchor_time_ = wire_time;
+  } else if (on_preferred_frame &&
+             RelocalisationCheckDue(wire_time - jump_anchor_time_, config_.rate_hz)) {
+    const double dx = position.x - jump_anchor_position_.x;
+    const double dy = position.y - jump_anchor_position_.y;
+    const double dz = position.z - jump_anchor_position_.z;
     const double step = std::sqrt(dx * dx + dy * dy + dz * dz);
-    const double turn_deg = AngleBetweenDegrees(last_rotation_, rotation);
+    const double turn_deg = AngleBetweenDegrees(jump_anchor_rotation_, rotation);
     const bool moved = step > config_.relocalisation_jump_m;
     const bool turned = turn_deg > config_.relocalisation_jump_deg;
     // A sample that trips both is ONE jump, not two: it is one discontinuity in
@@ -477,9 +498,11 @@ bool PoseSampler::Sample(double wire_time, SessionRunner& runner, std::string* s
       RecordEvent(wire_time, runner, "robot.localisation_jump", position, true,
                   std::move(props));
     }
+    jump_anchor_position_ = position;
+    jump_anchor_rotation_ = rotation;
+    jump_anchor_time_ = wire_time;
   }
   last_position_ = position;
-  last_rotation_ = rotation;
   have_last_ = true;
 
   // The gaze channel. Robots have no eyes, but they have a forward axis, and this

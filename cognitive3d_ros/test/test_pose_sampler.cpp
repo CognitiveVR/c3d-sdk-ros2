@@ -6,9 +6,12 @@
 #include <nlohmann/json.hpp>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <filesystem>
+#include <string>
+#include <vector>
 
 #include "c3d/spool.hpp"
 #include "cognitive3d_ros/pose_sampler.hpp"
@@ -488,9 +491,9 @@ TEST_F(PoseSamplerTest, DetectsAJumpThatIsPureRotation) {
 
 // The other side of the same threshold, and the reason it is not simply small.
 // A base spinning in place at 200 deg/s -- faster than a TurtleBot 4's own limit
-// of 109 -- covers 20 degrees between samples at 10 Hz, and every one of those
-// samples is the robot doing what it was told. A detector that fired here would
-// annotate an honest pirouette as corrupt data six times over.
+// of 109 -- covers 20 degrees in the 0.1 s a relocalisation check spans, and every
+// one of those samples is the robot doing what it was told. A detector that fired
+// here would annotate an honest pirouette as corrupt data six times over.
 TEST_F(PoseSamplerTest, ALegitimateFastRotationIsNotAJump) {
   SetChain(100.0, AxisAngle(0, 0, 1, 0.0));
 
@@ -507,6 +510,249 @@ TEST_F(PoseSamplerTest, ALegitimateFastRotationIsNotAJump) {
   EXPECT_EQ(sampler.relocalisation_jumps(), 0u)
       << "a rotation the robot actually performed was reported as a localiser fault";
 
+  Flush();
+  EXPECT_EQ(transport_->CountIn("robot.localisation_jump"), 0);
+}
+
+namespace {
+
+// A stationary robot behind a localiser shaped as nav2_amcl's: `map -> odom` once per scan, every
+// 1/7 s, stamped the scan's time plus a 1 s transform tolerance, and `odom -> base_link` at 50 Hz,
+// stamped as published. At scan time 5 s the estimate corrects by `jump_m` along x and `jump_deg`
+// of yaw. tf2 interpolates `map -> odom` between the two future-dated entries either side of the
+// lookup time, so the correction reaches a latest-time lookup as a ramp one scan period long,
+// about a second late -- the shape no per-sample threshold sees at a high rate. Sampled at
+// `sample_hz` of wire time from 2 s to 8 s, publishing everything due before each sample.
+// Returns the number of samples recorded.
+int SampleAnAmclCorrection(tf2_ros::Buffer& buffer, PoseSampler& sampler, SessionRunner& runner,
+                           double sample_hz, double jump_m, double jump_deg) {
+  struct Pending {
+    double published;
+    geometry_msgs::msg::TransformStamped transform;
+  };
+  std::vector<Pending> pending;
+  for (int k = 0; k <= 400; ++k) {
+    pending.push_back({0.02 * k, MakeTf("odom", "base_link", 0.0, 0.0, 0.0, 0.02 * k)});
+  }
+  for (int k = 0; k <= 56; ++k) {
+    const double scan = k / 7.0;
+    const bool corrected = k >= 35;  // scan time 5 s
+    pending.push_back({scan, MakeTfQ("map", "odom", corrected ? jump_m : 0.0, 0.0, 0.0,
+                                     AxisAngle(0, 0, 1, corrected ? jump_deg : 0.0),
+                                     scan + 1.0)});
+  }
+  std::stable_sort(pending.begin(), pending.end(),
+                   [](const Pending& a, const Pending& b) { return a.published < b.published; });
+  std::size_t next = 0;
+  int recorded = 0;
+  for (int n = 0;; ++n) {
+    const double now = 2.0 + n / sample_hz;
+    if (now > 8.0 + 1e-9) break;
+    while (next < pending.size() && pending[next].published <= now + 1e-9) {
+      buffer.setTransform(pending[next++].transform, "test");
+    }
+    if (sampler.Sample(1000.0 + now, runner, nullptr)) ++recorded;
+  }
+  return recorded;
+}
+
+struct AmclCase {
+  double sample_hz;
+  double jump_m;
+  double jump_deg;
+  const char* kind;
+};
+
+}  // namespace
+
+// One correction is one event, of the kind that crossed its threshold, at the default rate and
+// at 10 Hz alike. Compared sample to sample at 30 Hz, each step is about a quarter of the
+// correction -- 21 degrees, 0.28 m -- and nothing is recorded at all.
+class AmclCorrectionTest : public PoseSamplerTest,
+                           public ::testing::WithParamInterface<AmclCase> {};
+
+TEST_P(AmclCorrectionTest, ACorrectionTfSpreadsOverSeveralSamplesIsOneJump) {
+  const AmclCase c = GetParam();
+  PoseSamplerConfig config;  // the shipped thresholds
+  config.rate_hz = c.sample_hz;
+  PoseSampler sampler(buffer_, config);
+  const int recorded = SampleAnAmclCorrection(*buffer_, sampler, *runner_, c.sample_hz, c.jump_m,
+                                              c.jump_deg);
+  ASSERT_GT(recorded, static_cast<int>(5.5 * c.sample_hz))
+      << "the lookups failed, so no correction reached the pose";
+  c3d::Vec3 last{};
+  ASSERT_TRUE(sampler.last_body_position(&last));
+  ASSERT_NEAR(last.x, c.jump_m, 1e-6) << "the correction never reached the pose";
+
+  EXPECT_EQ(sampler.relocalisation_jumps(), 1u);
+  Flush();
+  const auto jumps = LocalisationJumpProperties(*transport_);
+  ASSERT_EQ(jumps.size(), 1u);
+  EXPECT_EQ(jumps[0].value("kind", std::string()), c.kind);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    RotationPositionAndBoth, AmclCorrectionTest,
+    ::testing::Values(AmclCase{30.0, 0.0, 90.0, "rotation"}, AmclCase{30.0, 1.2, 0.0, "position"},
+                      AmclCase{30.0, 1.2, 90.0, "both"}, AmclCase{10.0, 0.0, 90.0, "rotation"},
+                      AmclCase{10.0, 1.2, 0.0, "position"}),
+    [](const ::testing::TestParamInfo<AmclCase>& info) {
+      return std::string(info.param.kind) + "_at_" +
+             std::to_string(static_cast<int>(info.param.sample_hz)) + "_hz";
+    });
+
+// A discrete correction at 30 Hz is ONE event. Comparing every sample with the pose a tenth of a
+// second back would see the same step from each of the three samples after it.
+TEST_F(PoseSamplerTest, ADiscreteJumpAtThirtyHertzIsOneEvent) {
+  PoseSamplerConfig config;
+  config.rate_hz = 30.0;
+  PoseSampler sampler(buffer_, config);
+  for (int n = 0; n <= 30; ++n) {
+    SetChain(100.0 + n / 30.0, AxisAngle(0, 0, 1, n < 10 ? 0.0 : 90.0));
+    ASSERT_TRUE(sampler.Sample(1000.0 + n / 30.0, *runner_, nullptr)) << n;
+  }
+  EXPECT_EQ(sampler.relocalisation_jumps(), 1u);
+  Flush();
+  EXPECT_EQ(transport_->CountIn("robot.localisation_jump"), 1);
+}
+
+// A correction spread over longer than one check is still one event: 90 degrees over 1/7 s,
+// sampled at 30 Hz, crosses the threshold in one check and leaves less than it to the next.
+TEST_F(PoseSamplerTest, ACorrectionLongerThanOneCheckIsOneEvent) {
+  PoseSamplerConfig config;
+  config.rate_hz = 30.0;
+  PoseSampler sampler(buffer_, config);
+  for (int n = 0; n <= 30; ++n) {
+    const double t = n / 30.0;
+    const double ramp = std::clamp((t - 0.3) * 7.0, 0.0, 1.0);
+    SetChain(100.0 + t, AxisAngle(0, 0, 1, 90.0 * ramp));
+    ASSERT_TRUE(sampler.Sample(1000.0 + t, *runner_, nullptr)) << n;
+  }
+  EXPECT_EQ(sampler.relocalisation_jumps(), 1u);
+  Flush();
+  const auto jumps = LocalisationJumpProperties(*transport_);
+  ASSERT_EQ(jumps.size(), 1u);
+  EXPECT_GT(jumps[0].value("rotation_deg", 0.0), 45.0);
+  EXPECT_LT(jumps[0].value("rotation_deg", 0.0), 90.0)
+      << "measured over one check, which this correction outlasts";
+}
+
+// The check compares poses a tenth of a second apart however fast the samples come, and starts
+// again from each check: 200 deg/s for a whole second is 20 degrees per check at 30 Hz and at
+// 1000 Hz, and 200 degrees to a comparison that never moved its starting pose.
+TEST_F(PoseSamplerTest, ALegitimateFastRotationIsNotAJumpAtAnyRate) {
+  for (const double hz : {30.0, 1000.0}) {
+    buffer_->clear();
+    PoseSamplerConfig config;
+    config.rate_hz = hz;
+    PoseSampler sampler(buffer_, config);
+    const int samples = static_cast<int>(hz);
+    for (int n = 0; n <= samples; ++n) {
+      const double t = n / hz;
+      SetChain(100.0 + t, AxisAngle(0, 0, 1, 200.0 * t));
+      ASSERT_TRUE(sampler.Sample(1000.0 + t, *runner_, nullptr)) << hz << " Hz, " << n;
+    }
+    EXPECT_EQ(sampler.relocalisation_jumps(), 0u) << hz << " Hz";
+  }
+  Flush();
+  EXPECT_EQ(transport_->CountIn("robot.localisation_jump"), 0);
+}
+
+// Below 10 Hz every sample is compared with the previous one: a 0.6 m step is a jump on the very
+// next sample, and 0.3 m per sample never adds up to one.
+TEST_F(PoseSamplerTest, BelowTenHertzEverySampleIsCompared) {
+  PoseSamplerConfig config;
+  config.rate_hz = 2.0;
+  PoseSampler sampler(buffer_, config);
+  const auto at = [&](int n, double x) {
+    buffer_->setTransform(MakeTf("map", "odom", 0, 0, 0, 100.0 + 0.5 * n), "test");
+    buffer_->setTransform(MakeTf("odom", "base_link", x, 0.0, 0.0, 100.0 + 0.5 * n), "test");
+    return sampler.Sample(1000.0 + 0.5 * n, *runner_, nullptr);
+  };
+  for (int n = 0; n <= 3; ++n) ASSERT_TRUE(at(n, 0.3 * n));
+  EXPECT_EQ(sampler.relocalisation_jumps(), 0u) << "0.3 m per sample is motion";
+  ASSERT_TRUE(at(4, 1.5));
+  EXPECT_EQ(sampler.relocalisation_jumps(), 1u) << "a 0.6 m step at 2 Hz";
+}
+
+// Nothing is compared across a stale stretch, a change of reference frame, a clock that went
+// back or a session restart, even inside one check interval at 30 Hz: each would report the
+// difference between two unrelated poses as a jump.
+TEST_F(PoseSamplerTest, AStaleStretchInsideACheckIsNotAJump) {
+  PoseSamplerConfig config;
+  config.rate_hz = 30.0;
+  config.stale_transform_after_s = 0.05;
+  PoseSampler sampler(buffer_, config);
+  SetChain(100.0, Qxyzw(0, 0, 0, 1));
+  ASSERT_TRUE(sampler.Sample(1000.0, *runner_, nullptr));
+  ASSERT_TRUE(sampler.Sample(1000.0 + 1.0 / 30.0, *runner_, nullptr));
+  ASSERT_FALSE(sampler.Sample(1000.0 + 2.0 / 30.0, *runner_, nullptr));
+  ASSERT_TRUE(sampler.last_sample_stale());
+
+  buffer_->setTransform(MakeTf("map", "odom", 0, 0, 0, 100.1), "test");
+  buffer_->setTransform(MakeTf("odom", "base_link", 5.0, 0.0, 0.0, 100.1), "test");
+  ASSERT_TRUE(sampler.Sample(1000.0 + 3.0 / 30.0, *runner_, nullptr));
+  buffer_->setTransform(MakeTf("map", "odom", 0, 0, 0, 100.2), "test");
+  buffer_->setTransform(MakeTf("odom", "base_link", 5.0, 0.0, 0.0, 100.2), "test");
+  ASSERT_TRUE(sampler.Sample(1000.0 + 6.0 / 30.0, *runner_, nullptr));
+  EXPECT_EQ(sampler.relocalisation_jumps(), 0u);
+}
+
+TEST_F(PoseSamplerTest, AChangeOfReferenceFrameInsideACheckIsNotAJump) {
+  PoseSamplerConfig config;
+  config.rate_hz = 30.0;
+  config.reference_frame_grace_s = 0.0;
+  PoseSampler sampler(buffer_, config);
+  std::string status;
+  SetChain(100.0, Qxyzw(0, 0, 0, 1));
+  ASSERT_TRUE(sampler.Sample(1000.0, *runner_, &status)) << status;
+  ASSERT_EQ(sampler.active_reference_frame(), "map");
+
+  // `map` goes, and the run falls back to `odom` ...
+  buffer_->clear();
+  buffer_->setTransform(MakeTf("odom", "base_link", 1.0, 0.0, 0.0, 100.0 + 1.0 / 30.0), "test");
+  ASSERT_TRUE(sampler.Sample(1000.0 + 1.0 / 30.0, *runner_, &status)) << status;
+  ASSERT_EQ(sampler.active_reference_frame(), "odom");
+
+  // ... and comes back four metres away, which is a different frame's origin, not a jump.
+  for (int n = 2; n <= 6; ++n) {
+    const double t = n / 30.0;
+    buffer_->setTransform(MakeTf("map", "odom", 4.0, 0.0, 0.0, 100.0 + t), "test");
+    buffer_->setTransform(MakeTf("odom", "base_link", 1.0, 0.0, 0.0, 100.0 + t), "test");
+    ASSERT_TRUE(sampler.Sample(1000.0 + t, *runner_, &status)) << status;
+  }
+  ASSERT_EQ(sampler.active_reference_frame(), "map");
+  EXPECT_EQ(sampler.relocalisation_jumps(), 0u);
+}
+
+TEST_F(PoseSamplerTest, AClockThatWentBackStartsTheCheckAgain) {
+  PoseSamplerConfig config;
+  config.rate_hz = 30.0;
+  PoseSampler sampler(buffer_, config);
+  SetChain(100.0, Qxyzw(0, 0, 0, 1));
+  ASSERT_TRUE(sampler.Sample(1000.0, *runner_, nullptr));
+
+  buffer_->setTransform(MakeTf("map", "odom", 0, 0, 0, 100.05), "test");
+  buffer_->setTransform(MakeTf("odom", "base_link", 5.0, 0.0, 0.0, 100.05), "test");
+  ASSERT_TRUE(sampler.Sample(999.95, *runner_, nullptr));
+  buffer_->setTransform(MakeTf("map", "odom", 0, 0, 0, 100.1), "test");
+  buffer_->setTransform(MakeTf("odom", "base_link", 5.0, 0.0, 0.0, 100.1), "test");
+  ASSERT_TRUE(sampler.Sample(1000.1, *runner_, nullptr));
+  EXPECT_EQ(sampler.relocalisation_jumps(), 0u);
+}
+
+TEST_F(PoseSamplerTest, ASessionRestartStartsTheCheckAgain) {
+  PoseSamplerConfig config;
+  config.rate_hz = 30.0;
+  PoseSampler sampler(buffer_, config);
+  SetChain(100.0, Qxyzw(0, 0, 0, 1));
+  ASSERT_TRUE(sampler.Sample(1000.0, *runner_, nullptr));
+  sampler.Reset();
+
+  buffer_->setTransform(MakeTf("map", "odom", 0, 0, 0, 100.1), "test");
+  buffer_->setTransform(MakeTf("odom", "base_link", 5.0, 0.0, 0.0, 100.1), "test");
+  ASSERT_TRUE(sampler.Sample(1000.1, *runner_, nullptr));
+  EXPECT_EQ(sampler.relocalisation_jumps(), 0u);
   Flush();
   EXPECT_EQ(transport_->CountIn("robot.localisation_jump"), 0);
 }
@@ -1518,4 +1764,23 @@ TEST(StaleTransformBound, TenSamplePeriodsAndNeverUnderFiveSeconds) {
   EXPECT_DOUBLE_EQ(StaleTransformAfterSeconds(10.0), 5.0);
   EXPECT_DOUBLE_EQ(StaleTransformAfterSeconds(1.0), 10.0);
   EXPECT_DOUBLE_EQ(StaleTransformAfterSeconds(0.5), 20.0);
+}
+
+// The first sample a check is due at, for samples 1/hz apart, spans between a tenth of a second,
+// less the jitter allowance, and two tenths: every sample at 10 Hz and below, every third at
+// 30 Hz. A sample a little early is still the one checked.
+TEST(RelocalisationCheck, DueATenthOfASecondApartAndEverySampleBelowTenHertz) {
+  for (const double hz : {10.0, 11.0, 15.0, 25.0, 30.0, 1000.0}) {
+    int k = 1;
+    while (!RelocalisationCheckDue(k / hz, hz) && k < 1000) ++k;
+    const double spanned = k / hz;
+    EXPECT_GE(spanned, 0.1 - 0.1 * std::min(0.1, 1.0 / hz) - 1e-12) << hz << " Hz";
+    EXPECT_LT(spanned, 0.2) << hz << " Hz";
+  }
+  for (const double hz : {9.0, 2.0, 0.5}) {
+    EXPECT_TRUE(RelocalisationCheckDue(1.0 / hz, hz)) << hz << " Hz";
+  }
+  EXPECT_EQ(RelocalisationCheckDue(1.0 / 30.0, 30.0), false);
+  EXPECT_EQ(RelocalisationCheckDue(2.0 / 30.0, 30.0), false);
+  EXPECT_EQ(RelocalisationCheckDue(3.0 / 30.0 - 0.002, 30.0), true) << "2 ms early";
 }

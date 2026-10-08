@@ -41,8 +41,9 @@
     fallback_reference_frame: "odom"
     reference_frame_grace_s: 5.0        # seconds to wait for reference_frame
     robot_frame: "base_link"
-    # A step or a turn between two samples in reference_frame larger than these
-    # records robot.localisation_jump. Per sample: raise them at a lower rate.
+    # A step or a turn in reference_frame larger than these, between poses about
+    # 0.1 s apart, records robot.localisation_jump. Below 10 Hz the poses are
+    # consecutive samples: raise them in proportion to the longer period.
     relocalisation_jump_m: 0.5          # meters
     relocalisation_jump_deg: 45.0       # degrees
     # A frame the gaze channel reports instead of robot_frame. A name that does not

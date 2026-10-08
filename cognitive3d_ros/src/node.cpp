@@ -469,8 +469,9 @@ void Cognitive3DNode::DeclareParameters() {
   // Declared from the struct so the two defaults cannot drift apart.
   DeclareDouble("reference_frame_grace_s", sampler_config_.reference_frame_grace_s);
   // What counts as a relocalisation jump rather than as the robot moving, in the
-  // preferred frame. Both are PER SAMPLE, so both scale with `sample_rate_hz`:
-  // halve the rate and one honest sample covers twice as much.
+  // preferred frame. Both are PER CHECK: poses about 0.1 s apart at a
+  // `sample_rate_hz` of 10 or more, consecutive samples below it, where halving the
+  // rate doubles what one honest sample covers.
   //
   // Exposed because the right value is a fact about the deployment that the SDK
   // cannot see. 0.5 m is coarse in a room the robot crosses in four steps and
@@ -482,8 +483,8 @@ void Cognitive3DNode::DeclareParameters() {
   // re-estimates its yaw by a right angle while the robot stands still -- and
   // orientation is what the viewer turns the robot by, so missing one corrupts the
   // spatial timeline and not merely a travel metric. 45 degrees sits above the
-  // 11 degrees per sample a base spinning at 109 deg/s covers at 10 Hz, with
-  // room for a slipped timer, and below the right angle such a re-estimate is.
+  // 11 degrees a base spinning at 109 deg/s covers in 0.1 s, with room for a
+  // check that came late, and below the right angle such a re-estimate is.
   //
   // Declared from the struct so the two sets of defaults cannot drift apart.
   DeclareDouble("relocalisation_jump_m", sampler_config_.relocalisation_jump_m);

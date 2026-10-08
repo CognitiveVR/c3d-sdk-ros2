@@ -120,14 +120,24 @@ force.
 
 ### Localization jumps
 
-A localizer corrects its estimate in steps. In the preferred frame, a sample that moves more than
-`relocalisation_jump_m` (0.5 meters) or turns more than `relocalisation_jump_deg` (45 degrees)
-since the previous sample records `robot.localisation_jump`, and counts in `c3d.localisation_jumps`.
-The event carries `distance_m`, `rotation_deg`, `kind` (`position`, `rotation` or `both`) and
-`frame`. The pose itself is still recorded; the event lets an analysis exclude the discontinuity.
+A localizer corrects its estimate in steps. In the preferred frame, the node compares the pose with
+the one about 0.1 seconds earlier, or with the previous sample when `sample_rate_hz` is below 10. A
+move of more than `relocalisation_jump_m` (0.5 meters) or a turn of more than
+`relocalisation_jump_deg` (45 degrees) records one `robot.localisation_jump`, and counts in
+`c3d.localisation_jumps`. The event carries `distance_m` and `rotation_deg`, measured over that
+comparison, `kind` (`position`, `rotation` or `both`) and `frame`. The pose itself is still
+recorded; the event lets an analysis exclude the discontinuity.
 
-Both thresholds are per sample. At a lower `sample_rate_hz` each sample covers more motion, so
-raise them in proportion, or fast driving and turning read as jumps.
+Comparing poses 0.1 seconds apart, rather than consecutive samples, makes detection the same at any
+`sample_rate_hz` of 10 or more. A localizer that future-dates its transform, as AMCL does, is
+interpolated by tf between two of its updates, so one correction reaches the pose spread over every
+sample in between, and consecutive samples at a high rate would each see only a part of it. A correction spread over more
+than 0.1 seconds, behind a localizer that updates slower than 10 Hz, can still be split between two
+comparisons and reach the threshold in neither. Nothing is compared across a change of
+reference frame, a stale transform or the start of a session.
+
+Both thresholds hold for 0.1 seconds of motion. Below a `sample_rate_hz` of 10, each sample covers
+more motion, so raise them in proportion, or fast driving and turning read as jumps.
 
 ### Stale transforms
 
