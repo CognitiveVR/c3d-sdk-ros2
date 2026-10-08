@@ -1761,6 +1761,7 @@ TEST_F(PoseSamplerTest, AChangeOfReferenceFrameRestartsTheStaleClock) {
 }
 
 TEST(StaleTransformBound, TenSamplePeriodsAndNeverUnderFiveSeconds) {
+  EXPECT_DOUBLE_EQ(StaleTransformAfterSeconds(30.0), 5.0);
   EXPECT_DOUBLE_EQ(StaleTransformAfterSeconds(10.0), 5.0);
   EXPECT_DOUBLE_EQ(StaleTransformAfterSeconds(1.0), 10.0);
   EXPECT_DOUBLE_EQ(StaleTransformAfterSeconds(0.5), 20.0);

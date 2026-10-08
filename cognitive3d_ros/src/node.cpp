@@ -463,7 +463,7 @@ void Cognitive3DNode::DeclareParameters() {
   declare_parameter<bool>("dry_run", false);
   // Requires use_sim_time. Off, every wire timestamp is wall clock now.
   declare_parameter<bool>("sim_time_on_wire", false);
-  DeclareDouble("sample_rate_hz", 10.0);
+  DeclareDouble("sample_rate_hz", 30.0);
   declare_parameter<std::string>("reference_frame", "map");
   declare_parameter<std::string>("fallback_reference_frame", "odom");
   // Declared from the struct so the two defaults cannot drift apart.
@@ -2840,7 +2840,7 @@ void Cognitive3DNode::OnSampleTimer() {
   } else {
     ++pose_failures_;
     // Throttled: a robot that has not started its localisation yet would
-    // otherwise produce ten of these per second.
+    // otherwise produce one of these per sample.
     if (steady_now - last_pose_warn_ > 10.0) {
       last_pose_warn_ = steady_now;
       RCLCPP_WARN(get_logger(),

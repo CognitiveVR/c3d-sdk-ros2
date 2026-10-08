@@ -297,7 +297,7 @@ TEST_F(ComponentTest, LoadedWithANamespaceAndTfRemapsItReadsTheNamespacedTree) {
           .translation.x,
       1.5)
       << "the buffer holds another tree than the robot's";
-  // Poses from that tree, at 10 Hz, into the session.
+  // Poses from that tree, at the default rate, into the session.
   spin_publishing([] { return false; }, std::chrono::milliseconds(1500));
   ASSERT_EQ(node->deactivate().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
 

@@ -7,7 +7,7 @@ frame, and the frame the gaze channel reports. The exact conversions are specifi
 
 ## The pose timeline
 
-At `sample_rate_hz` (10 by default) the node looks up `reference_frame` to `robot_frame` in tf,
+At `sample_rate_hz` (30 by default) the node looks up `reference_frame` to `robot_frame` in tf,
 `map` to `base_link` by default, falling back to `odom`. It converts the pose into the scene's axes
 under `pose_convention` and records its position and rotation. This is the gaze channel, the spatial timeline Session Replay draws the robot
 from. Every event is placed at the robot body's position from the latest sample.

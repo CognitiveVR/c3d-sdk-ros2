@@ -76,7 +76,7 @@ struct PoseSamplerConfig {
   std::string gaze_frame;
   FrameConvention gaze_frame_convention = FrameConvention::kAuto;
 
-  double rate_hz = 10.0;
+  double rate_hz = 30.0;
   // A pose whose transform stamp has not advanced for this long, on the wire's clock, is STALE:
   // skipped and counted rather than recorded as where the robot is now. A publisher that dies
   // leaves its last transform in the buffer, and without this the robot is recorded standing

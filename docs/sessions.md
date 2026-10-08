@@ -236,7 +236,7 @@ wall-clock second, which Gazebo shows as RTF. At a factor of 1 the two settings 
 session. Below 1, a session recorded without `sim_time_on_wire` is longer than the run by one over
 the factor: at 0.25, 5 simulated minutes make a 20-minute session. Set `sim_time_on_wire: true`
 whenever the factor stays below 1. Its rates then count per simulated second, so at a factor of 0.2
-the default 10 Hz pose rate records 2 poses per wall-clock second, and 10 per simulated second.
+the default 30 Hz pose rate records 6 poses per wall-clock second, and 30 per simulated second.
 
 On a computer with no simulator window, measure the factor from `/clock`, with two readings about
 30 seconds apart:
@@ -388,7 +388,7 @@ status per topic:
 
 ```text
 [INFO] [...] [cognitive3d]: observing 3 topic(s)
-  session <seconds>_<your-device-id>  poses=1707 frame=map  recorded=9844 dropped=0  uploaded=38 spooled=1  events=1
+  session <seconds>_<your-device-id>  poses=5121 frame=map  recorded=29532 dropped=0  uploaded=38 spooled=1  events=1
   /odom  3404 msg  3404 xlat  20Hz  2393KiB  reliable/volatile/keep_last(10)
   /joint_states  8510 msg  8510 xlat  50Hz  1662KiB  reliable/volatile/keep_last(10)
   /navigate_to_pose/_action/status  14 msg  14 xlat  0Hz  2KiB  reliable/transient_local/keep_last(10)

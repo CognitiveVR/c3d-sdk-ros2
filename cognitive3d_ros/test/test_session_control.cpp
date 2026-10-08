@@ -1456,6 +1456,18 @@ TEST_F(LifecycleContractTest, TheGazeIntervalFollowsTheSampleRate) {
   EXPECT_EQ(at_the_rate, gaze);
 }
 
+// Ten periods at the default rate are a third of a second, well inside the gap between two
+// updates of a localiser that does not future-date its transform. The node's stale window at the
+// default rate is the five-second floor, so such a localiser is not counted as stopped.
+TEST_F(LifecycleContractTest, AtTheDefaultSampleRateTheStaleWindowIsFiveSeconds) {
+  MakeNode(/*auto_start_session=*/false);
+  ASSERT_EQ(node_->configure().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+  EXPECT_DOUBLE_EQ(node_->resolved_sampler_config().rate_hz, 30.0);
+  EXPECT_DOUBLE_EQ(node_->resolved_config().gaze_interval_s, 1.0 / 30.0);
+  EXPECT_DOUBLE_EQ(node_->resolved_sampler_config().stale_transform_after_s, 5.0);
+  node_->cleanup();
+}
+
 // A namespaced node takes battery and diagnostics by type only under its own namespace.
 TEST(DiscoveryScope, ANamespacedNodeTakesStandardTypesOnlyUnderItsNamespace) {
   const fs::path dir = fs::temp_directory_path() / ("c3d_scope_" + std::to_string(::getpid()));
@@ -2229,7 +2241,7 @@ TEST(NodeIdentityProperties, ASessionReopenedAfterABackwardClockJumpCarriesTheWh
   const auto drive_clock_to = [&](double seconds) {
     rosgraph_msgs::msg::Clock message;
     message.clock = rclcpp::Time(static_cast<int64_t>(seconds * 1e9));
-    // The sample timer is a 10 Hz WALL timer and the jump is only observed on a tick, so this has
+    // The sample timer is a 30 Hz WALL timer and the jump is only observed on a tick, so this has
     // to let real time pass. `spin_some` does NOT wait out its argument -- it returns as soon as no
     // more work is ready -- so a loop of forty spin_somes can finish in microseconds and the timer
     // never fires. Sleeping is what makes the tick happen; without it the test reports a correct
@@ -4627,7 +4639,7 @@ TEST_F(LifecycleContractTest, AParameterReadAtConfigureIsNotSetWhileConfigured) 
     EXPECT_NE(result.reason.find("ros2 lifecycle set /cognitive3d cleanup"), std::string::npos)
         << result.reason;
   }
-  EXPECT_DOUBLE_EQ(node_->get_parameter("sample_rate_hz").as_double(), 10.0);
+  EXPECT_DOUBLE_EQ(node_->get_parameter("sample_rate_hz").as_double(), 30.0);
   EXPECT_FALSE(node_->set_parameters_atomically(
                         {{"session_name", std::string("mixed")}, {"sample_rate_hz", 20.0}})
                    .successful)

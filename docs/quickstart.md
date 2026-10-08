@@ -163,7 +163,7 @@ The node is a lifecycle node, and it records nothing until it is configured and 
 id, which is the session's start in Unix seconds and the device id:
 
 ```text
-[INFO] [...] [cognitive3d]: activated. Sampling poses at 10.0 Hz into session <seconds>_<your-device-id>.
+[INFO] [...] [cognitive3d]: activated. Sampling poses at 30.0 Hz into session <seconds>_<your-device-id>.
 ```
 
 In the first seconds after activation the node can warn `<n> allowlisted topic(s) not present on
@@ -172,7 +172,7 @@ within a few seconds. The node then logs a report every 10 seconds, and its sess
 whether recording works:
 
 ```text
-  session <seconds>_<your-device-id>  poses=212 frame=map  recorded=1460 dropped=0  uploaded=3 spooled=1
+  session <seconds>_<your-device-id>  poses=636 frame=map  recorded=4380 dropped=0  uploaded=3 spooled=1
 ```
 
 `frame=` names the reference frame the poses are in: `map`, or `odom` on a robot without a map

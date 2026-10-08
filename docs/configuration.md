@@ -106,7 +106,7 @@ read zero on most mobile robots.
 
 | parameter | type | default | unit | what it does |
 | -- | -- | -- | -- | -- |
-| `sample_rate_hz` | double | `10.0` | Hz | Pose samples per second, from 1/86400 (one a day) to 1000. A transform whose stamp stops advancing for 10 sample periods, and at least 5 seconds, is skipped as stale and counted in `c3d.stale_poses`. |
+| `sample_rate_hz` | double | `30.0` | Hz | Pose samples per second, from 1/86400 (one a day) to 1000. A transform whose stamp stops advancing for 10 sample periods, and at least 5 seconds, is skipped as stale and counted in `c3d.stale_poses`. |
 | `reference_frame` | string | `"map"` | — | The frame poses are read in when it resolves. Empty uses `fallback_reference_frame` alone. |
 | `fallback_reference_frame` | string | `"odom"` | — | The frame used when `reference_frame` does not resolve. A session that starts on it records `robot.reference_frame_unavailable`, and every switch records `robot.reference_frame_changed`. A path recorded in `odom` starts wherever the robot booted, not where it is in the scene. |
 | `reference_frame_grace_s` | double | `5.0` | seconds | How long the node waits for `reference_frame` once the fallback resolves, before it settles on the fallback. Nothing is recorded while it waits. `doctor` waits for the same time. A finite number, 0 or more: `0` adopts the fallback at once. |

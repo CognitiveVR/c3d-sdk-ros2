@@ -33,7 +33,7 @@
     dynamic_up_offset_meters: 0.0       # meters; Dynamic Object only
 
     # ---- Poses and the gaze channel ----------------------------------------------
-    sample_rate_hz: 10.0                # pose samples per second
+    sample_rate_hz: 30.0                # pose samples per second
     # Poses are read in reference_frame, or in the fallback while it does not resolve.
     # A path recorded in odom starts wherever the robot booted. An empty
     # reference_frame uses the fallback alone.
