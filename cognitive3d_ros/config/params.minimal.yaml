@@ -1,0 +1,40 @@
+# The smallest params file that starts the node. Copy it, not cognitive3d.yaml, and
+# replace every value. docs/configuration.md describes every parameter.
+#
+# Keyed `/**` so it applies whatever the node is called. A file keyed by a node name
+# applies to no node of any other name, which then runs on its defaults.
+#
+# The application key is not set here. Export C3D_APPLICATION_API_KEY in the node's
+# environment: a ROS parameter is readable by anything on the ROS graph.
+
+/**:
+  ros__parameters:
+    # Required. Your scene's UUID and its version number. Configure refuses a scene_id
+    # that is not a UUID, this placeholder included.
+    scene_id: "REPLACE-WITH-YOUR-SCENE-UUID"
+    scene_version: "1"          # quoted: an unquoted 1 is an integer and is refused
+
+    # The robot's name on the Cognitive3D dashboard. Left empty, a node in the root
+    # namespace is ros-unnamed, like every other robot left empty.
+    device_id: "my-robot"
+
+    # Required, with no default. gltf_authored for a scene exported from ROS or Gazebo
+    # (export_world_gltf.sh, or any ROS-to-glTF exporter), unity for a scene authored in
+    # Unity. The two differ by a 90 degree yaw, and nothing in the session shows a
+    # wrong choice. See docs/coordinates.md.
+    pose_convention: "gltf_authored"
+
+    # What to record from your robot: replace these with its own topics, checked with
+    # `ros2 topic list`. A robot running an EKF often publishes /odometry/filtered and
+    # no /odom. Odometry, joint states and scans are sampled at their message type's
+    # default rate unless a topic_config block sets one. /tf needs no entry.
+    topics:
+      - "/odom"
+      - "/joint_states"
+      - "/scan"
+
+    # Recorded without an entry above, under the node's namespace: battery and
+    # diagnostics topics by type, and Nav2 and Create 3 action servers by name. A custom
+    # action needs its name in action_names, which replaces the built-in list. doctor's
+    # actions check names every action on the graph and whether it is recorded.
+    # action_names: ["navigate_to_pose", "dock", "pick_object"]

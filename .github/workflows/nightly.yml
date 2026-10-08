@@ -1,0 +1,30 @@
+# The full build-and-test workflow once a night, on public repositories only: a private
+# repository's runner minutes are metered, and arm64 runners exist only for public ones.
+name: nightly
+
+on:
+  schedule:
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  visibility:
+    # Asked of the API rather than read from the event: a scheduled run's event payload is not a
+    # repository webhook and need not describe the repository.
+    name: is the repository public
+    runs-on: ubuntu-24.04
+    outputs:
+      public: ${{ steps.repo.outputs.public }}
+    steps:
+      - id: repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "public=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.private | not')" >> "$GITHUB_OUTPUT"
+
+  build-and-test:
+    needs: visibility
+    if: ${{ needs.visibility.outputs.public == 'true' }}
+    uses: ./.github/workflows/build-and-test.yml

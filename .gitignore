@@ -1,0 +1,14 @@
+.DS_Store
+
+# colcon / CMake output. Never in-tree: `tools/build_and_test.sh` builds into a
+# container-local directory so a host without ROS can still run the suite.
+/build/
+/install/
+/log/
+
+# Python bytecode from the tools/ scripts.
+__pycache__/
+*.pyc
+
+# Agent worktrees. Checkouts of this repo, never content of it.
+.claude/worktrees/

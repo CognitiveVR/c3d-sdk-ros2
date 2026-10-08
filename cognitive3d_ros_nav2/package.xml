@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>cognitive3d_ros_nav2</name>
+  <version>1.0.0</version>
+  <description>
+    Nav2 behaviour-tree events for cognitive3d_ros. Translates the Nav2
+    behaviour-tree log into recovery and node-failure events and a tree-activity
+    rate. It ships the node's entry point and its component,
+    cognitive3d_ros_nav2::Cognitive3DNode, with the translators composed in,
+    and cognitive3d_ros's launch file runs that entry point whenever this
+    package is present. Kept separate so that a robot not running Nav2 does not
+    install nav2_msgs.
+  </description>
+  <maintainer email="support@cognitive3d.com">Cognitive3D</maintainer>
+  <license file="LICENSE">LicenseRef-Cognitive3D-SDK</license>
+
+  <url type="website">https://cognitive3d.com</url>
+  <url type="repository">https://github.com/CognitiveVR/c3d-sdk-ros2</url>
+  <url type="bugtracker">https://github.com/CognitiveVR/c3d-sdk-ros2/issues</url>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>cognitive3d_ros</depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_lifecycle</depend>
+  <depend>rclcpp_components</depend>
+  <depend>nav2_msgs</depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>lifecycle_msgs</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

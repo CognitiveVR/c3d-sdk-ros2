@@ -1,0 +1,20 @@
+---
+exclude_paths:
+  # Test suites: they run built binaries by path, parse fixtures, and carry placeholder keys.
+  - '**/test/**'
+  - 'tools/test_*.py'
+engines:
+  cppcheck:
+    exclude_paths:
+      # Analysed alone, a header reports every member another file reads as unused.
+      - '**/include/**'
+      # Without the ROS include paths, its `__has_include(<rmw/...>)` reads as always false.
+      - 'cognitive3d_ros/src/identity.cpp'
+  flawfinder:
+    exclude_paths:
+      # Its one hit is `strlen` of a string literal constant.
+      - 'core/src/spool.cpp'
+  agentlinter:
+    exclude_paths:
+      # A policy for people, not agent instructions; it publishes the security contact address.
+      - 'SECURITY.md'

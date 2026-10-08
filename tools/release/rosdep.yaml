@@ -1,0 +1,12 @@
+# rosdep keys for this repository's own packages, which no public rosdep source carries.
+# bloom resolves every dependency of a package to a system package before it writes debian/,
+# so cognitive3d_ros needs a key for cognitive3d_ros_msgs and cognitive3d_ros_nav2 needs one for
+# cognitive3d_ros. tools/release/build_debs.sh registers this file as a rosdep source.
+cognitive3d_ros_msgs:
+  ubuntu:
+    jammy: [ros-humble-cognitive3d-ros-msgs]
+    noble: [ros-jazzy-cognitive3d-ros-msgs]
+cognitive3d_ros:
+  ubuntu:
+    jammy: [ros-humble-cognitive3d-ros]
+    noble: [ros-jazzy-cognitive3d-ros]

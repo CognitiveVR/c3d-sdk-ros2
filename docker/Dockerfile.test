@@ -1,0 +1,65 @@
+# Build and test environment for this repo, on any host with Docker.
+#
+# The point of resolving dependencies with `rosdep install` rather than a hand
+# written apt list is that it reads the package manifests: an undeclared
+# dependency fails THIS image build instead of working on the machines that
+# happen to have it and failing on a partner's clean checkout, where the
+# documented build sequence is the first thing to break.
+# The base is an ARG so one file serves both tier 1 distros and cannot drift:
+# `tools/build_and_test.sh humble` passes ros:humble-ros-base-jammy. Everything
+# else defaults to Jazzy.
+ARG ROS_IMAGE=ros:jazzy-ros-base-noble
+FROM ${ROS_IMAGE}
+
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3-colcon-common-extensions \
+      cmake \
+      g++ \
+      # core/ is deliberately COLCON_IGNORE'd and builds standalone, so its
+      # test dependency is outside any package manifest rosdep can read.
+      libgtest-dev \
+      # The Cap'n Proto compiler and runtime, for the camera and lidar payloads.
+      # Named here rather than in a manifest because rosdep has no key for either
+      # -- `rosdep resolve capnproto` is an error on Jazzy. libzstd-dev and
+      # pkg-config, which core/ also needs, DO have keys and are declared in
+      # cognitive3d_ros/package.xml instead.
+      capnproto \
+      libcapnp-dev \
+      python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# pycapnp and zstandard, for tools/capnp_dump.py in the synthetic tier -- the second
+# because a point cloud block is zstd-compressed by default and a decoder that cannot
+# decompress can only report the header. NOT vendored: it is a Cython
+# extension, so vendoring means a wheel per platform. On a developer's host `uv run` installs it
+# from the script's own PEP 723 metadata; in here it is installed once so the tier can decode
+# without network access at test time. `--break-system-packages` because Noble marks the system
+# interpreter externally managed and this image IS the environment.
+#
+# CAPTURE_TOOLS=0 leaves them out. The Humble image does, because the capture tier
+# runs on Jazzy only and Jammy's pip predates `--break-system-packages`.
+#
+# Pinned. CI builds this image afresh in every job, while a developer's image is cached under a
+# hash of this file, so an unpinned upstream release would change CI alone, on a day nothing
+# here changed.
+ARG CAPTURE_TOOLS=1
+RUN if [ "$CAPTURE_TOOLS" = 1 ]; then \
+      pip3 install --break-system-packages --no-cache-dir pycapnp==2.2.4 zstandard==0.25.0; \
+    fi
+
+# Manifests only. Copying sources here would rebuild this layer on every edit,
+# and the sources are mounted at run time anyway.
+# EVERY ament manifest, and adding a package means adding a line here. rosdep
+# resolves a workspace-local dependency only if it can see that package's own
+# manifest; otherwise it looks for a system package of that name and fails, so a
+# package missing from this list fails this image build rather than a later one.
+COPY cognitive3d_ros/package.xml      /manifests/src/cognitive3d_ros/package.xml
+COPY cognitive3d_ros_nav2/package.xml /manifests/src/cognitive3d_ros_nav2/package.xml
+COPY cognitive3d_ros_msgs/package.xml /manifests/src/cognitive3d_ros_msgs/package.xml
+RUN apt-get update \
+    && rosdep update --rosdistro "$ROS_DISTRO" \
+    && rosdep install --from-paths /manifests/src --ignore-src -y --rosdistro "$ROS_DISTRO" \
+    && rm -rf /var/lib/apt/lists/* /manifests

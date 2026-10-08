@@ -1,0 +1,68 @@
+# A params file for the Cognitive3D node, to fill from the robot survey (SKILL.md, Step 1).
+# Replace every <placeholder> with a measured value, and delete each optional block that does
+# not apply: an empty list stops the node at startup. The application key never goes here; the
+# node reads it from C3D_APPLICATION_API_KEY in its environment.
+# Every parameter: https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/configuration.md
+
+/**:                                   # keep /**: a file keyed by node name configures nothing else
+  ros__parameters:
+    # Which scene, from the human: the Upload Web App's sceneId and versionNumber. Configure
+    # refuses a scene_id that is not a UUID, this placeholder included.
+    scene_id: "<your-scene-uuid>"
+    scene_version: "<your-scene-version>"   # quoted digits
+    # How the scene was authored, from the human: gltf_authored or unity.
+    pose_convention: "<gltf_authored-or-unity>"
+    # A stable name unique to this robot.
+    device_id: "<your-device-id>"
+
+    # Does a map frame exist? Keep map when it does; the node falls back to odom while it does not.
+    reference_frame: "map"
+    # What is the robot body frame called? Normally base_link, even beside a base_footprint.
+    robot_frame: "<base-frame-from-the-tf-tree>"
+
+    # What does the robot publish? One topic per type for odometry, IMU, joint states and scans.
+    # No /tf, images or point clouds. Batteries, diagnostics and Nav2 and Create 3 actions need
+    # no entry. Add /behavior_tree_log when Nav2 runs and cognitive3d_ros_nav2 is installed.
+    topics:
+      - "<odometry-topic>"
+      - "<joint-states-topic>"
+
+    # Optional, per allowlisted topic; a key for a topic not in topics refuses configure. The key
+    # is the topic with / collapsed to _, so /sensors/range is sensors_range.
+    # topic_config:
+    #   <topic-key>:                       # a plain std_msgs/msg/Float32 sensor: name its unit
+    #     series: "<name>.<quantity>_<unit>"
+    #   joint_states:                      # publishers that differ in durability
+    #     qos:
+    #       durability: "volatile"
+
+    # Optional. Is an allowlisted Float32 a rangefinder, or an Int32MultiArray a row of one-bit
+    # sensors? Describe it, so Session Replay can draw it. Its topic must be in topics. Session
+    # Replay draws a cone only for a cone_rangefinder named ultrasonic.
+    # sensors: ["<sensor-name>"]
+    # sensor:
+    #   <sensor-name>:
+    #     kind: "cone_rangefinder"         # or binary_array, with element_count instead
+    #     topic: "<rangefinder-topic>"
+    #     units: "<unit-the-topic-publishes-in>"
+    #     cone_half_angle_deg: <half-of-the-datasheet-beam-angle>
+
+    # Optional. Only for a custom action. This replaces the built-in Nav2 and Create 3 list, so
+    # keep the defaults the robot uses beside it. Never an empty list.
+    # action_names: ["navigate_to_pose", "dock", "<custom-action>"]
+
+    # Optional. Is there a forward camera whose viewpoint matters? Its body or optical frame.
+    # gaze_frame: "<camera-frame>"
+
+    # Optional. Does a mission or task orchestrator own the session boundaries?
+    # auto_start_session: false
+
+    # Optional. Is use_sim_time true on the robot? Then also here, and sim_time_on_wire when the
+    # simulator's real-time factor stays below 1.
+    # use_sim_time: true
+    # sim_time_on_wire: true
+
+    # Set it under systemd or in a container: a directory on persistent storage, one per node. In
+    # a robot container you cannot recreate, a directory on a mount it already has (findmnt lists
+    # them). With none, it is optional: every path in the container is lost with it.
+    # spool_dir: "<absolute-path>"

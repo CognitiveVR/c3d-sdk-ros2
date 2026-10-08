@@ -1,0 +1,59 @@
+# Start a Cognitive3D session from another node, such as a mission or task
+# orchestrator: the Cognitive3D node's `~/start_session` service. It names the
+# session, attaches what the caller knows about the task, and returns the
+# session's id so the session can be found later.
+#
+# Sessions exist only while the node is active: a request to a node that is not
+# active is refused and opens nothing, so activate it first. With the node's
+# `auto_start_session: true`, activation already opened a session, and a request
+# is refused naming it until it is ended.
+#
+# With the node's `remote_variables` on, the call returns once the session's
+# remote variables are fetched, which takes up to `remote_variables_timeout_s`.
+
+# Optional. Recorded as the session property `c3d.sessionname`. Empty falls back
+# to the `session_name` parameter, and then to the session id, so a session is
+# never left carrying the name of the one before it.
+string session_name
+
+# Optional. A flat JSON object of session properties, each value keeping its own
+# JSON type. Types matter on the wire: the platform indexes numeric session
+# properties separately, so a number sent as a string is invisible to a numeric
+# filter. A JSON string is recorded as written. Nested objects, arrays and null
+# are refused, and so is any key in the `c3d.` namespace, where the SDK records
+# its own session properties: a value there would replace the SDK's. The one
+# exception is `c3d.remote_variable.*` while the node's `remote_variables` is
+# false.
+string properties_json
+
+# Optional. The identifier the platform draws this session's A/B arms for, and
+# the session's participant id (`c3d.participant.id`). Empty falls back to the
+# node's `device_id`, which keeps one robot in one arm of a sticky test for
+# good: right for a test across a fleet, wrong for comparing runs. Use a UUID
+# per run. The node sends the platform the lowercase hex SHA-256 of this
+# string's bytes, so sequential identifiers spread across arms, and records the
+# string itself. Longer than 64 bytes is refused before any session opens.
+string participant_id
+---
+# True when this call opened a session.
+bool ok
+
+# The session that is now running. On a refusal because one was already
+# running, this is that session's id.
+#
+# Invariant, and callers depend on it: `ok=false` with a non-empty id means
+# "already running as this id, and this call did not open it". Every other
+# refusal reports an empty id and has opened nothing, so a caller can leave the
+# running session alone on the first, and fix the cause and retry on the second.
+string session_id
+
+# Empty on success; on a refusal, what went wrong and what to do about it.
+string message
+
+# The remote variables and A/B arms resolved for this session, as a flat JSON
+# object keyed by variable name with each value keeping its wire type
+# ({"nav_speed_centimeters_per_second":30}). "{}" when nothing is configured for
+# this identifier. Empty when the fetch is off (`remote_variables: false`) or
+# failed. A failed fetch also leaves a `c3d.remote_variables.unavailable` event
+# in the session; a fetch that is off leaves nothing.
+string remote_variables_json

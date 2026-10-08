@@ -1,0 +1,123 @@
+# On a version tag: check the tag, build and smoke-test the debs, and leave a DRAFT release with
+# them, their checksums and the CHANGELOG section as notes. A person reviews the draft and
+# publishes it; nothing here publishes anything.
+#
+# Dispatched by hand with a version, it is the dry run: the same checks against that version and
+# every deb leg, arm64 included on a public repository, and no release. Run it on the commit to
+# be tagged, because a failure found only on a pushed tag means deleting and re-pushing the tag.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The x.y.z the tree declares and the tag will name
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # The tag, or a dry run's version; either way read as `${VERSION#v}`. Through the environment,
+  # never spliced into a script, because a dispatch input is free text.
+  VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+
+jobs:
+  verify:
+    # The tag is the one version declaration nothing inside the repository can check, because it
+    # is created outside it, after the bump has merged.
+    name: the tag names the version the tree declares
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: every declaration says the tag's version
+        run: tools/bump_version.sh --check "${VERSION#v}"
+      # Dated, with no HTML comment and with links that resolve from a release page: exactly the
+      # notes the release job publishes. A dry run skips the date alone, so it can reach the deb
+      # legs before release day; a tag never does.
+      - name: CHANGELOG.md has release notes for it
+        run: |
+          undated=()
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then undated=(--allow-undated); fi
+          tools/release/changelog_section.sh --release "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            "${undated[@]}" "${VERSION#v}" > /dev/null
+      - name: the docs pin it
+        run: python3 tools/test_doc_version_pins.py
+
+  debs:
+    name: debs (${{ matrix.distro }}, ${{ matrix.runner }})
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [humble, jazzy]
+        # arm64 runners exist for public repositories only. A release from a private repository
+        # carries amd64 debs alone, and its notes say so.
+        runner: ${{ fromJSON(github.event.repository.private && '["ubuntu-24.04"]' || '["ubuntu-24.04", "ubuntu-24.04-arm"]') }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: build
+        run: tools/release/build_debs.sh "${{ matrix.distro }}" "$RUNNER_TEMP/debs"
+      - name: smoke test in a fresh image
+        run: tools/release/smoke_test.sh "${{ matrix.distro }}" "$RUNNER_TEMP/debs"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: debs-${{ matrix.distro }}-${{ runner.arch }}
+          path: ${{ runner.temp }}/debs/*.deb
+          if-no-files-found: error
+
+  release:
+    name: draft release
+    needs: debs
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: debs-*
+          path: ${{ runner.temp }}/release
+          merge-multiple: true
+      - name: checksums
+        working-directory: ${{ runner.temp }}/release
+        run: sha256sum -- *.deb > SHA256SUMS && cat SHA256SUMS
+      - name: notes
+        env:
+          PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          tools/release/changelog_section.sh --release "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            "${GITHUB_REF_NAME#v}" > "$RUNNER_TEMP/notes.md"
+          if [ "$PRIVATE" = true ]; then
+            printf '\n> Built in a private repository: amd64 debs only.\n' >> "$RUNNER_TEMP/notes.md"
+          fi
+      - name: create the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A draft holds no tag until it is published, so creating one again for the same tag
+          # makes a second draft. The listing includes drafts for a token that can write.
+          existing="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq \
+            '.[] | select(.tag_name == env.GITHUB_REF_NAME) | if .draft then "draft" else "published" end')"
+          if [ -n "$existing" ]; then
+            echo "::error::$GITHUB_REF_NAME already has a release ($(paste -sd, - <<< "$existing")). Delete the draft and re-run this job; a published release is never replaced."
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md" \
+            "$RUNNER_TEMP"/release/*.deb "$RUNNER_TEMP/release/SHA256SUMS"

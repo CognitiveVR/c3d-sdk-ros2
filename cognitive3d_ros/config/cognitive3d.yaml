@@ -1,0 +1,210 @@
+# cognitive3d_ros: every parameter the node reads, at its default.
+#
+# A reference, not a starting point: copy params.minimal.yaml instead. Every value left
+# uncommented here is the node's own default. Lists and per-sensor blocks are commented
+# out, because an empty YAML list stops the node and a copied block turns a stream on.
+# docs/configuration.md describes each parameter, its valid values and its traps.
+
+/**:
+  ros__parameters:
+    # ---- Required ----------------------------------------------------------------
+    # Configure refuses an empty value for these, and a process without
+    # C3D_APPLICATION_API_KEY in its environment. The key is never a parameter.
+    scene_id: ""                        # the scene's UUID
+    scene_version: ""                   # the version number, quoted: "1", not 1
+    # gltf_authored for a scene exported from ROS or Gazebo, unity for a scene authored
+    # in Unity, rep103 for debugging. A wrong choice puts the path off the floor plan,
+    # and nothing in the session shows it. See docs/coordinates.md.
+    pose_convention: ""
+
+    # ---- Identity and scene ------------------------------------------------------
+    # The robot's stable identity. Empty becomes ros-<namespace>, or ros-unnamed in
+    # the root namespace, which every unnamed robot then shares.
+    device_id: ""
+
+    # Also record the robot as a Dynamic Object. Off, Session Replay draws the robot
+    # from the pose timeline and needs no mesh. On, upload the mesh to the scene
+    # version first (docs/scenes.md), or the replay shows no robot.
+    robot_dynamic_object: false
+    robot_mesh: "robot_placeholder"     # read only when robot_dynamic_object is true
+    robot_display_name: "Robot"         # read only when robot_dynamic_object is true
+    robot_object_id: "robot"            # the uploaded object's id; must not be empty
+    mesh_yaw_offset_deg: 0.0            # degrees; Dynamic Object only, and yaw only
+    dynamic_up_offset_meters: 0.0       # meters; Dynamic Object only
+
+    # ---- Poses and the gaze channel ----------------------------------------------
+    sample_rate_hz: 10.0                # pose samples per second
+    # Poses are read in reference_frame, or in the fallback while it does not resolve.
+    # A path recorded in odom starts wherever the robot booted. An empty
+    # reference_frame uses the fallback alone.
+    reference_frame: "map"
+    fallback_reference_frame: "odom"
+    reference_frame_grace_s: 5.0        # seconds to wait for reference_frame
+    robot_frame: "base_link"
+    # A step or a turn between two samples in reference_frame larger than these
+    # records robot.localisation_jump. Per sample: raise them at a lower rate.
+    relocalisation_jump_m: 0.5          # meters
+    relocalisation_jump_deg: 45.0       # degrees
+    # A frame the gaze channel reports instead of robot_frame. A name that does not
+    # resolve falls back to the robot pose with no error; doctor fails on it.
+    gaze_frame: ""
+    gaze_frame_convention: "auto"       # auto, body_forward_x or optical_forward_z
+
+    # ---- The allowlist and per-topic rules ---------------------------------------
+    # Nothing else from your robot is recorded unless its topic is listed. Check the
+    # names with `ros2 topic list`: /odom is a convention, not a promise. /tf and
+    # /tf_static need no entry. Empty by default.
+    # topics:
+    #   - "/odom"
+    #   - "/joint_states"
+    #   - "/scan"
+    #   - "/imu"
+    #   - "/ultrasonic"
+    #
+    # One block per entry, keyed by the entry with each run of / and * collapsed to
+    # one _ and the ends trimmed, so /odom is odom. A key that matches no entry, or
+    # a misspelled field, refuses configure. A value left out takes the message
+    # type's default.
+    # topic_config:
+    #   odom:
+    #     rate_hz: -1.0                 # 0 or less: the type's default (odometry 10 Hz)
+    #     ingest: ""                    # only refuse and full_ingest have an effect
+    #     series: ""                    # Float32 and Int32MultiArray topics only
+    #     qos:
+    #       reliability: ""             # reliable or best_effort; empty negotiates
+    #       durability: ""              # volatile or transient_local
+    #       history: ""                 # keep_last or keep_all
+    #       depth: -1                   # -1 negotiates
+    #   ultrasonic:                     # a std_msgs/msg/Float32 topic
+    #     rate_hz: 5.0
+    #     series: "ultrasonic.distance_centimeters"
+
+    # ---- Discovery ---------------------------------------------------------------
+    # Taken without an allowlist entry, under the node's namespace, or anywhere from
+    # the root namespace.
+    auto_subscribe_standard_types: true # every BatteryState and DiagnosticArray topic
+    # Record every action server named in action_names. An action that is not
+    # enrolled records nothing; doctor's actions check lists both kinds.
+    action_discovery: true
+    # Setting action_names replaces the built-in Nav2 and Create 3 list. An empty
+    # list stops the node; set action_discovery to false instead.
+    # action_names: ["navigate_to_pose", "dock", "pick_object"]
+    discovery_period_s: 5.0             # seconds between scans of the ROS graph
+    warn_on_missing_topics: true        # log allowlisted topics absent from the graph
+
+    # ---- Sessions ----------------------------------------------------------------
+    # With true, activation opens a session. With false, ~/start_session and
+    # ~/end_session do, and ~/start_session needs an active node.
+    auto_start_session: true
+    session_name: ""                    # empty names the session by its id
+    # Extra session properties as key=value strings, typed: "4" is a number.
+    # session_properties: ["site=warehouse-3", "fleet=pilot"]
+    use_sim_time: false
+    # Advance session timestamps with ROS time from each session's wall-clock start.
+    # Requires use_sim_time to be true.
+    sim_time_on_wire: false
+
+    # ---- The spool ---------------------------------------------------------------
+    # Every record is written here before upload. Empty is $XDG_STATE_HOME/cognitive3d,
+    # else $HOME/.local/state/cognitive3d. One process per directory.
+    spool_dir: ""
+    spool_max_mb: 512                   # MiB for every stream; data is evicted at the cap
+    marker_heartbeat_s: 5.0             # seconds
+    orphan_stale_after_s: 30.0          # seconds; must exceed marker_heartbeat_s
+
+    # ---- Uploads -----------------------------------------------------------------
+    # Record and spool, and upload nothing. Applied at once by `ros2 param set`.
+    uploads_paused: false
+    http_connect_timeout_s: 10          # seconds
+    # An upload slower than this for http_low_speed_time_s is abandoned and retried.
+    http_low_speed_limit_bytes_per_s: 1024
+    http_low_speed_time_s: 60           # seconds; shorter than http_timeout_s
+    http_timeout_s: 300                 # seconds; the ceiling for one request
+    retry_min_s: 60.0                   # seconds; doubles per failure, to retry_max_s
+    retry_max_s: 240.0                  # seconds
+
+    # ---- Cameras and lidars ------------------------------------------------------
+    # Off until a name is listed. A name is a label, not the topic.
+    # cameras: ["front"]
+    # camera:
+    #   front:
+    #     topic: ""                     # Image or CompressedImage; required
+    #     rate_hz: 1.0                  # frames per second
+    #     format: "jpeg"                # the only accepted value
+    #     jpeg_quality: 80              # 1 to 100
+    #     max_width_px: 640             # 0 never resizes
+    #     frame: ""                     # empty uses header.frame_id
+    #     hfov_degrees: 0.0             # full angles in degrees, sent with every frame;
+    #     vfov_degrees: 0.0             #   both or neither, 0 < angle < 180; 0 is unset
+    #     camera_info_topic: "auto"     # field of view from CameraInfo while those are unset;
+    #                                   #   auto is the image topic's sibling, "" none
+    #     qos:
+    #       reliability: ""
+    #       durability: ""
+    #       history: ""
+    #       depth: -1
+    #
+    # lidars: ["scan"]
+    # lidar:
+    #   scan:
+    #     topic: ""                     # LaserScan or PointCloud2; required
+    #     rate_hz: 2.0                  # scans per second
+    #     frame: ""                     # empty uses header.frame_id
+    #     intensities: false            # LaserScan only
+    #     pointcloud:                   # PointCloud2 only
+    #       voxel_leaf_m: 0.05          # meters; 0 keeps every point
+    #       position: "int16_mm"        # or float32; int16_mm drops points past 32.767 m
+    #       color: "none"               # or rgb565, rgb332, rgb888
+    #       intensity: "none"           # or uint8
+    #       max_points: 100000          # a larger cloud is dropped whole
+    #       zstd_level: 1               # 0 to 22
+    #
+    # Records upload in parts, cut at whichever bound comes first. The byte bounds
+    # run from 1024 to 33554432.
+    camera_flush_s: 2.0
+    camera_flush_bytes: 4194304
+    lidar_flush_s: 2.0
+    lidar_flush_bytes: 4194304
+
+    # ---- Described sensors (provisional) -----------------------------------------
+    # Session properties describing a plain sensor, so Session Replay can draw it.
+    # The topic must also be in topics; the series is worked out from it.
+    # sensors: ["ultrasonic", "line"]
+    # sensor:
+    #   ultrasonic:
+    #     kind: "cone_rangefinder"      # a std_msgs/msg/Float32 distance
+    #     topic: "/ultrasonic"          # required
+    #     units: "centimeters"          # what the topic publishes in; required
+    #     cone_half_angle_deg: 7.5      # degrees, above 0 and below 90; required
+    #     range_min_m: 0.0              # meters; 0 records none
+    #     range_max_m: 0.0              # meters; 0 records none
+    #     mount_xyz_m: [0.10, 0.00, 0.05]   # meters in mount_parent; omit to record none
+    #     mount_yaw_deg: 0.0            # degrees; recorded with mount_xyz_m
+    #     frame: ""
+    #     mount_parent: ""
+    #     mount_measured: false         # true once the mount was measured
+    #   line:
+    #     kind: "binary_array"          # a std_msgs/msg/Int32MultiArray of one-bit elements
+    #     topic: "/line_sensor"
+    #     element_count: 4              # 1 to 32; required
+    #     meaning_0: ""                 # recorded verbatim
+    #     meaning_1: ""
+
+    # ---- Remote variables --------------------------------------------------------
+    # Fetch remote variables and A/B arms once per session. docs/remote-variables.md.
+    remote_variables: true
+    # The fetch's timeout in seconds. Must be positive: turn the fetch off with
+    # remote_variables, never with 0.
+    remote_variables_timeout_s: 3.0
+
+    # ---- Diagnostics and limits --------------------------------------------------
+    report_period_s: 10.0               # seconds between reports and ~/diagnostics
+    # Events each source may record per second. Each topic is a source, and ~/events
+    # is one. 0 removes the cap; the excess is counted in c3d.events_suppressed.
+    event_rate_limit_hz: 5.0
+    dry_run: false                      # no session and no upload; doctor sets it
+
+    # ---- Development -------------------------------------------------------------
+    # For a local capture stub. Leave both at their defaults on a robot.
+    gateway: ""                         # overrides the data host
+    protocol: "https"                   # http only beside a gateway that is not Cognitive3D

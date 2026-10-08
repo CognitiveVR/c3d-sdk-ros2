@@ -1,0 +1,23 @@
+# End the running Cognitive3D session: the Cognitive3D node's `~/end_session`
+# service.
+#
+# Ending writes the session's end to the spool and closes the session, then
+# returns; it never waits for an upload. Once it has returned, stopping the
+# process loses nothing and records no abnormal end: what is spooled uploads in
+# the background, or at the node's next start.
+
+# Recorded on the session's end event. A task orchestrator should say why --
+# "completed", "aborted", "operator_stop" -- because a session that ended
+# because the robot gave up is not the same measurement as one that finished.
+# Empty records "ended_by_service".
+string reason
+---
+# False when no session was running.
+bool ok
+
+# The session that was ended, so a caller can record which one it just closed.
+# Empty when no session was running.
+string session_id
+
+# Empty on success; otherwise why the request was refused.
+string message

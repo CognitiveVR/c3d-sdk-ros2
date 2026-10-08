@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Community support on Discord
+    url: https://discord.gg/x38sNUdDRH
+    about: Questions about integrating the SDK. For account or commercial support, email support@cognitive3d.com.
+  - name: Report a security vulnerability
+    url: https://github.com/CognitiveVR/c3d-sdk-ros2/blob/main/SECURITY.md
+    about: Report it privately to support@cognitive3d.com, never in a public issue.

@@ -1,0 +1,46 @@
+# The scan-plane pass of the synthetic tier: one camera and one LaserScan on the SAME tf frame.
+#
+# `pose_convention` is overridden per pass on the command line, and the verifier reads the value
+# back off the wire rather than trusting this file -- under rep103 the two pose rules coincide
+# exactly, so a pass that quietly ran the default would prove nothing and still be green.
+#
+# `fallback_reference_frame` is empty on purpose. The mount's transform is published static under
+# `map`, so the expected world position of a ray is a constant this tier knows; falling back to
+# `odom` would silently re-parent every sensor pose and the reconstruction would be checked
+# against the wrong frame. With no fallback the records are dropped instead, and a pass with no
+# records fails.
+/**:
+  ros__parameters:
+    scene_id: "a1b2c3d4-0000-4000-8000-000000000014"
+    scene_version: "3"
+    device_id: "sim-robot-01"
+    protocol: "http"
+    gateway: "127.0.0.1:8932"
+    # Shared by both passes, and cleared between them by run_synthetic_integration.sh.
+    spool_dir: "/tmp/c3d_scan_plane_spool"
+    pose_convention: "gltf_authored"
+    sample_rate_hz: 10.0
+    reference_frame: "map"
+    fallback_reference_frame: ""
+    robot_frame: "base_link"
+    robot_display_name: "Scan Plane Robot"
+    discovery_period_s: 2.0
+    report_period_s: 6.0
+    topics:
+      - "/tf"
+      - "/tf_static"
+    cameras: ["mount"]
+    camera:
+      mount:
+        topic: "/fake/camera/image_raw"
+        rate_hz: 2.0
+        max_width_px: 160
+        jpeg_quality: 70
+    lidars: ["scan"]
+    lidar:
+      scan:
+        topic: "/fake/scan"
+        rate_hz: 2.0
+        intensities: true
+    camera_flush_s: 2.0
+    lidar_flush_s: 2.0

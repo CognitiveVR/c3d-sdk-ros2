@@ -1,0 +1,80 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>cognitive3d_ros</name>
+  <version>1.0.0</version>
+  <description>
+    Records a ROS 2 robot's telemetry as Cognitive3D sessions. A lifecycle node
+    that samples the robot's pose from tf, records allowlisted sensor topics,
+    camera and lidar frames, action outcomes and published events, spools them
+    to disk and uploads them to the Cognitive3D platform. Subscribe-only: it
+    creates no publishers on any topic it does not own and cannot write to a
+    control stack. Ships the node, its rclcpp_components plugin, the doctor
+    preflight command and the scene and session tools.
+  </description>
+  <maintainer email="support@cognitive3d.com">Cognitive3D</maintainer>
+  <license file="LICENSE">LicenseRef-Cognitive3D-SDK</license>
+
+  <url type="website">https://cognitive3d.com</url>
+  <url type="repository">https://github.com/CognitiveVR/c3d-sdk-ros2</url>
+  <url type="bugtracker">https://github.com/CognitiveVR/c3d-sdk-ros2/issues</url>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <!-- core/ finds libzstd through pkg-config. -->
+  <buildtool_depend>pkg-config</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>rclcpp_lifecycle</depend>
+  <depend>rclcpp_components</depend>
+  <depend>ament_index_cpp</depend>
+  <depend>lifecycle_msgs</depend>
+  <depend>diagnostic_msgs</depend>
+  <depend>rosgraph_msgs</depend>
+
+  <!--
+    Core translator message packages only. Every robot has these.
+    nav2_msgs deliberately lives in the optional cognitive3d_ros_nav2 package,
+    so a robot not running Nav2 does not pull it in.
+  -->
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>tf2_msgs</depend>
+  <depend>action_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>cognitive3d_ros_msgs</depend>
+
+  <!-- Camera frames are decoded, resized and JPEG-encoded here. -->
+  <depend>cv_bridge</depend>
+
+  <!--
+    Build-only. No installed header includes any of these, so a package building
+    against this one needs none of them. nlohmann_json is header-only and
+    compiled in; the others are linked as shared libraries, which dpkg-shlibdeps
+    adds to a deb's runtime dependencies by soname, so a robot installs the
+    runtime library and never the -dev package. libcurl is also named as a
+    runtime key for an install that resolves exec dependencies through rosdep.
+    Cap'n Proto, core/'s other dependency, has no rosdep key, so it is an apt
+    line in the install instructions and in docker/Dockerfile.test instead.
+  -->
+  <build_depend>libcurl-dev</build_depend>
+  <build_depend>nlohmann-json-dev</build_depend>
+  <build_depend>libzstd-dev</build_depend>
+  <build_depend>libopencv-dev</build_depend>
+  <exec_depend>libcurl</exec_depend>
+
+  <!-- Imported by launch/cognitive3d.launch.py. -->
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+  <!-- test_launch_autostart.py reads the launched node's state over its services. -->
+  <test_depend>rclpy</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

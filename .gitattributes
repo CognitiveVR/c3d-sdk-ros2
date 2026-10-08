@@ -1,0 +1,6 @@
+# Every text file is stored and checked out with LF; binary files are detected and left alone.
+* text=auto eol=lf
+
+# Copies of the platform's canonical schemas (core/capnp/README.md explains), pinned by
+# core/capnp/CHECKSUMS. Excluded from language statistics; diffs stay visible for review.
+core/capnp/* linguist-vendored

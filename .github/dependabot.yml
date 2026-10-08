@@ -1,0 +1,11 @@
+# Actions are pinned by commit SHA, and Dependabot raises no security alert for a SHA pin, so its
+# weekly version updates are what keep the pins current.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']

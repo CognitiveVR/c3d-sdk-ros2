@@ -1,0 +1,38 @@
+{
+  "about": "Environment resolution cases. core/test/test_environment.cpp and tools/test_c3d_api_env.py both run every case, so the C++ and Python halves of the toolchain cannot disagree about which hosts a process environment selects. A variable absent from `env` is unset; a string, even an empty one, is set to that value. `mentions` lists the variable names a refusal must name, and `says`, when present, a phrase both halves must word identically.",
+  "cases": [
+    {"env": {}, "accept": true, "name": "prod", "data": "data.cognitive3d.com", "api": "api.cognitive3d.com", "custom": false},
+    {"env": {"C3D_ENVIRONMENT": "prod"}, "accept": true, "name": "prod", "data": "data.cognitive3d.com", "api": "api.cognitive3d.com", "custom": false},
+
+    {"env": {"C3D_ENVIRONMENT": "dev"}, "accept": false, "mentions": ["C3D_ENVIRONMENT", "C3D_DATA_HOST", "C3D_API_HOST"], "says": "no trimming, no case folding"},
+    {"env": {"C3D_ENVIRONMENT": ""}, "accept": false, "mentions": ["C3D_ENVIRONMENT"]},
+    {"env": {"C3D_ENVIRONMENT": " "}, "accept": false, "mentions": ["C3D_ENVIRONMENT"]},
+    {"env": {"C3D_ENVIRONMENT": "prod "}, "accept": false, "mentions": ["C3D_ENVIRONMENT"]},
+    {"env": {"C3D_ENVIRONMENT": " prod"}, "accept": false, "mentions": ["C3D_ENVIRONMENT"]},
+    {"env": {"C3D_ENVIRONMENT": "PROD"}, "accept": false, "mentions": ["C3D_ENVIRONMENT"]},
+    {"env": {"C3D_ENVIRONMENT": "Dev"}, "accept": false, "mentions": ["C3D_ENVIRONMENT"]},
+    {"env": {"C3D_ENVIRONMENT": "production"}, "accept": false, "mentions": ["C3D_ENVIRONMENT"]},
+    {"env": {"C3D_ENVIRONMENT": "development"}, "accept": false, "mentions": ["C3D_ENVIRONMENT"]},
+    {"env": {"C3D_ENVIRONMENT": "staging"}, "accept": false, "mentions": ["C3D_ENVIRONMENT"]},
+    {"env": {"C3D_ENVIRONMENT": "custom"}, "accept": false, "mentions": ["C3D_ENVIRONMENT"]},
+
+    {"env": {"C3D_DATA_HOST": "data.example.test", "C3D_API_HOST": "api.example.test"}, "accept": true, "name": "custom", "data": "data.example.test", "api": "api.example.test", "custom": true},
+    {"env": {"C3D_ENVIRONMENT": "prod", "C3D_DATA_HOST": "data.example.test", "C3D_API_HOST": "api.example.test"}, "accept": false, "mentions": ["C3D_ENVIRONMENT", "C3D_DATA_HOST"], "says": "name the hosts one way"},
+    {"env": {"C3D_ENVIRONMENT": "", "C3D_DATA_HOST": "data.example.test", "C3D_API_HOST": "api.example.test"}, "accept": false, "mentions": ["C3D_ENVIRONMENT"]},
+    {"env": {"C3D_DATA_HOST": "127.0.0.1:8787", "C3D_API_HOST": "127.0.0.1:8788"}, "accept": true, "name": "custom", "data": "127.0.0.1:8787", "api": "127.0.0.1:8788", "custom": true},
+    {"env": {"C3D_ENVIRONMENT": "dev", "C3D_DATA_HOST": "data.example.test", "C3D_API_HOST": "api.example.test"}, "accept": false, "mentions": ["C3D_ENVIRONMENT"]},
+
+    {"env": {"C3D_DATA_HOST": "data.example.test"}, "accept": false, "mentions": ["C3D_DATA_HOST", "C3D_API_HOST"], "says": "set both, or neither"},
+    {"env": {"C3D_API_HOST": "api.example.test"}, "accept": false, "mentions": ["C3D_DATA_HOST", "C3D_API_HOST"]},
+    {"env": {"C3D_ENVIRONMENT": "prod", "C3D_API_HOST": "api.example.test"}, "accept": false, "mentions": ["C3D_DATA_HOST", "C3D_API_HOST"]},
+    {"env": {"C3D_DATA_HOST": "", "C3D_API_HOST": "api.example.test"}, "accept": false, "mentions": ["C3D_DATA_HOST"], "says": "is set but empty"},
+    {"env": {"C3D_DATA_HOST": "data.example.test", "C3D_API_HOST": ""}, "accept": false, "mentions": ["C3D_API_HOST"], "says": "is set but empty"},
+    {"env": {"C3D_DATA_HOST": "https://data.example.test", "C3D_API_HOST": "api.example.test"}, "accept": false, "mentions": ["C3D_DATA_HOST"]},
+    {"env": {"C3D_DATA_HOST": "data.example.test", "C3D_API_HOST": "api.example.test/v0"}, "accept": false, "mentions": ["C3D_API_HOST"]},
+    {"env": {"C3D_DATA_HOST": "data.cognitive3d.com@evil.example", "C3D_API_HOST": "api.example.test"}, "accept": false, "mentions": ["C3D_DATA_HOST"]},
+    {"env": {"C3D_DATA_HOST": "data.example.test", "C3D_API_HOST": " api.example.test"}, "accept": false, "mentions": ["C3D_API_HOST"]},
+    {"env": {"C3D_DATA_HOST": "data.example.test:", "C3D_API_HOST": "api.example.test"}, "accept": false, "mentions": ["C3D_DATA_HOST"]},
+    {"env": {"C3D_DATA_HOST": "data.example.test:99999", "C3D_API_HOST": "api.example.test"}, "accept": false, "mentions": ["C3D_DATA_HOST"]},
+    {"env": {"C3D_DATA_HOST": "data.example.test", "C3D_API_HOST": "api.example.test?x=1"}, "accept": false, "mentions": ["C3D_API_HOST"]}
+  ]
+}

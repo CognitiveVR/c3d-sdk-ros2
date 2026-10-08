@@ -1,0 +1,144 @@
+# Every job runs the same entry point a developer runs. A CI recipe that diverges from the local
+# one drifts, and then what CI proves stops being what anyone can reproduce.
+name: build and test
+
+on:
+  # `push` is filtered so a feature branch does not run twice. `pull_request` is not filtered: a
+  # pull request based on another feature branch must still get CI.
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+  # nightly.yml calls this on a schedule.
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    # The ROS-free boundary. tools/build_and_test.sh builds core/ under `env -i`, which is stricter
+    # than not sourcing setup.bash: the ROS image puts /opt/ros/<distro>/bin on PATH, and CMake
+    # derives a package search prefix from every PATH entry ending in /bin, so
+    # find_package(rclcpp) inside core/ would configure in a shell that never touched ROS.
+    name: core (no ROS)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: tools/build_and_test.sh core
+
+  ros:
+    # Jazzy. The name is unqualified because required status checks match it.
+    name: ament packages
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: tools/build_and_test.sh ros
+
+  humble:
+    # Humble's APIs differ from Jazzy's in ways a Jazzy build cannot see.
+    name: ament packages (Humble)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: tools/build_and_test.sh humble
+
+  synthetic:
+    # The capture tier, and the only job that can see what reaches the wire: the generated Cap'n
+    # Proto readers are PRIVATE to core/ so that a consumer needs no capnp, which also means no
+    # ament test can decode a payload.
+    name: synthetic integration
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: tools/build_and_test.sh synthetic
+
+  arm64:
+    # The common robot architecture. arm64 runners are free only on public repositories, so these
+    # run only there, and not on pull requests.
+    name: ${{ matrix.selector }} (arm64)
+    if: ${{ !github.event.repository.private && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        selector: [ros, humble]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: tools/build_and_test.sh ${{ matrix.selector }}
+
+  debs:
+    # The release build without the release: the scripts release.yml runs on a tag, on amd64.
+    name: deb dry run (${{ matrix.distro }})
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [humble, jazzy]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: tools/release/build_debs.sh ${{ matrix.distro }} "$RUNNER_TEMP/debs"
+      - run: tools/release/smoke_test.sh ${{ matrix.distro }} "$RUNNER_TEMP/debs"
+
+  tools:
+    # The tools install with the Humble debs, whose Python is 3.10, and with the Jazzy ones, 3.12.
+    name: python tools (${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      # Standard library only: an operator verifying a production session should not need a
+      # virtualenv to do it, so this job has no dependency step.
+      #
+      # Every suite is FOUND, not listed, and all of them run before the job fails, so the run
+      # that needs the detail of a failure has all of it.
+      - name: every tools/test_*.py
+        run: |
+          shopt -s nullglob
+          suites=(tools/test_*.py)
+          if [ ${#suites[@]} -eq 0 ]; then
+            echo "no tools/test_*.py found -- this job would have passed vacuously" >&2
+            exit 1
+          fi
+          status=0
+          for suite in "${suites[@]}"; do
+            echo "== $suite"
+            python3 "$suite" || status=1
+          done
+          exit $status
+
+  markdown:
+    name: markdownlint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Tracked files only: a bare `**/*.md` follows untracked symlinks on a developer's machine
+      # into neighbouring checkouts.
+      - run: git ls-files '*.md' | tr '\n' '\0' | xargs -0 npx --yes markdownlint-cli@0.49.1

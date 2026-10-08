@@ -1,0 +1,87 @@
+/**:
+  ros__parameters:
+    scene_id: "a1b2c3d4-0000-4000-8000-000000000013"
+    scene_version: "3"
+    device_id: "sim-robot-01"
+    protocol: "http"
+    gateway: "127.0.0.1:8931"
+    spool_dir: "/tmp/c3d_synth_spool"
+    pose_convention: "rep103"
+    sample_rate_hz: 10.0
+    reference_frame: "map"
+    fallback_reference_frame: "odom"
+    robot_frame: "base_link"
+    robot_display_name: "Test Robot"
+    session_properties:
+      - "site=warehouse-3"
+      - "fleet=pilot"
+      - "policy_version=2.1.0"
+    discovery_period_s: 2.0
+    report_period_s: 6.0
+    topics:
+      - "/tf"
+      - "/tf_static"
+      - "/odom"
+      - "/joint_states"
+      - "/battery_state"
+      - "/diagnostics"
+      - "/navigate_to_pose/_action/status"
+    topic_config:
+      tf:
+        ingest: "downsample"
+        rate_hz: 10.0
+      odom:
+        ingest: "downsample"
+        rate_hz: 5.0
+      joint_states:
+        ingest: "downsample"
+        rate_hz: 2.0
+      navigate_to_pose__action_status:
+        ingest: "full_ingest"
+        qos:
+          durability: "transient_local"
+          depth: 1
+
+    # The two binary streams. One camera and two lidars, which is the shape the
+    # capture tier asserts on: a JPEG stream that is resized on the way out, a
+    # LaserScan that keeps the sensor's own units, and a point cloud that goes
+    # through the voxel pass and zstd.
+    cameras: ["front", "zoom"]
+    camera:
+      front:
+        topic: "/fake/camera/image_raw"
+        rate_hz: 2.0
+        # Below the publisher's 320, so the resize path runs and the width on the
+        # wire is the one that was SENT rather than the one that was configured.
+        max_width_px: 160
+        jpeg_quality: 70
+        # Set by parameter, so every frame carries exactly these two Float32 values. 45.5 is
+        # not a whole number, so a value truncated anywhere on the way shows.
+        hfov_degrees: 61.0
+        vfov_degrees: 45.5
+      # The same camera's JPEG stream, with no field of view parameters: its frames take theirs
+      # from the sibling /fake/camera/camera_info, whose focal length changes every frame.
+      # "front" has that sibling too, and its parameters win over it.
+      zoom:
+        topic: "/fake/camera/image_raw/compressed"
+        rate_hz: 2.0
+    lidars: ["scan", "depth"]
+    lidar:
+      scan:
+        topic: "/fake/scan"
+        rate_hz: 2.0
+        intensities: true
+      depth:
+        topic: "/fake/points"
+        rate_hz: 1.0
+        pointcloud:
+          voxel_leaf_m: 0.05
+          position: "int16_mm"
+          color: "rgb565"
+          intensity: "none"
+          max_points: 100000
+          zstd_level: 1
+    # Short, so a run of this length cuts several parts of each and the part
+    # counter is actually exercised.
+    camera_flush_s: 2.0
+    lidar_flush_s: 2.0
