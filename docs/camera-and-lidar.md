@@ -310,6 +310,10 @@ point cloud's size or `rate_hz`.
 Posing a record can wait up to 50 milliseconds for its transform, which is usually about to
 arrive. Once a lookup for a frame fails, the node waits for that frame at most once a second until
 one succeeds, so a frame tf cannot resolve costs that sensor's records and not the node's time.
+A sensor whose records are stamped ahead of their tf chain, such as a driver that stamps as it
+publishes on a robot whose odometry arrives at 20 Hz, resolves only by waiting, so it waits on every
+record. At 30 records a second that can delay pose sampling: lower its `rate_hz` if `poses=` in the
+report line rises slower than `sample_rate_hz`.
 
 ## What gets refused
 

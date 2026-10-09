@@ -131,9 +131,10 @@ recorded; the event lets an analysis exclude the discontinuity.
 Comparing poses 0.1 seconds apart, rather than consecutive samples, makes detection the same at any
 `sample_rate_hz` of 10 or more. A localizer that future-dates its transform, as AMCL does, is
 interpolated by tf between two of its updates, so one correction reaches the pose spread over every
-sample in between, and consecutive samples at a high rate would each see only a part of it. A correction spread over more
-than 0.1 seconds, behind a localizer that updates slower than 10 Hz, can still be split between two
-comparisons and reach the threshold in neither. Nothing is compared across a change of
+sample in between, and consecutive samples at a high rate would each see only a part of it. A
+correction spread over more than 0.1 seconds, behind a localizer that updates slower than 10 Hz, can
+still be split between two comparisons and reach the threshold in neither, or, when it is large,
+reach it in both and be recorded twice. Nothing is compared across a change of
 reference frame, a stale transform or the start of a session.
 
 Both thresholds hold for 0.1 seconds of motion. Below a `sample_rate_hz` of 10, each sample covers

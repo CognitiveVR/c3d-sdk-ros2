@@ -526,7 +526,8 @@ namespace {
 // lookup time, so the correction reaches a latest-time lookup as a ramp one scan period long,
 // about a second late -- the shape no per-sample threshold sees at a high rate. Sampled at
 // `sample_hz` of wire time from 2 s to 8 s, publishing everything due before each sample.
-// Returns the number of samples recorded.
+// Returns the number of samples recorded. The position cases use 1.2 m: a much larger correction
+// can reach the threshold in two consecutive comparisons and be recorded twice.
 int SampleAnAmclCorrection(tf2_ros::Buffer& buffer, PoseSampler& sampler, SessionRunner& runner,
                            double sample_hz, double jump_m, double jump_deg) {
   struct Pending {

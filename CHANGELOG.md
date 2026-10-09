@@ -27,7 +27,8 @@ marks as provisional may change in a minor release, and its entry here says how 
 - `robot.localisation_jump` compares poses about 0.1 seconds apart rather than consecutive samples,
   so detection does not weaken as `sample_rate_hz` rises: a correction that tf spreads over several
   samples, as it does behind AMCL, is no longer cut into steps too small to detect. Below 10 Hz it
-  compares consecutive samples, as before.
+  compares consecutive samples, as before. A localizer slower than 10 Hz can still spread a
+  correction across two comparisons, as in 1.0.0.
 - `c3d.pose_failures`, `c3d.stale_poses` and `c3d.gaze_frame_failures` count samples, so at 30 Hz
   the same failure counts three times as many as at 10 Hz.
 - To keep 1.0.0's rates and spool, set `sample_rate_hz: 10.0`, `camera.<name>.rate_hz: 1.0`,
@@ -40,6 +41,13 @@ marks as provisional may change in a minor release, and its entry here says how 
 - A camera or lidar whose frame tf cannot resolve no longer waits 50 ms for it on every record,
   which held up the node's callback thread and its pose sampling. After a failed lookup the node
   waits for that frame at most once a second until it resolves.
+
+### Known limitations
+
+- A camera or lidar whose records are stamped ahead of their tf chain, such as a driver that stamps
+  as it publishes on a robot whose odometry arrives at 20 Hz, waits up to 50 ms for every record on
+  the node's callback thread. At 30 records a second this can delay pose sampling. Lower that
+  sensor's `rate_hz` if `poses=` in the report line rises slower than `sample_rate_hz`.
 
 ## [1.0.0] - 2026-10-08
 
