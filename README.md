@@ -111,7 +111,7 @@ own repository's `.claude/skills/`, which shares it with your team, or into `~/.
 yourself:
 
 ```bash
-git clone --depth 1 --branch v1.0.0 https://github.com/CognitiveVR/c3d-sdk-ros2.git /tmp/c3d-sdk-ros2
+git clone --depth 1 --branch v1.1.0 https://github.com/CognitiveVR/c3d-sdk-ros2.git /tmp/c3d-sdk-ros2
 mkdir -p .claude/skills
 cp -r /tmp/c3d-sdk-ros2/.claude/skills/integrate-cognitive3d-ros2 .claude/skills/
 ```

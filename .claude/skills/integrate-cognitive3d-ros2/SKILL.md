@@ -6,7 +6,7 @@ description: Use when adding Cognitive3D telemetry (the cognitive3d_ros node, th
 # Integrate the Cognitive3D SDK for ROS 2
 
 This procedure adds the Cognitive3D node to a robot that already works: its own tf tree, topic
-names and launch files. It targets SDK 1.0.0, and every link below points at that version's docs.
+names and launch files. It targets SDK 1.1.0, and every link below points at that version's docs.
 
 Most mistakes in this integration produce no error. The platform accepts the session with HTTP 200,
 and it is empty, misplaced or filed under another project. So measure the robot before deciding
@@ -91,51 +91,51 @@ Make each decision from the survey, in one or two sentences, and record why.
 - **The scene.** Ask the human where it came from and for its scene id and version number (the
   `versionNumber`, not the `versionId`). It must belong to the same project as the application key;
   with `C3D_ORG_API_KEY` set, doctor's `scene/project` check confirms the version number in Step 5,
-  and with `C3D_PROJECT_ID` set as well, the project. See [Scenes](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/scenes.md).
+  and with `C3D_PROJECT_ID` set as well, the project. See [Scenes](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/scenes.md).
 - **The pose convention.** `gltf_authored` for a scene exported from ROS or Gazebo as glTF,
   including with `export_world_gltf.sh`; `unity` for a scene authored in Unity. Ask, never infer: a
   wrong choice is invisible in every check except Session Replay. See
-  [Choosing a pose convention](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/coordinates.md#choosing-a-pose-convention).
+  [Choosing a pose convention](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/coordinates.md#choosing-a-pose-convention).
 - **The frames.** `reference_frame` stays `map` when the survey found one. `robot_frame` is the
   frame the body is built around, normally `base_link` even where a `base_footprint` exists, as
   either parent or child; see
-  [Choosing the body frame](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/coordinates.md#choosing-the-body-frame).
+  [Choosing the body frame](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/coordinates.md#choosing-the-body-frame).
   With no `map`, once doctor's `robot pose` check in Step 5 confirms it, say so to the human as a
   finding: see
-  [When the robot has no map frame](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/coordinates.md#when-the-robot-has-no-map-frame).
+  [When the robot has no map frame](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/coordinates.md#when-the-robot-has-no-map-frame).
 - **The gaze frame.** Leave `gaze_frame` empty unless a forward camera's viewpoint matters. A body
   frame or an `_optical_frame` both work; check the convention the node logs at configure. See
-  [The gaze channel](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/coordinates.md#the-gaze-channel).
+  [The gaze channel](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/coordinates.md#the-gaze-channel).
 - **The allowlist.** List the topics the survey found, by their real names. Leave out `/tf`,
   `/tf_static`, images and point clouds. Batteries, diagnostics and the Nav2 and Create 3 actions
   under the node's namespace need no entry. Give each `Float32` or `Int32MultiArray` topic a
   `series` that names its unit. See
-  [The allowlist](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/recording.md#the-allowlist).
+  [The allowlist](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/recording.md#the-allowlist).
 - **Sensor descriptions.** For an allowlisted rangefinder (`Float32`) or one-bit array
   (`Int32MultiArray`), a `sensors` entry records its kind, cone, range and mount as session
   properties, so Session Replay can draw it. Session Replay draws a cone only for a
   `cone_rangefinder` named `ultrasonic`: name the rangefinder that, or it is recorded and drawn with
   no cone. Never write `c3d.` keys into `session_properties`: configure refuses them. Provisional.
-  See [Described sensors](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/configuration.md#described-sensors).
+  See [Described sensors](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/configuration.md#described-sensors).
 - **QoS.** For a topic whose publishers differ in durability, as `/joint_states` often does under
   ros2_control (`joint_state_broadcaster` transient-local, `joint_state_publisher` volatile), set
   `topic_config.<key>.qos.durability: volatile`; for one whose publishers differ in reliability,
   `qos.reliability: best_effort`. Otherwise the node can subscribe before it sees the second
   publisher and never receive from it. See
-  [Ingest and QoS](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/recording.md#ingest-and-qos).
+  [Ingest and QoS](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/recording.md#ingest-and-qos).
 - **Actions.** Set `action_names` only for a custom action. It replaces the built-in list, so keep
   the defaults the robot uses beside it, and never set it to `[]`. See
-  [Actions](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/recording.md#actions).
+  [Actions](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/recording.md#actions).
 - **Sessions.** Keep `auto_start_session: true` unless a mission or task orchestrator owns the
   session boundaries. If the project runs A/B tests, the orchestrator passes a new UUID as
   `participant_id` for every run. Leave `session_name` unset: set as a parameter, it names every
   session alike, and a per-run name goes in the `~/start_session` request. See
-  [Sessions](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/sessions.md#starting-a-session-from-another-node).
+  [Sessions](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/sessions.md#starting-a-session-from-another-node).
 - **Cameras and lidars.** Off unless the human asks. Each is a name with its own topic, sized by
   `doctor`. A camera's field of view lets Session Replay draw its frustum. It comes from the
   driver's CameraInfo when that is calibrated; when `doctor`'s `camera/<name> field of view` says
   there is no source, set `camera.<name>.hfov_degrees` and `vfov_degrees` from the datasheet or a
-  measurement, both or neither. See [Camera and lidar](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/camera-and-lidar.md).
+  measurement, both or neither. See [Camera and lidar](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/camera-and-lidar.md).
 - **The robot's Dynamic Object.** Leave `robot_dynamic_object` off. Session Replay draws the robot
   from the pose timeline, and turning it on needs a mesh upload first.
 - **The device id.** A stable name unique to this robot.
@@ -145,7 +145,7 @@ Make each decision from the survey, in one or two sentences, and record why.
 Copy `params.template.yaml` from this skill's directory to `~/cognitive3d/params.yaml`, the path
 the SDK's docs use, unless the human chooses another, and replace every placeholder with a value
 from Step 2. Delete each optional block that does not apply rather than leaving it empty: an empty
-YAML list stops the node at startup. Keep the `/**` key and the quotes around `scene_version`. [Configuration](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/configuration.md)
+YAML list stops the node at startup. Keep the `/**` key and the quotes around `scene_version`. [Configuration](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/configuration.md)
 documents every parameter.
 
 ## Step 4: Wire it into launch
@@ -175,11 +175,11 @@ cognitive3d = IncludeLaunchDescription(
 - The node needs `C3D_APPLICATION_API_KEY` in its own environment: exported in the launching shell,
   `Environment=` or `EnvironmentFile=` in a systemd unit, or `-e` on a container.
 - Under systemd or in a container, follow
-  [Running in a container or under systemd](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/sessions.md#running-in-a-container-or-under-systemd):
+  [Running in a container or under systemd](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/sessions.md#running-in-a-container-or-under-systemd):
   an explicit `spool_dir` on persistent storage, the node in the container's main process tree,
   and `--network=host --ipc=host`. When the robot's stack is a container you can only
   `docker exec` into, follow
-  [A robot stack in a container you cannot recreate](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/sessions.md#a-robot-stack-in-a-container-you-cannot-recreate):
+  [A robot stack in a container you cannot recreate](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/sessions.md#a-robot-stack-in-a-container-you-cannot-recreate):
   stop the node with SIGINT to the launch process, never by stopping the container, and tell the
   human where the spool lives and whether it survives the container being replaced.
 - As a composable component, load it into `component_container_isolated` or a container of its
@@ -218,7 +218,7 @@ catches a scene from another project and a version id given as `scene_version`, 
 the node the launch file runs and says so; for a component you load yourself, its configure log line
 `translating N message type(s)` must name `nav2_msgs/msg/BehaviorTreeLog`. Read every note to the
 human verbatim. See
-[Doctor and verification](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/doctor-and-verification.md#checks).
+[Doctor and verification](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/doctor-and-verification.md#checks).
 
 ## Step 6: Record and verify the first session
 
@@ -227,7 +227,7 @@ human verbatim. See
    Warnings that allowlisted topics are not on the graph, or that there is no pose yet, are normal in
    the first seconds. What says recording works is the report line the node logs every 10 seconds:
    `frame=` names the reference frame and `poses=` rises. See
-   [The report line](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/sessions.md#the-report-line); its `events=` counts only events
+   [The report line](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/sessions.md#the-report-line); its `events=` counts only events
    published on `~/events`, never objectives.
 2. End the session with `ros2 lifecycle set /cognitive3d deactivate`, and leave the node running
    for a minute so the spool uploads.
@@ -246,7 +246,7 @@ human verbatim. See
    its direction of travel, the allowlisted sensors appear under their own names, and the expected
    objectives are there. Only this catches a wrong pose convention or an `odom` origin, and no tool
    reads sensors, events or objectives back from a stored session. See
-   [Check Session Replay](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/doctor-and-verification.md#check-session-replay).
+   [Check Session Replay](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/doctor-and-verification.md#check-session-replay).
 
 ## Step 7: Hand off
 
@@ -280,18 +280,18 @@ Not verifiable from the data:
 
 Each is explained at the link. If the docs are unreachable, the line is the rule.
 
-- A params file not keyed `/**` applies nothing to a node of another name. See [the params file is ignored](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/troubleshooting.md#the-node-ignores-the-params-file).
-- An application key or scene id from another project files the session elsewhere, or in an empty scene. See [an empty world](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/troubleshooting.md#the-session-is-in-an-empty-world-or-the-scene-looks-wrong).
-- The wrong `pose_convention` turns the whole path 90 degrees, and no tool reports it. See [the robot is in the wrong place](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/troubleshooting.md#the-robot-is-in-the-wrong-place).
-- With no `map`, the path is drawn from the robot's boot pose. See [no map frame](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/coordinates.md#when-the-robot-has-no-map-frame).
-- Height and tilt read zero on a standard mobile stack; a constant zero proves nothing. See [planar poses](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/coordinates.md#planar-poses).
-- A missing or misnamed topic leaves only the `c3d.*` series, which still look like sensors. See [sensors are missing](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/troubleshooting.md#sensors-are-missing).
-- An action that is not enrolled records nothing, which looks like an action that never ran. See [actions](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/recording.md#actions).
-- Objectives keyed on `<action>.started` match nothing on Nav2 or Create 3; use `.executing`. See [objectives](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/recording.md#objectives).
-- An unresolved `gaze_frame` or a wrong `gaze_frame_convention` misaims the ray with no error. See [the gaze is misaimed](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/troubleshooting.md#the-gaze-points-at-the-floor-or-90-degrees-off).
-- A point cloud whose header names an optical frame can be stored on its side. See [the wrong header frame](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/camera-and-lidar.md#a-point-cloud-whose-header-names-the-wrong-frame).
-- A refused key pauses uploads and keeps the data; nothing appears until it is fixed. See [uploads stall or pause](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/troubleshooting.md#uploads-stall-or-pause).
-- A container without `--ipc=host` subscribes and receives nothing. See [run in a container](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/install.md#run-in-a-container).
-- For A/B tests: the variable's own probability at 0, and a new `participant_id` per run. See [A/B test arms are wrong](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/troubleshooting.md#ab-test-arms-are-wrong).
+- A params file not keyed `/**` applies nothing to a node of another name. See [the params file is ignored](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/troubleshooting.md#the-node-ignores-the-params-file).
+- An application key or scene id from another project files the session elsewhere, or in an empty scene. See [an empty world](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/troubleshooting.md#the-session-is-in-an-empty-world-or-the-scene-looks-wrong).
+- The wrong `pose_convention` turns the whole path 90 degrees, and no tool reports it. See [the robot is in the wrong place](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/troubleshooting.md#the-robot-is-in-the-wrong-place).
+- With no `map`, the path is drawn from the robot's boot pose. See [no map frame](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/coordinates.md#when-the-robot-has-no-map-frame).
+- Height and tilt read zero on a standard mobile stack; a constant zero proves nothing. See [planar poses](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/coordinates.md#planar-poses).
+- A missing or misnamed topic leaves only the `c3d.*` series, which still look like sensors. See [sensors are missing](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/troubleshooting.md#sensors-are-missing).
+- An action that is not enrolled records nothing, which looks like an action that never ran. See [actions](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/recording.md#actions).
+- Objectives keyed on `<action>.started` match nothing on Nav2 or Create 3; use `.executing`. See [objectives](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/recording.md#objectives).
+- An unresolved `gaze_frame` or a wrong `gaze_frame_convention` misaims the ray with no error. See [the gaze is misaimed](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/troubleshooting.md#the-gaze-points-at-the-floor-or-90-degrees-off).
+- A point cloud whose header names an optical frame can be stored on its side. See [the wrong header frame](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/camera-and-lidar.md#a-point-cloud-whose-header-names-the-wrong-frame).
+- A refused key pauses uploads and keeps the data; nothing appears until it is fixed. See [uploads stall or pause](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/troubleshooting.md#uploads-stall-or-pause).
+- A container without `--ipc=host` subscribes and receives nothing. See [run in a container](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/install.md#run-in-a-container).
+- For A/B tests: the variable's own probability at 0, and a new `participant_id` per run. See [A/B test arms are wrong](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/troubleshooting.md#ab-test-arms-are-wrong).
 
-For anything else, start from [Troubleshooting](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/troubleshooting.md).
+For anything else, start from [Troubleshooting](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/troubleshooting.md).
