@@ -1010,7 +1010,7 @@ bool Cognitive3DNode::LoadMediaConfig(std::string* error) {
     }
     const std::string key = "camera." + name;
     if (!has_parameter(key + ".topic")) declare_parameter<std::string>(key + ".topic", "");
-    DeclareDouble(key + ".rate_hz", 1.0);
+    DeclareDouble(key + ".rate_hz", 30.0);
     if (!has_parameter(key + ".format")) declare_parameter<std::string>(key + ".format", "jpeg");
     if (!has_parameter(key + ".jpeg_quality")) declare_parameter<int>(key + ".jpeg_quality", 80);
     if (!has_parameter(key + ".max_width_px")) declare_parameter<int>(key + ".max_width_px", 640);
@@ -1046,7 +1046,7 @@ bool Cognitive3DNode::LoadMediaConfig(std::string* error) {
     const std::string key = "lidar." + name;
     const c3d::PointCloudOptions defaults;
     if (!has_parameter(key + ".topic")) declare_parameter<std::string>(key + ".topic", "");
-    DeclareDouble(key + ".rate_hz", 2.0);
+    DeclareDouble(key + ".rate_hz", 30.0);
     if (!has_parameter(key + ".frame")) declare_parameter<std::string>(key + ".frame", "");
     if (!has_parameter(key + ".intensities")) declare_parameter<bool>(key + ".intensities", false);
     DeclareDouble(key + ".pointcloud.voxel_leaf_m", defaults.voxel_leaf_m);

@@ -3230,6 +3230,7 @@ void ExpectMediaProperties(const nlohmann::json& sent) {
   expect("c3d.ros.camera.front.vfov_degrees", 0.0);
   expect("c3d.ros.camera.front.fov_source", "camera_info");
   expect("c3d.ros.camera.front.camera_info_topic", "/camera_info");
+  expect("c3d.ros.camera.rear.rate_hertz", 30.0);
   expect("c3d.ros.camera.rear.hfov_degrees", 61.0);
   expect("c3d.ros.camera.rear.vfov_degrees", 45.5);
   expect("c3d.ros.camera.rear.fov_source", "parameter");
@@ -3239,11 +3240,11 @@ void ExpectMediaProperties(const nlohmann::json& sent) {
   expect("c3d.ros.cameras", "front,rear,side");
 
   expect("c3d.ros.lidar.scan.topic", "/scan");
-  expect("c3d.ros.lidar.scan.rate_hertz", 2.0);
+  expect("c3d.ros.lidar.scan.rate_hertz", 30.0);
   expect("c3d.ros.lidar.scan.message_type", "sensor_msgs/msg/LaserScan");
   expect("c3d.ros.lidar.scan.intensities", true);
   expect("c3d.ros.lidar.depth.topic", "/points");
-  expect("c3d.ros.lidar.depth.rate_hertz", 2.0);
+  expect("c3d.ros.lidar.depth.rate_hertz", 30.0);
   expect("c3d.ros.lidar.depth.message_type", "sensor_msgs/msg/PointCloud2");
   expect("c3d.ros.lidar.depth.pointcloud.voxel_leaf_meters", 0.05);
   expect("c3d.ros.lidar.depth.pointcloud.max_points", 5000);

@@ -130,7 +130,7 @@
     # camera:
     #   front:
     #     topic: ""                     # Image or CompressedImage; required
-    #     rate_hz: 1.0                  # frames per second
+    #     rate_hz: 30.0                 # frames per second
     #     format: "jpeg"                # the only accepted value
     #     jpeg_quality: 80              # 1 to 100
     #     max_width_px: 640             # 0 never resizes
@@ -149,7 +149,7 @@
     # lidar:
     #   scan:
     #     topic: ""                     # LaserScan or PointCloud2; required
-    #     rate_hz: 2.0                  # scans per second
+    #     rate_hz: 30.0                 # scans per second
     #     frame: ""                     # empty uses header.frame_id
     #     intensities: false            # LaserScan only
     #     pointcloud:                   # PointCloud2 only

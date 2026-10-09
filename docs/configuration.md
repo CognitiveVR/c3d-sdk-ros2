@@ -266,7 +266,7 @@ what is refused.
 | -- | -- | -- | -- | -- |
 | `cameras` | string[] | `[]` | — | The camera names, each configured under `camera.<name>.*`. A name must be non-empty, carry no `.` or `/`, and appear once. A `camera.<name>.<field>` key whose name is not listed here, or whose field is not one of those below, refuses configure, naming the key. |
 | `camera.<name>.topic` | string | `""` | — | A `sensor_msgs/msg/Image` or `sensor_msgs/msg/CompressedImage` topic. Required for every listed name: empty refuses configure. A topic of another type is refused when it appears on the graph, not at configure; `doctor` checks it. |
-| `camera.<name>.rate_hz` | double | `1.0` | Hz | Frames accepted per second, counted on arrival. Must be positive. |
+| `camera.<name>.rate_hz` | double | `30.0` | Hz | Frames accepted per second, counted on arrival. Must be positive. |
 | `camera.<name>.format` | string | `"jpeg"` | — | The encoding. `jpeg` is the only accepted value. |
 | `camera.<name>.jpeg_quality` | int | `80` | — | The JPEG quality, from 1 to 100. |
 | `camera.<name>.max_width_px` | int | `640` | pixels | Wider frames are scaled down to this width, keeping the aspect ratio. `0` never resizes. |
@@ -280,7 +280,7 @@ what is refused.
 | `camera.<name>.qos.depth` | int | `-1` | messages | As for `topic_config.<key>.qos.depth`. |
 | `lidars` | string[] | `[]` | — | The lidar names, each configured under `lidar.<name>.*`, with the same rules as `cameras`. A `lidar.<name>.<field>` key whose name is not listed here, or whose field is not one of those below, refuses configure, naming the key. A lidar has no `qos.*` fields. |
 | `lidar.<name>.topic` | string | `""` | — | A `sensor_msgs/msg/LaserScan` or `sensor_msgs/msg/PointCloud2` topic. Required for every listed name. |
-| `lidar.<name>.rate_hz` | double | `2.0` | Hz | Scans accepted per second, counted on arrival. Must be positive. |
+| `lidar.<name>.rate_hz` | double | `30.0` | Hz | Scans accepted per second, counted on arrival. Must be positive. |
 | `lidar.<name>.frame` | string | `""` | — | As for a camera. Also set it when a point cloud's header names a frame its points are not in, which `doctor`'s optical frame check detects. |
 | `lidar.<name>.intensities` | bool | `false` | — | `LaserScan` only. Record intensities too, which doubles a scan's size. |
 | `lidar.<name>.pointcloud.voxel_leaf_m` | double | `0.05` | meters | `PointCloud2` only. The downsampling cell size, from 0 to 65; `0` keeps every point. |

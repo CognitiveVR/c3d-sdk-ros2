@@ -21,7 +21,7 @@ its history joined. It must not be empty or contain `.` or `/`.
     camera:
       front:
         topic: "/oakd/rgb/preview/image_raw"
-        rate_hz: 1.0          # frames recorded per second
+        rate_hz: 30.0         # frames recorded per second
         max_width_px: 640     # wider frames are scaled down; 0 never resizes
         jpeg_quality: 80
 ```
@@ -93,7 +93,7 @@ Name each lidar in `lidars` and give it a topic, with the same naming rule as a 
     lidar:
       scan:
         topic: "/scan"
-        rate_hz: 2.0
+        rate_hz: 30.0
       depth:
         topic: "/oakd/rgb/preview/depth/points"
         rate_hz: 1.0
@@ -143,8 +143,8 @@ refuses those types.
 
 ## How often frames are recorded
 
-`rate_hz` is the most records per second a sensor stores: 1.0 for a camera and 2.0 for a lidar
-unless you set it. The limit runs on the time each message arrives at the node, never on its header
+`rate_hz` is the most records per second a sensor stores: 30 for a camera or a lidar unless you
+set it. The limit runs on the time each message arrives at the node, never on its header
 stamp. A source publishing at exactly `rate_hz` is recorded in full, a faster one is held to
 `rate_hz`, and a pause in the source does not let a burst through afterwards. A driver that leaves
 stamps at zero, two publishers on one topic, or a simulator reset neither stops nor opens the
@@ -242,8 +242,9 @@ For a lidar, the error asks you to compare the publisher's profile, from
 
 ### Bandwidth
 
-What a stream costs is the size of one record times `rate_hz`. Record size depends on resolution,
-settings and what the sensor sees. These sizes were measured in simulation:
+What a stream costs is the size of one record times the records it stores per second: `rate_hz`,
+or the source's own rate when the source is slower. Record size depends on resolution, settings and
+what the sensor sees. These sizes were measured in simulation:
 
 | record | stored size |
 | -- | -- |
@@ -255,9 +256,18 @@ settings and what the sensor sees. These sizes were measured in simulation:
 | the same cloud with `rgb565` color | about 20 percent more |
 | the same cloud with `float32` positions | about 3 times as much |
 
-For example, a 640 x 480 camera at 5 frames per second stores about 290 KB per second, or about 1
-GB per hour. `doctor` sizes each configured sensor by encoding one real message with the same
-encoder the run uses, and warns when all sensors together exceed 2 MiB per second.
+For example, at the default 30 records per second:
+
+- a 640 x 480 camera stores about 1.7 MB per second, about 6 GB per hour
+- a depth point cloud of 20,000 stored points stores about 1.8 MB per second, about 6.5 GB per hour
+- a point cloud at the default `max_points` of 100,000 stores about 9 MB per second, about 32 GB per
+  hour
+
+`doctor` sizes each configured sensor by encoding one real message with the same encoder the run
+uses and multiplying by `rate_hz`, so it overstates a source slower than that. It warns when all
+sensors together exceed 2 MiB per second, as the camera and the 20,000-point cloud above do
+together. To record less, lower `rate_hz`, `max_width_px` or `jpeg_quality`, or raise a point
+cloud's `voxel_leaf_m`.
 
 > [!WARNING]
 > The platform stores each frame or scan as one record of at most about 1 MiB. A larger record is
@@ -273,8 +283,10 @@ camera; for a point cloud, keep `int16_mm`, drop color, raise `voxel_leaf_m` or 
 Camera and lidar records go to the spool before they upload, and share its `spool_max_mb` budget
 with every other stream. When the spool is full, the oldest camera and lidar data is evicted before
 any pose, sensor or event data. When the uplink is slower than the data rate, the spool grows by
-the difference for as long as the session lasts. [Sessions](sessions.md) describes the spool,
-recording with uploads paused, and draining it later over a faster link.
+the difference for as long as the session lasts. On disk a camera or lidar record takes about a
+third more than it uploads, so the default 1 GiB holds about 8 minutes of the camera above with no
+uplink at all. [Sessions](sessions.md) describes the spool, recording with uploads paused, and
+draining it later over a faster link.
 
 ### CPU
 
@@ -291,8 +303,9 @@ For each recorded message, the work is, from cheapest to most expensive:
 - a `PointCloud2`: converted, voxel-downsampled, sorted and compressed
 
 The node handles its callbacks one at a time, so a slow encode delays its other work, including the
-next pose sample. Keep `rate_hz`, `max_width_px` and the point cloud's size modest on a robot with a
-small CPU.
+next pose sample. At the default 30 records a second, an `Image` or a `PointCloud2` is a heavy load
+for a small CPU: record a compressed or reduced-resolution topic there, or lower `max_width_px`, the
+point cloud's size or `rate_hz`.
 
 Posing a record can wait up to 50 milliseconds for its transform, which is usually about to
 arrive. Once a lookup for a frame fails, the node waits for that frame at most once a second until
