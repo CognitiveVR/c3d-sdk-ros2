@@ -4,6 +4,8 @@
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 
+#include <chrono>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -247,8 +249,15 @@ class PoseSampler {
   // `stamp` is the message's own, not the latest available: a frame is posed where
   // the robot WAS when it was taken. A lookup that fails returns false and the
   // caller drops the record.
+  //
+  // A lookup waits up to 50 ms for the transform at `stamp`, which is usually
+  // about to arrive. After one fails, lookups for that frame take what the buffer
+  // holds, and wait again at most once a second, until one succeeds. They run on
+  // the node's one callback thread, where a frame tf cannot resolve would
+  // otherwise cost 50 ms per record: at 30 records a second, the whole thread and
+  // the pose timer with it.
   bool LookupSensorPose(const std::string& frame, const rclcpp::Time& stamp,
-                        c3d::Vec3* position, c3d::Quat* rotation) const;
+                        c3d::Vec3* position, c3d::Quat* rotation);
 
  private:
   // Through the capped door, like everything else. The position is passed rather
@@ -289,6 +298,8 @@ class PoseSampler {
   double fallback_first_seen_ = 0.0;
   bool topology_emitted_ = false;
   EventRateLimiter* event_limiter_ = nullptr;
+  // Per sensor frame whose last lookup failed: when a lookup for it may wait again.
+  std::map<std::string, std::chrono::steady_clock::time_point> sensor_wait_not_before_;
 };
 
 }  // namespace cognitive3d_ros

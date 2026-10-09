@@ -294,6 +294,10 @@ The node handles its callbacks one at a time, so a slow encode delays its other 
 next pose sample. Keep `rate_hz`, `max_width_px` and the point cloud's size modest on a robot with a
 small CPU.
 
+Posing a record can wait up to 50 milliseconds for its transform, which is usually about to
+arrive. Once a lookup for a frame fails, the node waits for that frame at most once a second until
+one succeeds, so a frame tf cannot resolve costs that sensor's records and not the node's time.
+
 ## What gets refused
 
 Configure refuses, naming the parameter:

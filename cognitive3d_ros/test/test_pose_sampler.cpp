@@ -4,13 +4,16 @@
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
+#include <rclcpp/rclcpp.hpp>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "c3d/spool.hpp"
@@ -868,6 +871,77 @@ TEST_F(PoseSamplerTest, ASensorPoseIsInMapAsSoonAsTheGazeChannelIs) {
   // map -> odom is 5 m, odom -> base_link 1 m, base_link -> camera_link 0.25 m,
   // so an odom-framed answer would read 1.25 rather than 6.25.
   EXPECT_NEAR(position.x, 6.25, 1e-6);
+}
+
+// A sensor frame tf cannot resolve costs that sensor's records, not the node's one callback
+// thread. Waiting 50 ms on every record of a 30 Hz stream would be the whole thread; after a
+// failure a lookup takes what the buffer holds, and waits again at most once a second.
+TEST_F(PoseSamplerTest, AnUnresolvableSensorFrameIsNotWaitedForOnEveryRecord) {
+  SetChain(100.0, Qxyzw(0, 0, 0, 1));
+  PoseSampler sampler(buffer_, PoseSamplerConfig{});
+  ASSERT_TRUE(sampler.Sample(1000.0, *runner_, nullptr));
+  const rclcpp::Time stamp(100, 0, RCL_SYSTEM_TIME);
+  c3d::Vec3 position{};
+  c3d::Quat rotation{};
+
+  const auto seconds_since = [](std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  };
+  const auto first = std::chrono::steady_clock::now();
+  EXPECT_FALSE(sampler.LookupSensorPose("camera_lnik", stamp, &position, &rotation));
+  ASSERT_GE(seconds_since(first), 0.04) << "the first lookup did not wait, so nothing is measured";
+
+  const auto rest = std::chrono::steady_clock::now();
+  for (int i = 0; i < 30; ++i) {
+    EXPECT_FALSE(sampler.LookupSensorPose("camera_lnik", stamp, &position, &rotation));
+  }
+  const double took = seconds_since(rest);
+  EXPECT_LT(took, 0.5) << "30 more records of a frame tf does not know took " << took
+                       << " s; a 50 ms wait on each is 1.5 s";
+}
+
+// The frame that failed is still looked up, so a sensor whose transform starts being published
+// late is posed again from its next record.
+TEST_F(PoseSamplerTest, ASensorFrameThatStartsResolvingIsPosedAgain) {
+  SetChain(100.0, Qxyzw(0, 0, 0, 1));
+  PoseSampler sampler(buffer_, PoseSamplerConfig{});
+  ASSERT_TRUE(sampler.Sample(1000.0, *runner_, nullptr));
+  const rclcpp::Time stamp(100, 0, RCL_SYSTEM_TIME);
+  c3d::Vec3 position{};
+  c3d::Quat rotation{};
+  ASSERT_FALSE(sampler.LookupSensorPose("camera_link", stamp, &position, &rotation));
+
+  buffer_->setTransform(MakeTf("base_link", "camera_link", 0.25, 0.0, 0.0, 0.0), "test",
+                        /*is_static=*/true);
+  ASSERT_TRUE(sampler.LookupSensorPose("camera_link", stamp, &position, &rotation))
+      << "a frame that failed once was never posed again";
+  EXPECT_NEAR(position.x, 1.25, 1e-6);
+}
+
+// A frame stamped ahead of its chain resolves only by waiting for the chain to catch up, as it
+// does on every frame of a driver that stamps its frames as it publishes them. After a failure
+// the wait still comes once a second, so one early miss does not lose the sensor for the session.
+TEST_F(PoseSamplerTest, AFrameAheadOfItsChainStillWaitsOnceASecondAfterAFailure) {
+  SetChain(100.0, Qxyzw(0, 0, 0, 1));
+  buffer_->setTransform(MakeTf("base_link", "camera_link", 0.25, 0.0, 0.0, 0.0), "test",
+                        /*is_static=*/true);
+  PoseSampler sampler(buffer_, PoseSamplerConfig{});
+  ASSERT_TRUE(sampler.Sample(1000.0, *runner_, nullptr));
+  const rclcpp::Time ahead(100, 500000000, RCL_SYSTEM_TIME);
+  c3d::Vec3 position{};
+  c3d::Quat rotation{};
+  ASSERT_FALSE(sampler.LookupSensorPose("camera_link", ahead, &position, &rotation))
+      << "the chain ends at 100.0 and nothing extends it";
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+  std::thread chain([this] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    SetChain(100.6, Qxyzw(0, 0, 0, 1));
+  });
+  const bool posed = sampler.LookupSensorPose("camera_link", ahead, &position, &rotation);
+  chain.join();
+  EXPECT_TRUE(posed) << "a frame that failed once never waited for its chain again";
+  EXPECT_NEAR(position.x, 1.25, 1e-6);
 }
 
 TEST_F(PoseSamplerTest, EmitsAnEventWhenTheReferenceFrameChanges) {
@@ -1784,4 +1858,15 @@ TEST(RelocalisationCheck, DueATenthOfASecondApartAndEverySampleBelowTenHertz) {
   EXPECT_EQ(RelocalisationCheckDue(1.0 / 30.0, 30.0), false);
   EXPECT_EQ(RelocalisationCheckDue(2.0 / 30.0, 30.0), false);
   EXPECT_EQ(RelocalisationCheckDue(3.0 / 30.0 - 0.002, 30.0), true) << "2 ms early";
+}
+
+// rclcpp initialised, as it is in the node's process: tf2_ros waits out a lookup's timeout only
+// while rclcpp::ok(), so without it every timed lookup returns at once and a test of what the
+// wait costs measures nothing.
+int main(int argc, char** argv) {
+  ::testing::InitGoogleTest(&argc, argv);
+  rclcpp::init(argc, argv);
+  const int result = RUN_ALL_TESTS();
+  rclcpp::shutdown();
+  return result;
 }

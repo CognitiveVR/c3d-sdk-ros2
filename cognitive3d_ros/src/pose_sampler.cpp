@@ -219,6 +219,7 @@ bool RelocalisationCheckDue(double elapsed_s, double rate_hz) {
 }
 
 void PoseSampler::Reset() {
+  sensor_wait_not_before_.clear();
   have_last_ = false;
   have_jump_anchor_ = false;
   relocalisation_jumps_ = 0;
@@ -296,7 +297,7 @@ bool PoseSampler::RecordEvent(double wire_time, SessionRunner& runner, const std
 }
 
 bool PoseSampler::LookupSensorPose(const std::string& frame, const rclcpp::Time& stamp,
-                                   c3d::Vec3* position, c3d::Quat* rotation) const {
+                                   c3d::Vec3* position, c3d::Quat* rotation) {
   if (!buffer_ || frame.empty()) return false;
 
   // Whatever the gaze channel settled on, and nothing else. Until it has settled
@@ -314,16 +315,24 @@ bool PoseSampler::LookupSensorPose(const std::string& frame, const rclcpp::Time&
   }
   if (reference.empty()) return false;
 
+  // A short timeout rather than none: the message arrived, so the transform
+  // for its stamp is either already there or about to be, and tf's own buffer
+  // is what decides. Zero here drops the first frames of every run. A frame
+  // whose last lookup failed waits again only once a second rather than never:
+  // a driver that stamps its frames as it publishes them is ahead of its chain
+  // on every frame, and only the wait resolves it.
+  const auto now = std::chrono::steady_clock::now();
+  const auto failing = sensor_wait_not_before_.find(frame);
+  const bool wait = failing == sensor_wait_not_before_.end() || now >= failing->second;
   try {
-    // A short timeout rather than none: the message arrived, so the transform
-    // for its stamp is either already there or about to be, and tf's own buffer
-    // is what decides. Zero here drops the first frames of every run.
     const auto transform = buffer_->lookupTransform(reference, frame, tf2::TimePoint(
-        std::chrono::nanoseconds(stamp.nanoseconds())), tf2::durationFromSec(0.05));
+        std::chrono::nanoseconds(stamp.nanoseconds())), tf2::durationFromSec(wait ? 0.05 : 0.0));
+    sensor_wait_not_before_.erase(frame);
     if (position != nullptr) *position = ToVec3(transform.transform.translation);
     if (rotation != nullptr) *rotation = ToQuat(transform.transform.rotation);
     return true;
   } catch (const tf2::TransformException&) {
+    if (wait) sensor_wait_not_before_[frame] = now + std::chrono::seconds(1);
     return false;
   }
 }
