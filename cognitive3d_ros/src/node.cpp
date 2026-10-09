@@ -435,7 +435,7 @@ void Cognitive3DNode::DeclareParameters() {
   // Empty resolves to a per-user state directory at configure: a shared, world-writable default
   // would let two instances, or two users, write into one spool.
   declare_parameter<std::string>("spool_dir", "");
-  declare_parameter<int>("spool_max_mb", 512);
+  declare_parameter<int>("spool_max_mb", 1024);
   // How often a live session refreshes its spool marker, and how long a marker
   // must have gone unrefreshed before startup recovery may adopt it as an orphan.
   // Exposed because the only reason to change them is a deployment fact the SDK

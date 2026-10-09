@@ -284,8 +284,8 @@ another process holds.
 
 ### The size cap
 
-`spool_max_mb` (512 by default) caps the spool on disk. At the cap, the oldest chunks of the lowest
-tier are evicted to make room. From the first evicted to the last:
+`spool_max_mb` (1024, 1 GiB, by default) caps the spool on disk. At the cap, the oldest chunks of
+the lowest tier are evicted to make room. From the first evicted to the last:
 
 1. camera and lidar
 2. poses and sensor series

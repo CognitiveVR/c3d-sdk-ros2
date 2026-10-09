@@ -46,7 +46,7 @@ struct Config {
   // ---- Spool ---------------------------------------------------------------
   // Required. Every payload is written here before any upload is attempted.
   std::string spool_dir;
-  std::uint64_t spool_max_bytes = 512ull * 1024 * 1024;
+  std::uint64_t spool_max_bytes = 1024ull * 1024 * 1024;
 
   // ---- Batching ------------------------------------------------------------
   std::size_t gaze_batch = 256;

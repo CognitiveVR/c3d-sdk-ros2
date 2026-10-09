@@ -1427,6 +1427,15 @@ TEST(ParameterValidation, AWholeNumberIsAcceptedWhereADoubleIsDeclared) {
   fs::remove_all(dir, ec);
 }
 
+// The spool's cap is the documented 1024 MiB, and reaches the spool as 1 GiB.
+TEST_F(LifecycleContractTest, TheDefaultSpoolCapIsOneGibibyte) {
+  MakeNode(/*auto_start_session=*/false);
+  ASSERT_EQ(node_->configure().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+  EXPECT_EQ(node_->get_parameter("spool_max_mb").as_int(), 1024);
+  EXPECT_EQ(node_->resolved_config().spool_max_bytes, 1024ull * 1024 * 1024);
+  node_->cleanup();
+}
+
 // The gaze envelope's `interval` is the time one sample stands for, so it follows the rate.
 TEST_F(LifecycleContractTest, TheGazeIntervalFollowsTheSampleRate) {
   MakeNode(/*auto_start_session=*/true, {{"sample_rate_hz", 4.0}});

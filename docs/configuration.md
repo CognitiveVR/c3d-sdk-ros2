@@ -235,7 +235,7 @@ power loss.
 | parameter | type | default | unit | what it does |
 | -- | -- | -- | -- | -- |
 | `spool_dir` | string | `""` | — | The spool's directory. Empty resolves at configure to `$XDG_STATE_HOME/cognitive3d`, or else `$HOME/.local/state/cognitive3d`; configure refuses when neither names an absolute directory. One process per directory: configure refuses a directory another process holds, naming its process id, and a directory it cannot write. Give every node its own, including nodes in one component container. |
-| `spool_max_mb` | int | `512` | MiB | The spool's size cap, shared by every stream. A whole number from 1 to 1073741824. At the cap the spool evicts data, lowest-priority streams first, and that data never reaches the platform. Size it for the longest time the robot runs without a network. |
+| `spool_max_mb` | int | `1024` | MiB | The spool's size cap, shared by every stream. A whole number from 1 to 1073741824. At the cap the spool evicts data, lowest-priority streams first, and that data never reaches the platform. Size it for the longest time the robot runs without a network. |
 | `marker_heartbeat_s` | double | `5.0` | seconds | How often a live session refreshes its marker in the spool. Must be positive. |
 | `orphan_stale_after_s` | double | `30.0` | seconds | How long a session's marker may go unrefreshed before the next configure closes that session as ended abnormally. Must exceed `marker_heartbeat_s` by more than 0.05 seconds. |
 
