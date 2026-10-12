@@ -154,9 +154,9 @@ struct PoseSamplerConfig {
 double StaleTransformAfterSeconds(double rate_hz);
 
 // Whether a relocalisation check is due, `elapsed_s` after the pose it compares against. Due at
-// kRelocalisationCheckIntervalS less a tenth of a sample period (of the interval, below 10 Hz),
-// so a sample that arrives a little early is still the one checked: a 30 Hz timer checks every
-// third sample and never slips to every sixth, and below 10 Hz every sample is checked.
+// the sample nearest kRelocalisationCheckIntervalS, the later one on a tie, so a sample up to
+// half a period early or late is still the one checked: a 30 Hz timer checks every third sample,
+// and below 10 Hz every sample is checked.
 bool RelocalisationCheckDue(double elapsed_s, double rate_hz);
 
 // The event-cap source key the pose channel's own events are charged to. Not a

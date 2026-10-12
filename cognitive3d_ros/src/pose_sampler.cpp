@@ -215,7 +215,7 @@ double StaleTransformAfterSeconds(double rate_hz) {
 bool RelocalisationCheckDue(double elapsed_s, double rate_hz) {
   constexpr double kInterval = PoseSamplerConfig::kRelocalisationCheckIntervalS;
   const double period = rate_hz > 0.0 ? 1.0 / rate_hz : kInterval;
-  return elapsed_s >= kInterval - 0.1 * std::min(kInterval, period);
+  return elapsed_s > kInterval - 0.49 * period;
 }
 
 void PoseSampler::Reset() {
