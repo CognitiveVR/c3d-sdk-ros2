@@ -38,16 +38,11 @@ marks as provisional may change in a minor release, and its entry here says how 
 
 ### Fixed
 
-- A camera or lidar whose frame tf cannot resolve no longer waits 50 ms for it on every record,
-  which held up the node's callback thread and its pose sampling. After a failed lookup the node
-  waits for that frame at most once a second until it resolves.
-
-### Known limitations
-
-- A camera or lidar whose records are stamped ahead of their tf chain, such as a driver that stamps
-  as it publishes on a robot whose odometry arrives at 20 Hz, waits up to 50 ms for every record on
-  the node's callback thread. At 30 records a second this can delay pose sampling. Lower that
-  sensor's `rate_hz` if `poses=` in the report line rises slower than `sample_rate_hz`.
+- Posing a camera frame or lidar scan no longer blocks the node's callback thread. A record whose
+  transform has not arrived yet, such as one from a driver that stamps as it publishes, or one whose
+  frame tf cannot resolve, used to wait up to 50 ms on that thread, delaying pose sampling with it.
+  It is now held for up to 50 ms and retried while the node does other work; a record that still has
+  no pose is dropped and counted as before.
 
 ## [1.0.0] - 2026-10-08
 

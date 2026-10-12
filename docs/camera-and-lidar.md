@@ -307,13 +307,11 @@ next pose sample. At the default 30 records a second, an `Image` or a `PointClou
 for a small CPU: record a compressed or reduced-resolution topic there, or lower `max_width_px`, the
 point cloud's size or `rate_hz`.
 
-Posing a record can wait up to 50 milliseconds for its transform, which is usually about to
-arrive. Once a lookup for a frame fails, the node waits for that frame at most once a second until
-one succeeds, so a frame tf cannot resolve costs that sensor's records and not the node's time.
-A sensor whose records are stamped ahead of their tf chain, such as a driver that stamps as it
-publishes on a robot whose odometry arrives at 20 Hz, resolves only by waiting, so it waits on every
-record. At 30 records a second that can delay pose sampling: lower its `rate_hz` if `poses=` in the
-report line rises slower than `sample_rate_hz`.
+A record whose transform has not arrived yet, as with a driver that stamps its frames as it
+publishes them, is held for up to 50 milliseconds and posed when the transform arrives. Holding it
+costs the node no time: the node goes on with its other work and retries the held records. A record
+still without a pose after 50 milliseconds is dropped and counted in `pose_failures`, and so is
+the oldest held record once a sensor has 8 waiting.
 
 ## What gets refused
 

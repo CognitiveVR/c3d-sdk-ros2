@@ -47,6 +47,11 @@ double ArrivalSeconds(const MediaEnvironment& environment) {
   return environment.arrival_time ? environment.arrival_time() : SteadySeconds();
 }
 
+std::uint64_t WireMilliseconds(const MediaEnvironment& environment,
+                               const std_msgs::msg::Header& header) {
+  return ToMilliseconds(environment.wire_time ? environment.wire_time(header.stamp) : 0.0);
+}
+
 // The frame the pose is FOR: the configured one, else the message's own. A
 // message with neither is refused rather than posed against a guess -- a pose in
 // the wrong frame is not a lesser version of the right one.
@@ -77,6 +82,59 @@ cv::Mat ShrinkToWidth(const cv::Mat& source, int max_width_px) {
 }
 
 }  // namespace
+
+bool HeldRecords::Offer(const std::string& frame, const rclcpp::Time& stamp, Record record,
+                        const MediaEnvironment& environment, SessionRunner& runner,
+                        std::uint64_t* pose_failures) {
+  Service(environment, runner, pose_failures);
+  if (!environment.lookup_pose) {
+    ++*pose_failures;
+    return false;
+  }
+  if (held_.empty()) {
+    c3d::Vec3 position;
+    c3d::Quat rotation;
+    if (environment.lookup_pose(frame, stamp, &position, &rotation)) {
+      return record(position, rotation, environment, runner);
+    }
+  }
+  if (environment.pose_wait_s <= 0.0) {
+    ++*pose_failures;
+    return false;
+  }
+  if (held_.size() >= kMaxHeld) {
+    held_.pop_front();
+    ++*pose_failures;
+  }
+  held_.push_back(
+      Held{frame, stamp, ArrivalSeconds(environment) + environment.pose_wait_s, std::move(record)});
+  return false;
+}
+
+void HeldRecords::Service(const MediaEnvironment& environment, SessionRunner& runner,
+                          std::uint64_t* pose_failures) {
+  if (held_.empty()) return;
+  if (!runner.active() || !environment.lookup_pose) {
+    held_.clear();
+    return;
+  }
+  const double now = ArrivalSeconds(environment);
+  while (!held_.empty()) {
+    Held& front = held_.front();
+    c3d::Vec3 position;
+    c3d::Quat rotation;
+    if (environment.lookup_pose(front.frame, front.stamp, &position, &rotation)) {
+      Record record = std::move(front.record);
+      held_.pop_front();
+      record(position, rotation, environment, runner);
+      continue;
+    }
+    // In order: a record is never written ahead of one that arrived before it.
+    if (now < front.deadline) return;
+    held_.pop_front();
+    ++*pose_failures;
+  }
+}
 
 bool MediaMessageHeader(const std::string& type, const rclcpp::SerializedMessage& message,
                         std_msgs::msg::Header* header) {
@@ -124,6 +182,7 @@ void CameraCapture::Reset() {
   stats_ = CameraStats{};
   seq_ = 0;
   gate_.Reset();
+  held_.Clear();
   frame_id_warned_ = false;
   refusal_warned_ = false;
   unstamped_warned_ = false;
@@ -196,7 +255,7 @@ bool CameraCapture::AcceptHeader(const std_msgs::msg::Header& header,
   return gate_.Accept(ArrivalSeconds(environment), config_.rate_hz);
 }
 
-bool CameraCapture::Emit(const std_msgs::msg::Header& header, const std::string& bytes,
+bool CameraCapture::Emit(const std_msgs::msg::Header& header, std::string bytes,
                          std::uint16_t width, std::uint16_t height,
                          const MediaEnvironment& environment, SessionRunner& runner) {
   std::string frame_id;
@@ -211,35 +270,36 @@ bool CameraCapture::Emit(const std_msgs::msg::Header& header, const std::string&
     return false;
   }
 
-  c3d::Vec3 position;
-  c3d::Quat rotation;
-  if (!environment.lookup_pose || !environment.lookup_pose(frame_id, header.stamp, &position,
-                                                           &rotation)) {
-    ++stats_.pose_failures;
-    return false;
-  }
+  const std::uint64_t time_ms = WireMilliseconds(environment, header);
+  auto record = [this, frame_id, time_ms, bytes = std::move(bytes), width, height](
+                    const c3d::Vec3& position, const c3d::Quat& rotation,
+                    const MediaEnvironment& environment, SessionRunner& runner) {
+    const bool first_of_session = seq_ == 0;
+    const c3d::CameraFov fov = CurrentFov();
+    runner.RecordCameraFrame(config_.name, time_ms, seq_++, frame_id, position, rotation,
+                             config_.format, width, height, bytes, fov);
+    ++stats_.frames;
+    stats_.bytes += bytes.size();
+    // A CameraInfo topic nothing publishes leaves every frame of the session without a field of
+    // view, which the session's fov_source does not show. Not said of a publisher that has not
+    // sent yet: its first CameraInfo reaches the frames after it.
+    if (first_of_session && wants_camera_info() && !c3d::IsKnownCameraFov(fov) &&
+        environment.publishers && environment.warn_once &&
+        environment.publishers(config_.camera_info_topic) == 0) {
+      environment.warn_once("camera '" + config_.name + "': its frames take their field of view "
+                            "from " + config_.camera_info_topic + ", which has no publisher, so "
+                            "they carry none. Set camera." + config_.name + ".hfov_degrees and "
+                            "vfov_degrees, or point camera." + config_.name +
+                            ".camera_info_topic at the driver's CameraInfo");
+    }
+    return true;
+  };
+  return held_.Offer(frame_id, header.stamp, std::move(record), environment, runner,
+                     &stats_.pose_failures);
+}
 
-  const std::uint64_t time_ms =
-      ToMilliseconds(environment.wire_time ? environment.wire_time(header.stamp) : 0.0);
-  const bool first_of_session = seq_ == 0;
-  const c3d::CameraFov fov = CurrentFov();
-  runner.RecordCameraFrame(config_.name, time_ms, seq_++, frame_id, position, rotation,
-                           config_.format, width, height, bytes, fov);
-  ++stats_.frames;
-  stats_.bytes += bytes.size();
-  // A CameraInfo topic nothing publishes leaves every frame of the session without a field of
-  // view, which the session's fov_source does not show. Not said of a publisher that has not sent
-  // yet: its first CameraInfo reaches the frames after it.
-  if (first_of_session && wants_camera_info() && !c3d::IsKnownCameraFov(fov) &&
-      environment.publishers && environment.warn_once &&
-      environment.publishers(config_.camera_info_topic) == 0) {
-    environment.warn_once("camera '" + config_.name + "': its frames take their field of view "
-                          "from " + config_.camera_info_topic + ", which has no publisher, so "
-                          "they carry none. Set camera." + config_.name + ".hfov_degrees and "
-                          "vfov_degrees, or point camera." + config_.name +
-                          ".camera_info_topic at the driver's CameraInfo");
-  }
-  return true;
+void CameraCapture::ServiceHeld(const MediaEnvironment& environment, SessionRunner& runner) {
+  held_.Service(environment, runner, &stats_.pose_failures);
 }
 
 bool CameraCapture::EncodeCompressed(const sensor_msgs::msg::CompressedImage& compressed,
@@ -383,7 +443,7 @@ bool CameraCapture::Handle(const std::string& type, const rclcpp::SerializedMess
     }
     return false;
   }
-  return Emit(header, bytes, width, height, environment, runner);
+  return Emit(header, std::move(bytes), width, height, environment, runner);
 }
 
 LidarCapture::LidarCapture(LidarConfig config) : config_(std::move(config)) {}
@@ -392,6 +452,7 @@ void LidarCapture::Reset() {
   stats_ = LidarStats{};
   seq_ = 0;
   gate_.Reset();
+  held_.Clear();
   frame_id_warned_ = false;
   refusal_warned_ = false;
   color_warned_ = false;
@@ -409,10 +470,12 @@ bool LidarCapture::AcceptHeader(const std_msgs::msg::Header& header,
   return gate_.Accept(ArrivalSeconds(environment), config_.rate_hz);
 }
 
-bool LidarCapture::ResolvePose(const std_msgs::msg::Header& header,
-                               const MediaEnvironment& environment, std::string* frame_id,
-                               c3d::Vec3* position, c3d::Quat* rotation,
-                               std::uint64_t* time_ms) {
+void LidarCapture::ServiceHeld(const MediaEnvironment& environment, SessionRunner& runner) {
+  held_.Service(environment, runner, &stats_.pose_failures);
+}
+
+bool LidarCapture::ResolveFrame(const std_msgs::msg::Header& header,
+                                const MediaEnvironment& environment, std::string* frame_id) {
   if (!ResolveFrameId(config_.frame, header, frame_id)) {
     ++stats_.pose_failures;
     if (!frame_id_warned_ && environment.warn_once) {
@@ -423,12 +486,6 @@ bool LidarCapture::ResolvePose(const std_msgs::msg::Header& header,
     }
     return false;
   }
-  if (!environment.lookup_pose ||
-      !environment.lookup_pose(*frame_id, header.stamp, position, rotation)) {
-    ++stats_.pose_failures;
-    return false;
-  }
-  *time_ms = ToMilliseconds(environment.wire_time ? environment.wire_time(header.stamp) : 0.0);
   return true;
 }
 
@@ -487,12 +544,8 @@ bool LidarCapture::Handle(const std::string& type, const rclcpp::SerializedMessa
     if (!AcceptHeader(scan.header, environment)) return false;
 
     std::string frame_id;
-    c3d::Vec3 position;
-    c3d::Quat rotation;
-    std::uint64_t time_ms = 0;
-    if (!ResolvePose(scan.header, environment, &frame_id, &position, &rotation, &time_ms)) {
-      return false;
-    }
+    if (!ResolveFrame(scan.header, environment, &frame_id)) return false;
+    const std::uint64_t time_ms = WireMilliseconds(environment, scan.header);
 
     c3d::LaserScanData data;
     data.angle_min = scan.angle_min;
@@ -510,11 +563,16 @@ bool LidarCapture::Handle(const std::string& type, const rclcpp::SerializedMessa
       data.intensities.assign(scan.intensities.begin(), scan.intensities.end());
     }
 
-    runner.RecordLaserScan(config_.name, time_ms, seq_++, frame_id, position, rotation, data);
-    ++stats_.scans;
-    stats_.bytes +=
-        (data.ranges.size() + data.intensities.size()) * sizeof(float);
-    return true;
+    auto record = [this, frame_id, time_ms, data = std::move(data)](
+                      const c3d::Vec3& position, const c3d::Quat& rotation,
+                      const MediaEnvironment&, SessionRunner& runner) {
+      runner.RecordLaserScan(config_.name, time_ms, seq_++, frame_id, position, rotation, data);
+      ++stats_.scans;
+      stats_.bytes += (data.ranges.size() + data.intensities.size()) * sizeof(float);
+      return true;
+    };
+    return held_.Offer(frame_id, scan.header.stamp, std::move(record), environment, runner,
+                       &stats_.pose_failures);
   }
 
   if (type != "sensor_msgs/msg/PointCloud2") return false;
@@ -550,35 +608,38 @@ bool LidarCapture::Handle(const std::string& type, const rclcpp::SerializedMessa
   // scan that is about to be dropped, and a depth cloud at 1 Hz is the most
   // expensive thing this node does.
   std::string frame_id;
-  c3d::Vec3 position;
-  c3d::Quat rotation;
-  std::uint64_t time_ms = 0;
-  if (!ResolvePose(cloud.header, environment, &frame_id, &position, &rotation, &time_ms)) {
-    return false;
-  }
+  if (!ResolveFrame(cloud.header, environment, &frame_id)) return false;
+  const std::uint64_t time_ms = WireMilliseconds(environment, cloud.header);
+  const rclcpp::Time stamp = cloud.header.stamp;
 
-  const c3d::PointCloudInput input =
-      ExtractPointCloud(cloud, layout, config_.pointcloud.color != c3d::PointColor::kNone,
-                        config_.pointcloud.intensity != c3d::PointIntensity::kNone,
-                        runner.convention());
-  const c3d::EncodedPointCloud encoded = c3d::pointcloud::Encode(input, config_.pointcloud);
-  stats_.dropped_range += encoded.dropped_out_of_range;
-  if (!encoded.ok) {
-    if (encoded.reason == "oversize") {
-      ++stats_.dropped_oversize;
-    } else if (encoded.reason == "no_points_in_range") {
-      // Every point was outside int16's reach, which is the same fact the
-      // per-point counter carries and not a separate kind of failure.
-    } else {
-      ++stats_.refused;
+  auto record = [this, frame_id, time_ms, cloud = std::move(cloud), layout](
+                    const c3d::Vec3& position, const c3d::Quat& rotation,
+                    const MediaEnvironment&, SessionRunner& runner) {
+    const c3d::PointCloudInput input =
+        ExtractPointCloud(cloud, layout, config_.pointcloud.color != c3d::PointColor::kNone,
+                          config_.pointcloud.intensity != c3d::PointIntensity::kNone,
+                          runner.convention());
+    const c3d::EncodedPointCloud encoded = c3d::pointcloud::Encode(input, config_.pointcloud);
+    stats_.dropped_range += encoded.dropped_out_of_range;
+    if (!encoded.ok) {
+      if (encoded.reason == "oversize") {
+        ++stats_.dropped_oversize;
+      } else if (encoded.reason == "no_points_in_range") {
+        // Every point was outside int16's reach, which is the same fact the
+        // per-point counter carries and not a separate kind of failure.
+      } else {
+        ++stats_.refused;
+      }
+      return false;
     }
-    return false;
-  }
 
-  runner.RecordPointCloud(config_.name, time_ms, seq_++, frame_id, position, rotation, encoded);
-  ++stats_.scans;
-  stats_.bytes += encoded.data.size();
-  return true;
+    runner.RecordPointCloud(config_.name, time_ms, seq_++, frame_id, position, rotation, encoded);
+    ++stats_.scans;
+    stats_.bytes += encoded.data.size();
+    return true;
+  };
+  return held_.Offer(frame_id, stamp, std::move(record), environment, runner,
+                     &stats_.pose_failures);
 }
 
 }  // namespace cognitive3d_ros

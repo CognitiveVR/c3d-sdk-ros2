@@ -1672,6 +1672,10 @@ bool Cognitive3DNode::BringUp() {
                                            [this]() { OnDiscoveryTimer(); });
   report_timer_ = CreateActivationTimer(std::chrono::duration<double>(report_period_s_),
                                         [this]() { OnReportTimer(); });
+  if (!cameras_.empty() || !lidars_.empty()) {
+    media_hold_timer_ = CreateActivationTimer(std::chrono::milliseconds(10),
+                                              [this]() { OnMediaHoldTimer(); });
+  }
   return true;
 }
 
@@ -1684,6 +1688,7 @@ void Cognitive3DNode::BringDown(const std::string& reason) {
   sample_timer_.reset();
   discovery_timer_.reset();
   report_timer_.reset();
+  media_hold_timer_.reset();
   TearDownSubscriptions();
   StopSession(reason);
   if (diagnostics_pub_) diagnostics_pub_->on_deactivate();
@@ -2266,6 +2271,7 @@ LifecycleNodeInterface::CallbackReturn Cognitive3DNode::on_shutdown(
   sample_timer_.reset();
   discovery_timer_.reset();
   report_timer_.reset();
+  media_hold_timer_.reset();
   TearDownSubscriptions();
   // An orderly end here is what stops the next process start from reporting
   // this session as having died abnormally.
@@ -2547,6 +2553,8 @@ MediaEnvironment Cognitive3DNode::MakeMediaEnvironment() {
     RCLCPP_WARN(get_logger(), "%s", text.c_str());
   };
   environment.arrival_time = [this]() { return GateNow(); };
+  // The transform for a frame's stamp is usually a tf period or less behind it.
+  environment.pose_wait_s = 0.05;
   environment.publishers = [this](const std::string& topic) { return count_publishers(topic); };
   return environment;
 }
@@ -2699,6 +2707,12 @@ void Cognitive3DNode::OnMediaMessage(const std::string& key,
     capture->Handle(entry->second.type, message, media_environment_, *runner_);
     return;
   }
+}
+
+void Cognitive3DNode::OnMediaHoldTimer() {
+  if (runner_ == nullptr) return;
+  for (const auto& capture : cameras_) capture->ServiceHeld(media_environment_, *runner_);
+  for (const auto& capture : lidars_) capture->ServiceHeld(media_environment_, *runner_);
 }
 
 void Cognitive3DNode::OnMessage(const std::string& topic,
