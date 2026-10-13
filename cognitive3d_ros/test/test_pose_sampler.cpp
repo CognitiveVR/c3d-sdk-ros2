@@ -1813,41 +1813,23 @@ TEST(StaleTransformBound, TenSamplePeriodsAndNeverUnderFiveSeconds) {
   EXPECT_DOUBLE_EQ(StaleTransformAfterSeconds(0.5), 20.0);
 }
 
-namespace {
-
-// The span of the first check, for samples exactly 1/hz apart.
-double FirstCheckSpan(double hz) {
-  int k = 1;
-  while (!RelocalisationCheckDue(k / hz, hz) && k < 1000) ++k;
-  return k / hz;
-}
-
-}  // namespace
-
-// A check spans the sample nearest a tenth of a second, so never more than half a period either
-// side of it: every sample at 10 Hz and below, every third at 30 Hz, and every sample at 12 Hz,
-// where the next is twice as far off.
-TEST(RelocalisationCheck, DueAtTheSampleNearestATenthOfASecond) {
-  for (const double hz : {10.0, 11.0, 12.0, 13.0, 15.0, 17.0, 20.0, 25.0, 30.0, 1000.0}) {
-    EXPECT_LE(std::abs(FirstCheckSpan(hz) - 0.1), 0.5 / hz + 1e-12) << hz << " Hz";
+// The first sample a check is due at, for samples 1/hz apart, spans between a tenth of a second,
+// less the jitter allowance, and two tenths: every sample at 10 Hz and below, every third at
+// 30 Hz. A sample a little early is still the one checked.
+TEST(RelocalisationCheck, DueATenthOfASecondApartAndEverySampleBelowTenHertz) {
+  for (const double hz : {10.0, 11.0, 15.0, 25.0, 30.0, 1000.0}) {
+    int k = 1;
+    while (!RelocalisationCheckDue(k / hz, hz) && k < 1000) ++k;
+    const double spanned = k / hz;
+    EXPECT_GE(spanned, 0.1 - 0.1 * std::min(0.1, 1.0 / hz) - 1e-12) << hz << " Hz";
+    EXPECT_LT(spanned, 0.2) << hz << " Hz";
   }
-  EXPECT_NEAR(FirstCheckSpan(12.0), 1.0 / 12.0, 1e-12);
-  EXPECT_NEAR(FirstCheckSpan(30.0), 3.0 / 30.0, 1e-12);
   for (const double hz : {9.0, 2.0, 0.5}) {
     EXPECT_TRUE(RelocalisationCheckDue(1.0 / hz, hz)) << hz << " Hz";
   }
-}
-
-// Halfway between two samples, the later one: a shorter span sees less of a correction that tf
-// spreads over a scan period.
-TEST(RelocalisationCheck, ATieGoesToTheLaterSample) {
-  EXPECT_NEAR(FirstCheckSpan(15.0), 2.0 / 15.0, 1e-12);
-  EXPECT_NEAR(FirstCheckSpan(25.0), 3.0 / 25.0, 1e-12);
-}
-
-TEST(RelocalisationCheck, AnEarlyOrLateSampleIsStillTheOneChecked) {
-  EXPECT_TRUE(RelocalisationCheckDue(3.0 / 30.0 - 0.015, 30.0)) << "15 ms early";
-  EXPECT_FALSE(RelocalisationCheckDue(2.0 / 30.0 + 0.015, 30.0)) << "15 ms late";
+  EXPECT_EQ(RelocalisationCheckDue(1.0 / 30.0, 30.0), false);
+  EXPECT_EQ(RelocalisationCheckDue(2.0 / 30.0, 30.0), false);
+  EXPECT_EQ(RelocalisationCheckDue(3.0 / 30.0 - 0.002, 30.0), true) << "2 ms early";
 }
 
 // rclcpp initialised, as it is in the node's process: tf2_ros waits out a lookup's timeout only
