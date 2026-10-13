@@ -609,7 +609,7 @@ bool LidarCapture::Handle(const std::string& type, const rclcpp::SerializedMessa
 
   // The pose is resolved BEFORE the cloud is encoded. Encoding first and then
   // discovering there is no pose spends the expensive part of the pipeline on a
-  // scan that is about to be dropped, and a depth cloud at 1 Hz is the most
+  // scan that is about to be dropped, and encoding a depth cloud is the most
   // expensive thing this node does.
   std::string frame_id;
   if (!ResolveFrame(cloud.header, environment, &frame_id)) return false;

@@ -29,8 +29,9 @@ namespace cognitive3d_ros {
 // encoding refusals and the pose-failure path testable at all.
 struct MediaEnvironment {
   // The sensor pose in the reference frame in force, in ROS axes, at the message
-  // stamp. False when tf cannot answer -- the record is DROPPED, because a frame
-  // with no pose is a picture with no place in the scene.
+  // stamp. False when tf cannot answer yet: the record is held for `pose_wait_s`, and
+  // dropped if tf still cannot, because a frame with no pose is a picture with no
+  // place in the scene.
   std::function<bool(const std::string& frame, const rclcpp::Time& stamp, c3d::Vec3* position,
                      c3d::Quat* rotation)>
       lookup_pose;
@@ -57,8 +58,8 @@ struct MediaEnvironment {
 
 // Records that passed the rate gate before tf could pose them, kept in arrival order. A driver
 // that stamps a frame as it publishes it is ahead of the last transform of its chain, so its pose
-// is usually there a few milliseconds later; waiting for it would hold the node's one callback
-// thread, and the pose timer with it.
+// is usually there within a tf period; waiting for it would hold the node's one callback thread,
+// and the pose timer with it.
 class HeldRecords {
  public:
   // True when the record reached the session.

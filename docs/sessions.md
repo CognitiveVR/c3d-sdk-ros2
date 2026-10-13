@@ -486,9 +486,8 @@ frame.
   component its own executor, or into a container that holds nothing else. A shared
   `component_container` runs every component in it on one single-threaded executor, and the
   node's callbacks hold that executor: for up to `remote_variables_timeout_s` (3 seconds by
-  default) at every session start while the remote variables are fetched, for about 3 seconds at
-  cleanup and shutdown while uploads drain, and for up to 50 milliseconds per camera or lidar frame
-  while it waits for the frame's transform. A driver or other node in the same container waits as
+  default) at every session start while the remote variables are fetched, and for about 3 seconds
+  at cleanup and shutdown while uploads drain. A driver or other node in the same container waits as
   long, and its topics are served late. Under `component_container_mt` the node is free of data
   races, because every callback it owns runs in one mutually exclusive group, but a lifecycle
   transition or service call can wait seconds behind ingest while the robot's topics keep the

@@ -1428,7 +1428,8 @@ LifecycleNodeInterface::CallbackReturn Cognitive3DNode::on_configure(
 
   // tf2 owns the transform tree. The buffer lives from configure to cleanup; the listener
   // that fills it lives only while the node is active (see on_activate). It is filled on a thread
-  // of its own, which is what lets a lookup wait for a transform.
+  // of its own, so this node's callbacks never starve tf of its transforms, and the buffer is
+  // marked so, which Humble's tf2_ros requires before it answers the pose sampler's canTransform.
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
   tf_buffer_->setUsingDedicatedThread(true);
   tf_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive,
