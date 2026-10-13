@@ -8,7 +8,7 @@ marks as provisional may change in a minor release, and its entry here says how 
 
 ## [Unreleased]
 
-## [1.1.0] - 2026-10-09
+## [1.1.0] - 2026-10-13
 
 ### Changed
 
