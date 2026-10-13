@@ -69,7 +69,7 @@ choose a convention and what each one is for.
 ## The pose timeline
 
 The pose timeline is what Session Replay draws the robot from. It holds one record per pose
-sample, taken `sample_rate_hz` times a second (10 by default):
+sample, taken `sample_rate_hz` times a second (30 by default):
 
 | field | what |
 | -- | -- |

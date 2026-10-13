@@ -62,7 +62,7 @@ Each line is a check: a severity, the check's name and what it found. A line sta
 under it says what to do. This abridged run found nothing fatal:
 
 ```text
-cognitive3d_ros 1.0.0 doctor (ROS 2 jazzy, rmw_fastrtps_cpp)
+cognitive3d_ros 1.1.0 doctor (ROS 2 jazzy, rmw_fastrtps_cpp)
 
   [ok  ] build                        cognitive3d_ros's node, the one the launch file runs while cognitive3d_ros_nav2 is not installed; translating 9 message type(s): action_msgs/msg/GoalStatusArray, ...
   [ok  ] configuration                accepted; scene <your-scene-uuid> version <your-scene-version>, device <your-device-id>

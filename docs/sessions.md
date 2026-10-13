@@ -236,7 +236,7 @@ wall-clock second, which Gazebo shows as RTF. At a factor of 1 the two settings 
 session. Below 1, a session recorded without `sim_time_on_wire` is longer than the run by one over
 the factor: at 0.25, 5 simulated minutes make a 20-minute session. Set `sim_time_on_wire: true`
 whenever the factor stays below 1. Its rates then count per simulated second, so at a factor of 0.2
-the default 10 Hz pose rate records 2 poses per wall-clock second, and 10 per simulated second.
+the default 30 Hz pose rate records 6 poses per wall-clock second, and 30 per simulated second.
 
 On a computer with no simulator window, measure the factor from `/clock`, with two readings about
 30 seconds apart:
@@ -284,8 +284,8 @@ another process holds.
 
 ### The size cap
 
-`spool_max_mb` (512 by default) caps the spool on disk. At the cap, the oldest chunks of the lowest
-tier are evicted to make room. From the first evicted to the last:
+`spool_max_mb` (1024, 1 GiB, by default) caps the spool on disk. At the cap, the oldest chunks of
+the lowest tier are evicted to make room. From the first evicted to the last:
 
 1. camera and lidar
 2. poses and sensor series
@@ -388,7 +388,7 @@ status per topic:
 
 ```text
 [INFO] [...] [cognitive3d]: observing 3 topic(s)
-  session <seconds>_<your-device-id>  poses=1707 frame=map  recorded=9844 dropped=0  uploaded=38 spooled=1  events=1
+  session <seconds>_<your-device-id>  poses=5121 frame=map  recorded=29532 dropped=0  uploaded=38 spooled=1  events=1
   /odom  3404 msg  3404 xlat  20Hz  2393KiB  reliable/volatile/keep_last(10)
   /joint_states  8510 msg  8510 xlat  50Hz  1662KiB  reliable/volatile/keep_last(10)
   /navigate_to_pose/_action/status  14 msg  14 xlat  0Hz  2KiB  reliable/transient_local/keep_last(10)
@@ -486,9 +486,8 @@ frame.
   component its own executor, or into a container that holds nothing else. A shared
   `component_container` runs every component in it on one single-threaded executor, and the
   node's callbacks hold that executor: for up to `remote_variables_timeout_s` (3 seconds by
-  default) at every session start while the remote variables are fetched, for about 3 seconds at
-  cleanup and shutdown while uploads drain, and for up to 50 milliseconds per camera or lidar frame
-  while it waits for the frame's transform. A driver or other node in the same container waits as
+  default) at every session start while the remote variables are fetched, and for about 3 seconds
+  at cleanup and shutdown while uploads drain. A driver or other node in the same container waits as
   long, and its topics are served late. Under `component_container_mt` the node is free of data
   races, because every callback it owns runs in one mutually exclusive group, but a lifecycle
   transition or service call can wait seconds behind ingest while the robot's topics keep the

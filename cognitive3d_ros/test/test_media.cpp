@@ -145,10 +145,10 @@ class MediaTest : public ::testing::Test {
                                              std::make_shared<c3d::NullLogger>());
     ASSERT_TRUE(runner_->Begin());
 
-    environment_.lookup_pose = [this](const std::string& frame, const rclcpp::Time&,
+    environment_.lookup_pose = [this](const std::string& frame, const rclcpp::Time& stamp,
                                       c3d::Vec3* position, c3d::Quat* rotation) {
       looked_up_frames_.push_back(frame);
-      if (!pose_available_) return false;
+      if (!pose_available_ || stamp.seconds() > pose_until_) return false;
       *position = c3d::Vec3{1.0, 2.0, 3.0};
       *rotation = c3d::Quat{0.0, 0.0, 0.0, 1.0};
       return true;
@@ -170,6 +170,8 @@ class MediaTest : public ::testing::Test {
   std::vector<std::string> looked_up_frames_;
   std::vector<std::string> warnings_;
   bool pose_available_ = true;
+  // tf's chain ends here: a stamp after it has no pose yet.
+  double pose_until_ = std::numeric_limits<double>::infinity();
   double next_arrival_ = 1000.0;
   fs::path dir_;
   static int counter_;
@@ -927,6 +929,152 @@ TEST_F(MediaTest, AFrameWithNoPoseIsDroppedAndCounted) {
                               environment_, *runner_));
   EXPECT_EQ(capture.stats().frames, 0u);
   EXPECT_EQ(capture.stats().pose_failures, 1u);
+}
+
+// A frame stamped ahead of its tf chain is held, not waited for, and recorded once the chain
+// catches up: the node's one callback thread never stops for it.
+class MediaHoldTest : public MediaTest {
+ protected:
+  void SetUp() override {
+    MediaTest::SetUp();
+    environment_.pose_wait_s = 0.05;
+    environment_.arrival_time = [this]() { return now_; };
+  }
+
+  static LidarConfig Scanner() {
+    LidarConfig config;
+    config.name = "scan";
+    config.topic = "/scan";
+    config.rate_hz = 1000.0;
+    return config;
+  }
+
+  rclcpp::SerializedMessage ScanAt(double stamp_s) {
+    sensor_msgs::msg::LaserScan scan;
+    scan.header.frame_id = "base_scan";
+    scan.header.stamp.sec = static_cast<std::int32_t>(stamp_s);
+    scan.header.stamp.nanosec =
+        static_cast<std::uint32_t>(std::lround((stamp_s - std::floor(stamp_s)) * 1e9));
+    scan.range_max = 10.0f;
+    scan.ranges.assign(8, 1.0f);
+    now_ += 0.002;
+    return Serialize(scan);
+  }
+
+  double now_ = 2000.0;
+};
+
+TEST_F(MediaHoldTest, AFrameAheadOfItsChainIsHeldAndRecordedWhenTheChainCatchesUp) {
+  pose_until_ = 100.0;
+  CameraConfig config;
+  config.name = "front";
+  config.topic = "/image";
+  config.rate_hz = 1000.0;
+  CameraCapture capture(config);
+
+  const auto image = Serialize(MakeImage(32, 32, "rgb8", "camera_link", 100.03));
+  EXPECT_FALSE(capture.Handle("sensor_msgs/msg/Image", image, environment_, *runner_));
+  EXPECT_EQ(capture.held(), 1u);
+  EXPECT_EQ(capture.stats().frames, 0u);
+  EXPECT_EQ(capture.stats().pose_failures, 0u) << "a frame still inside its wait is not a failure";
+
+  now_ += 0.02;
+  pose_until_ = 100.05;
+  capture.ServiceHeld(environment_, *runner_);
+  EXPECT_EQ(capture.held(), 0u);
+  EXPECT_EQ(capture.stats().frames, 1u);
+  EXPECT_EQ(capture.stats().pose_failures, 0u);
+}
+
+TEST_F(MediaHoldTest, AHeldScanWhosePoseNeverArrivesIsDroppedAtItsDeadline) {
+  pose_available_ = false;
+  LidarCapture capture(Scanner());
+  EXPECT_FALSE(capture.Handle("sensor_msgs/msg/LaserScan", ScanAt(100.0), environment_, *runner_));
+  ASSERT_EQ(capture.held(), 1u);
+
+  now_ += 0.04;
+  capture.ServiceHeld(environment_, *runner_);
+  EXPECT_EQ(capture.held(), 1u) << "dropped before its wait was out";
+  EXPECT_EQ(capture.stats().pose_failures, 0u);
+
+  now_ += 0.02;
+  capture.ServiceHeld(environment_, *runner_);
+  EXPECT_EQ(capture.held(), 0u);
+  EXPECT_EQ(capture.stats().pose_failures, 1u);
+  EXPECT_EQ(capture.stats().scans, 0u);
+}
+
+// Records reach the session in arrival order, so `seq` follows the sensor: one whose pose is
+// already there waits behind one that arrived before it.
+TEST_F(MediaHoldTest, ARecordIsNeverWrittenAheadOfOneHeldBeforeIt) {
+  pose_until_ = 100.0;
+  LidarCapture capture(Scanner());
+  EXPECT_FALSE(capture.Handle("sensor_msgs/msg/LaserScan", ScanAt(100.03), environment_, *runner_));
+  EXPECT_FALSE(capture.Handle("sensor_msgs/msg/LaserScan", ScanAt(99.99), environment_, *runner_));
+  EXPECT_EQ(capture.held(), 2u);
+  EXPECT_EQ(capture.stats().scans, 0u);
+
+  pose_until_ = 101.0;
+  capture.ServiceHeld(environment_, *runner_);
+  EXPECT_EQ(capture.held(), 0u);
+  EXPECT_EQ(capture.stats().scans, 2u);
+}
+
+// The hold runs on the clock the transform arrives on, not the clock records arrive on. Under
+// use_sim_time a simulation at a quarter of real time delivers the transform a quarter as fast,
+// so a held record keeps its whole wait in simulated seconds, four times as long by the wall.
+TEST_F(MediaHoldTest, AHeldRecordWaitsOnTheClockItsTransformArrivesOn) {
+  double simulated = 500.0;
+  environment_.pose_clock = [&simulated]() { return simulated; };
+  pose_until_ = 100.0;
+  LidarCapture capture(Scanner());
+  EXPECT_FALSE(capture.Handle("sensor_msgs/msg/LaserScan", ScanAt(100.03), environment_, *runner_));
+  ASSERT_EQ(capture.held(), 1u);
+
+  now_ += 0.1;
+  simulated += 0.025;
+  capture.ServiceHeld(environment_, *runner_);
+  EXPECT_EQ(capture.held(), 1u) << "dropped after 0.025 s of its clock, by the arrival clock's 0.1";
+  pose_until_ = 100.05;
+  capture.ServiceHeld(environment_, *runner_);
+  EXPECT_EQ(capture.stats().scans, 1u);
+  EXPECT_EQ(capture.stats().pose_failures, 0u);
+
+  pose_until_ = 100.0;
+  EXPECT_FALSE(capture.Handle("sensor_msgs/msg/LaserScan", ScanAt(100.1), environment_, *runner_));
+  simulated += 0.06;
+  capture.ServiceHeld(environment_, *runner_);
+  EXPECT_EQ(capture.held(), 0u) << "held past its wait on its own clock";
+  EXPECT_EQ(capture.stats().pose_failures, 1u);
+}
+
+TEST_F(MediaHoldTest, AStoppedChainHoldsAtMostTheCapAndCountsWhatItPushesOut) {
+  pose_available_ = false;
+  LidarCapture capture(Scanner());
+  const std::size_t offered = HeldRecords::kMaxHeld + 3;
+  for (std::size_t i = 0; i < offered; ++i) {
+    capture.Handle("sensor_msgs/msg/LaserScan", ScanAt(100.0 + 0.001 * i), environment_, *runner_);
+  }
+  EXPECT_EQ(capture.held(), HeldRecords::kMaxHeld);
+  EXPECT_EQ(capture.stats().pose_failures, 3u);
+}
+
+TEST_F(MediaHoldTest, NothingHeldOutlivesItsSession) {
+  pose_available_ = false;
+  LidarCapture capture(Scanner());
+  capture.Handle("sensor_msgs/msg/LaserScan", ScanAt(100.0), environment_, *runner_);
+  ASSERT_EQ(capture.held(), 1u);
+  capture.Reset();
+  EXPECT_EQ(capture.held(), 0u) << "a scan from the last session would open the next one";
+
+  capture.Handle("sensor_msgs/msg/LaserScan", ScanAt(100.1), environment_, *runner_);
+  ASSERT_EQ(capture.held(), 1u);
+  runner_->End("test");
+  pose_available_ = true;
+  capture.ServiceHeld(environment_, *runner_);
+  EXPECT_EQ(capture.held(), 0u);
+  EXPECT_EQ(capture.stats().scans, 0u) << "recorded into a session that had ended";
+  EXPECT_EQ(capture.stats().pose_failures, 0u);
 }
 
 TEST_F(MediaTest, AnEmptyFrameIdWithNoConfiguredFrameIsRefusedWithAnExplanation) {

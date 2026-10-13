@@ -40,7 +40,7 @@ says why.
 Each [GitHub Release](https://github.com/CognitiveVR/c3d-sdk-ros2/releases) carries one `.deb` per
 package, distro and architecture, plus a `SHA256SUMS` file. The files are named
 `ros-<distro>-<package>_<version>-0<ubuntu-codename>_<architecture>.deb`, for example
-`ros-humble-cognitive3d-ros_1.0.0-0jammy_arm64.deb`.
+`ros-humble-cognitive3d-ros_1.1.0-0jammy_arm64.deb`.
 
 Before you start:
 
@@ -58,7 +58,7 @@ previews the install and then installs them:
 
 ```bash
 source /opt/ros/jazzy/setup.bash      # or humble; sets ROS_DISTRO
-SDK_VERSION=1.0.0
+SDK_VERSION=1.1.0
 UBUNTU="$(. /etc/os-release && echo "$VERSION_CODENAME")"
 ARCH="$(dpkg --print-architecture)"
 BASE="https://github.com/CognitiveVR/c3d-sdk-ros2/releases/download/v$SDK_VERSION"
@@ -171,7 +171,7 @@ Clone the repository into a workspace, install the dependencies rosdep knows, an
 
 ```bash
 mkdir -p ~/c3d_ws/src
-git clone --branch v1.0.0 https://github.com/CognitiveVR/c3d-sdk-ros2.git ~/c3d_ws/src/c3d-sdk-ros2
+git clone --branch v1.1.0 https://github.com/CognitiveVR/c3d-sdk-ros2.git ~/c3d_ws/src/c3d-sdk-ros2
 cd ~/c3d_ws
 source /opt/ros/jazzy/setup.bash      # or humble
 rosdep install --from-paths src --ignore-src -y
@@ -200,7 +200,7 @@ ros2 run cognitive3d_ros cognitive3d_node
 It logs one line naming the SDK version, the ROS distro and the RMW, then waits:
 
 ```text
-[INFO] [...] [cognitive3d]: cognitive3d_ros 1.0.0 (ROS 2 jazzy, rmw_fastrtps_cpp) constructed. Subscribe-only: this node publishes nothing except its own diagnostics.
+[INFO] [...] [cognitive3d]: cognitive3d_ros 1.1.0 (ROS 2 jazzy, rmw_fastrtps_cpp) constructed. Subscribe-only: this node publishes nothing except its own diagnostics.
 ```
 
 Stop it with Ctrl+C. A node started this way is unconfigured and records nothing. The

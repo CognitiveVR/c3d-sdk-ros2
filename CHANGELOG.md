@@ -8,6 +8,42 @@ marks as provisional may change in a minor release, and its entry here says how 
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-13
+
+### Changed
+
+- The pose timeline is sampled at 30 Hz by default (`sample_rate_hz`), up from 10.
+- Odometry, joint state, IMU, `std_msgs/msg/Float32` and `std_msgs/msg/Int32MultiArray` topics
+  record at up to 30 Hz by default, up from 10 Hz for odometry, 5 Hz for joint states and 1 Hz for
+  the rest. Batteries and laser scan summaries stay at 1 Hz.
+- Cameras and lidars record at up to 30 frames or scans per second by default (`rate_hz`), up from
+  1 and 2.
+- Recorded data volume rises with these rates. A source slower than its rate is recorded at its own
+  rate. At the defaults the pose timeline is about 2.5 KB per second, one 640 x 480 camera about
+  1.7 MB per second (about 6 GB per hour), and a depth point cloud of 20,000 points about 1.8 MB per
+  second, up to about 9 MB per second at `max_points`; see
+  [What it costs](docs/camera-and-lidar.md#what-it-costs).
+- `spool_max_mb` defaults to 1024, up from 512.
+- `robot.localisation_jump` compares poses about 0.1 seconds apart rather than consecutive samples,
+  so detection does not weaken as `sample_rate_hz` rises: a correction that tf spreads over several
+  samples, as it does behind AMCL, is no longer cut into steps too small to detect. Below 10 Hz it
+  compares consecutive samples, as before. A localizer slower than 10 Hz can still spread a
+  correction across two comparisons, as in 1.0.0.
+- `c3d.pose_failures`, `c3d.stale_poses` and `c3d.gaze_frame_failures` count samples, so at 30 Hz
+  the same failure counts three times as many as at 10 Hz.
+- To keep 1.0.0's rates and spool, set `sample_rate_hz: 10.0`, `camera.<name>.rate_hz: 1.0`,
+  `lidar.<name>.rate_hz: 2.0` and `spool_max_mb: 512`, and `topic_config.<key>.rate_hz` on each
+  allowlisted topic: `10.0` for odometry, `5.0` for joint states, and `1.0` for IMU, `Float32` and
+  `Int32MultiArray` topics.
+
+### Fixed
+
+- Posing a camera frame or lidar scan no longer blocks the node's callback thread. A record whose
+  transform has not arrived yet, such as one from a driver that stamps as it publishes, or one whose
+  frame tf cannot resolve, used to wait up to 50 ms on that thread, delaying pose sampling with it.
+  It is now held for up to 0.2 s of ROS time, simulated time under `use_sim_time`, and retried while
+  the node does other work; a record that still has no pose is dropped and counted as before.
+
 ## [1.0.0] - 2026-10-08
 
 The first public release of the Cognitive3D SDK for ROS 2. It records a robot's runs as Cognitive3D
@@ -39,4 +75,5 @@ Cognitive3D dashboard. Start with the [Quickstart](docs/quickstart.md).
 - The verifiers are diagnostics on an unversioned API, and the installed C++ headers are not a
   supported API: either can change in any release.
 
+[1.1.0]: https://github.com/CognitiveVR/c3d-sdk-ros2/releases/tag/v1.1.0
 [1.0.0]: https://github.com/CognitiveVR/c3d-sdk-ros2/releases/tag/v1.0.0

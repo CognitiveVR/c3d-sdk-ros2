@@ -218,6 +218,11 @@ TEST(ConfigDefaults, TheApplicationVersionDefaultsToTheSdksOwnVersion) {
   EXPECT_EQ(c3d::Config{}.app_version, std::string(c3d::kSdkVersion));
 }
 
+// The spool's cap is the documented 1 GiB unless a consumer sets another.
+TEST(ConfigDefaults, TheSpoolCapDefaultsToOneGibibyte) {
+  EXPECT_EQ(c3d::Config{}.spool_max_bytes, 1024ull * 1024 * 1024);
+}
+
 TEST_F(SessionTest, BeginEmitsSessionStartAndProperties) {
   Build();
   session_->SetProperty("site", std::string("warehouse-3"));

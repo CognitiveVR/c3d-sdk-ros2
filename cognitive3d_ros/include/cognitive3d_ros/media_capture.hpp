@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <string>
 
@@ -28,8 +29,9 @@ namespace cognitive3d_ros {
 // encoding refusals and the pose-failure path testable at all.
 struct MediaEnvironment {
   // The sensor pose in the reference frame in force, in ROS axes, at the message
-  // stamp. False when tf cannot answer -- the record is DROPPED, because a frame
-  // with no pose is a picture with no place in the scene.
+  // stamp. False when tf cannot answer yet: the record is held for `pose_wait_s`, and
+  // dropped if tf still cannot, because a frame with no pose is a picture with no
+  // place in the scene.
   std::function<bool(const std::string& frame, const rclcpp::Time& stamp, c3d::Vec3* position,
                      c3d::Quat* rotation)>
       lookup_pose;
@@ -45,6 +47,55 @@ struct MediaEnvironment {
   // How many publishers a topic has on the graph now. Unset is not known, and
   // nothing that depends on it is said.
   std::function<std::size_t(const std::string& topic)> publishers;
+  // How long a record whose pose `lookup_pose` cannot give yet is held for it, in seconds on the
+  // `pose_clock`. Held, not waited for: ServiceHeld retries it. 0 drops it at once.
+  double pose_wait_s = 0.0;
+  // Seconds on the clock the transforms `lookup_pose` waits for arrive on: the tf buffer's, which
+  // under use_sim_time is simulated time, so a simulation slower than real time still gives a held
+  // record its whole wait. Unset is `arrival_time`.
+  std::function<double()> pose_clock;
+};
+
+// Records that passed the rate gate before tf could pose them, kept in arrival order. A driver
+// that stamps a frame as it publishes it is ahead of the last transform of its chain, so its pose
+// is usually there within a tf period; waiting for it would hold the node's one callback thread,
+// and the pose timer with it.
+class HeldRecords {
+ public:
+  // True when the record reached the session.
+  using Record = std::function<bool(const c3d::Vec3& position, const c3d::Quat& rotation,
+                                    const MediaEnvironment&, SessionRunner&)>;
+
+  // Records now when nothing is held ahead of it and tf can pose it, holds it for
+  // `environment.pose_wait_s` otherwise. Every record dropped for want of a pose, this one or a
+  // held one, is added to `pose_failures`. True when this record reached the session now.
+  bool Offer(const std::string& frame, const rclcpp::Time& stamp, Record record,
+             const MediaEnvironment& environment, SessionRunner& runner,
+             std::uint64_t* pose_failures);
+  // Records, in order, each held record tf can now pose, up to the first it cannot; drops those
+  // past their deadline. Drops everything, uncounted, when no session is active.
+  void Service(const MediaEnvironment& environment, SessionRunner& runner,
+               std::uint64_t* pose_failures);
+  void Clear() { held_.clear(); }
+  std::size_t size() const { return held_.size(); }
+
+  // How long the node holds a record for its pose. Holding costs memory, not the callback
+  // thread, so it covers a driver that stamps as it publishes on a slow chain -- up to a tf period
+  // behind, 50 ms at 20 Hz, plus transport -- with room to spare.
+  static constexpr double kPoseHoldSeconds = 0.2;
+  // Past this many, the oldest is dropped: a chain that stopped would otherwise hold a frame from
+  // every arrival for the length of the wait. At 30 records a second a sensor holds about 6, 7 with
+  // timer jitter.
+  static constexpr std::size_t kMaxHeld = 8;
+
+ private:
+  struct Held {
+    std::string frame;
+    rclcpp::Time stamp;
+    double deadline = 0.0;
+    Record record;
+  };
+  std::deque<Held> held_;
 };
 
 struct CameraStats {
@@ -119,10 +170,14 @@ class CameraCapture {
   void HandleCameraInfo(const sensor_msgs::msg::CameraInfo& info,
                         const MediaEnvironment& environment);
 
-  // True when a frame reached the session. `type` is the graph's type name, so a
-  // topic that changes publisher mid-run is handled rather than assumed.
+  // True when a frame reached the session; false also for one held for its pose, which
+  // ServiceHeld records. `type` is the graph's type name, so a topic that changes publisher
+  // mid-run is handled rather than assumed.
   bool Handle(const std::string& type, const rclcpp::SerializedMessage& message,
               const MediaEnvironment& environment, SessionRunner& runner);
+  // Records the held frames tf can now pose. Called on a timer as well as from Handle.
+  void ServiceHeld(const MediaEnvironment& environment, SessionRunner& runner);
+  std::size_t held() const { return held_.size(); }
 
   // What this configuration WOULD send for one message: the same encode the run
   // performs, with no gate, no pose, no session and no counter touched.
@@ -140,7 +195,7 @@ class CameraCapture {
                    std::uint16_t* height, std::string* why) const;
   bool EncodeCompressed(const sensor_msgs::msg::CompressedImage& compressed, std::string* bytes,
                         std::uint16_t* width, std::uint16_t* height, std::string* why) const;
-  bool Emit(const std_msgs::msg::Header& header, const std::string& bytes, std::uint16_t width,
+  bool Emit(const std_msgs::msg::Header& header, std::string bytes, std::uint16_t width,
             std::uint16_t height, const MediaEnvironment& environment, SessionRunner& runner);
   // The rate gate on the message's arrival, saying once when its stamp is zero.
   bool AcceptHeader(const std_msgs::msg::Header& header, const MediaEnvironment& environment);
@@ -155,6 +210,7 @@ class CameraCapture {
   bool unstamped_warned_ = false;
   c3d::CameraFov camera_info_fov_;
   bool camera_info_warned_ = false;
+  HeldRecords held_;
 };
 
 // One configured lidar. LaserScan and PointCloud2 share the rate gate, the pose
@@ -167,8 +223,11 @@ class LidarCapture {
   const LidarStats& stats() const { return stats_; }
   void Reset();
 
+  // As CameraCapture::Handle, and held scans the same way.
   bool Handle(const std::string& type, const rclcpp::SerializedMessage& message,
               const MediaEnvironment& environment, SessionRunner& runner);
+  void ServiceHeld(const MediaEnvironment& environment, SessionRunner& runner);
+  std::size_t held() const { return held_.size(); }
 
   // The lidar twin of CameraCapture::MeasureEncodedFrame, and the same reason.
   // A point cloud is encoded through `c3d::pointcloud::Encode` here exactly as it
@@ -179,9 +238,8 @@ class LidarCapture {
                           std::string* why) const;
 
  private:
-  bool ResolvePose(const std_msgs::msg::Header& header, const MediaEnvironment& environment,
-                   std::string* frame_id, c3d::Vec3* position, c3d::Quat* rotation,
-                   std::uint64_t* time_ms);
+  bool ResolveFrame(const std_msgs::msg::Header& header, const MediaEnvironment& environment,
+                    std::string* frame_id);
   bool AcceptHeader(const std_msgs::msg::Header& header, const MediaEnvironment& environment);
 
   LidarConfig config_;
@@ -193,6 +251,7 @@ class LidarCapture {
   bool refusal_warned_ = false;
   bool color_warned_ = false;
   bool unstamped_warned_ = false;
+  HeldRecords held_;
 };
 
 }  // namespace cognitive3d_ros

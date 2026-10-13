@@ -435,7 +435,7 @@ void Cognitive3DNode::DeclareParameters() {
   // Empty resolves to a per-user state directory at configure: a shared, world-writable default
   // would let two instances, or two users, write into one spool.
   declare_parameter<std::string>("spool_dir", "");
-  declare_parameter<int>("spool_max_mb", 512);
+  declare_parameter<int>("spool_max_mb", 1024);
   // How often a live session refreshes its spool marker, and how long a marker
   // must have gone unrefreshed before startup recovery may adopt it as an orphan.
   // Exposed because the only reason to change them is a deployment fact the SDK
@@ -463,14 +463,15 @@ void Cognitive3DNode::DeclareParameters() {
   declare_parameter<bool>("dry_run", false);
   // Requires use_sim_time. Off, every wire timestamp is wall clock now.
   declare_parameter<bool>("sim_time_on_wire", false);
-  DeclareDouble("sample_rate_hz", 10.0);
+  DeclareDouble("sample_rate_hz", 30.0);
   declare_parameter<std::string>("reference_frame", "map");
   declare_parameter<std::string>("fallback_reference_frame", "odom");
   // Declared from the struct so the two defaults cannot drift apart.
   DeclareDouble("reference_frame_grace_s", sampler_config_.reference_frame_grace_s);
   // What counts as a relocalisation jump rather than as the robot moving, in the
-  // preferred frame. Both are PER SAMPLE, so both scale with `sample_rate_hz`:
-  // halve the rate and one honest sample covers twice as much.
+  // preferred frame. Both are PER CHECK: poses about 0.1 s apart at a
+  // `sample_rate_hz` of 10 or more, consecutive samples below it, where halving the
+  // rate doubles what one honest sample covers.
   //
   // Exposed because the right value is a fact about the deployment that the SDK
   // cannot see. 0.5 m is coarse in a room the robot crosses in four steps and
@@ -482,8 +483,8 @@ void Cognitive3DNode::DeclareParameters() {
   // re-estimates its yaw by a right angle while the robot stands still -- and
   // orientation is what the viewer turns the robot by, so missing one corrupts the
   // spatial timeline and not merely a travel metric. 45 degrees sits above the
-  // 11 degrees per sample a base spinning at 109 deg/s covers at 10 Hz, with
-  // room for a slipped timer, and below the right angle such a re-estimate is.
+  // 11 degrees a base spinning at 109 deg/s covers in 0.1 s, with room for a
+  // check that came late, and below the right angle such a re-estimate is.
   //
   // Declared from the struct so the two sets of defaults cannot drift apart.
   DeclareDouble("relocalisation_jump_m", sampler_config_.relocalisation_jump_m);
@@ -1009,7 +1010,7 @@ bool Cognitive3DNode::LoadMediaConfig(std::string* error) {
     }
     const std::string key = "camera." + name;
     if (!has_parameter(key + ".topic")) declare_parameter<std::string>(key + ".topic", "");
-    DeclareDouble(key + ".rate_hz", 1.0);
+    DeclareDouble(key + ".rate_hz", 30.0);
     if (!has_parameter(key + ".format")) declare_parameter<std::string>(key + ".format", "jpeg");
     if (!has_parameter(key + ".jpeg_quality")) declare_parameter<int>(key + ".jpeg_quality", 80);
     if (!has_parameter(key + ".max_width_px")) declare_parameter<int>(key + ".max_width_px", 640);
@@ -1045,7 +1046,7 @@ bool Cognitive3DNode::LoadMediaConfig(std::string* error) {
     const std::string key = "lidar." + name;
     const c3d::PointCloudOptions defaults;
     if (!has_parameter(key + ".topic")) declare_parameter<std::string>(key + ".topic", "");
-    DeclareDouble(key + ".rate_hz", 2.0);
+    DeclareDouble(key + ".rate_hz", 30.0);
     if (!has_parameter(key + ".frame")) declare_parameter<std::string>(key + ".frame", "");
     if (!has_parameter(key + ".intensities")) declare_parameter<bool>(key + ".intensities", false);
     DeclareDouble(key + ".pointcloud.voxel_leaf_m", defaults.voxel_leaf_m);
@@ -1427,7 +1428,8 @@ LifecycleNodeInterface::CallbackReturn Cognitive3DNode::on_configure(
 
   // tf2 owns the transform tree. The buffer lives from configure to cleanup; the listener
   // that fills it lives only while the node is active (see on_activate). It is filled on a thread
-  // of its own, which is what lets a lookup wait for a transform.
+  // of its own, so this node's callbacks never starve tf of its transforms, and the buffer is
+  // marked so, which Humble's tf2_ros requires before it answers the pose sampler's canTransform.
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
   tf_buffer_->setUsingDedicatedThread(true);
   tf_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive,
@@ -1671,6 +1673,10 @@ bool Cognitive3DNode::BringUp() {
                                            [this]() { OnDiscoveryTimer(); });
   report_timer_ = CreateActivationTimer(std::chrono::duration<double>(report_period_s_),
                                         [this]() { OnReportTimer(); });
+  if (!cameras_.empty() || !lidars_.empty()) {
+    media_hold_timer_ = CreateActivationTimer(std::chrono::milliseconds(10),
+                                              [this]() { OnMediaHoldTimer(); });
+  }
   return true;
 }
 
@@ -1683,6 +1689,7 @@ void Cognitive3DNode::BringDown(const std::string& reason) {
   sample_timer_.reset();
   discovery_timer_.reset();
   report_timer_.reset();
+  media_hold_timer_.reset();
   TearDownSubscriptions();
   StopSession(reason);
   if (diagnostics_pub_) diagnostics_pub_->on_deactivate();
@@ -2265,6 +2272,7 @@ LifecycleNodeInterface::CallbackReturn Cognitive3DNode::on_shutdown(
   sample_timer_.reset();
   discovery_timer_.reset();
   report_timer_.reset();
+  media_hold_timer_.reset();
   TearDownSubscriptions();
   // An orderly end here is what stops the next process start from reporting
   // this session as having died abnormally.
@@ -2546,6 +2554,9 @@ MediaEnvironment Cognitive3DNode::MakeMediaEnvironment() {
     RCLCPP_WARN(get_logger(), "%s", text.c_str());
   };
   environment.arrival_time = [this]() { return GateNow(); };
+  environment.pose_wait_s = HeldRecords::kPoseHoldSeconds;
+  // The tf buffer's clock.
+  environment.pose_clock = [this]() { return get_clock()->now().seconds(); };
   environment.publishers = [this](const std::string& topic) { return count_publishers(topic); };
   return environment;
 }
@@ -2700,6 +2711,12 @@ void Cognitive3DNode::OnMediaMessage(const std::string& key,
   }
 }
 
+void Cognitive3DNode::OnMediaHoldTimer() {
+  if (runner_ == nullptr) return;
+  for (const auto& capture : cameras_) capture->ServiceHeld(media_environment_, *runner_);
+  for (const auto& capture : lidars_) capture->ServiceHeld(media_environment_, *runner_);
+}
+
 void Cognitive3DNode::OnMessage(const std::string& topic,
                                 const rclcpp::SerializedMessage& message) {
   auto it = stats_.find(topic);
@@ -2839,7 +2856,7 @@ void Cognitive3DNode::OnSampleTimer() {
   } else {
     ++pose_failures_;
     // Throttled: a robot that has not started its localisation yet would
-    // otherwise produce ten of these per second.
+    // otherwise produce one of these per sample.
     if (steady_now - last_pose_warn_ > 10.0) {
       last_pose_warn_ = steady_now;
       RCLCPP_WARN(get_logger(),

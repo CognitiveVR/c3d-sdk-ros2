@@ -235,6 +235,7 @@ class Cognitive3DNode : public rclcpp_lifecycle::LifecycleNode {
   // session. Nothing without one.
   void RecordLidarTypeProperties(const LidarConfig& lidar, const std::string& type);
   void OnMediaMessage(const std::string& key, const rclcpp::SerializedMessage& message);
+  void OnMediaHoldTimer();
   MediaEnvironment MakeMediaEnvironment();
   void OnMessage(const std::string& topic, const rclcpp::SerializedMessage& message);
   // One line for each source the cap has taken something from, named by the source
@@ -357,6 +358,8 @@ class Cognitive3DNode : public rclcpp_lifecycle::LifecycleNode {
   rclcpp::TimerBase::SharedPtr discovery_timer_;
   rclcpp::TimerBase::SharedPtr report_timer_;
   rclcpp::TimerBase::SharedPtr sample_timer_;
+  // Retries camera frames and lidar scans held for their pose. Only while a sensor is configured.
+  rclcpp::TimerBase::SharedPtr media_hold_timer_;
 
   rclcpp::Service<cognitive3d_ros_msgs::srv::StartSession>::SharedPtr start_session_srv_;
   rclcpp::Service<cognitive3d_ros_msgs::srv::EndSession>::SharedPtr end_session_srv_;

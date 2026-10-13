@@ -15,7 +15,7 @@ namespace cognitive3d_ros {
 struct CameraConfig {
   std::string name;
   std::string topic;
-  double rate_hz = 1.0;
+  double rate_hz = 30.0;
   // "jpeg" is the only implemented value. "jpegxl" is reserved on the wire and
   // refused here, because a value the gateway accepts and no browser renders is
   // worse than a configure error.
@@ -48,7 +48,7 @@ struct CameraConfig {
 struct LidarConfig {
   std::string name;
   std::string topic;
-  double rate_hz = 2.0;
+  double rate_hz = 30.0;
   std::string frame;
   // LaserScan only. Intensities double a scan's size and most 2D lidars publish
   // a constant, so they are dropped unless asked for.

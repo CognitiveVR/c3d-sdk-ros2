@@ -7,7 +7,7 @@ frame, and the frame the gaze channel reports. The exact conversions are specifi
 
 ## The pose timeline
 
-At `sample_rate_hz` (10 by default) the node looks up `reference_frame` to `robot_frame` in tf,
+At `sample_rate_hz` (30 by default) the node looks up `reference_frame` to `robot_frame` in tf,
 `map` to `base_link` by default, falling back to `odom`. It converts the pose into the scene's axes
 under `pose_convention` and records its position and rotation. This is the gaze channel, the spatial timeline Session Replay draws the robot
 from. Every event is placed at the robot body's position from the latest sample.
@@ -120,14 +120,29 @@ force.
 
 ### Localization jumps
 
-A localizer corrects its estimate in steps. In the preferred frame, a sample that moves more than
-`relocalisation_jump_m` (0.5 meters) or turns more than `relocalisation_jump_deg` (45 degrees)
-since the previous sample records `robot.localisation_jump`, and counts in `c3d.localisation_jumps`.
-The event carries `distance_m`, `rotation_deg`, `kind` (`position`, `rotation` or `both`) and
-`frame`. The pose itself is still recorded; the event lets an analysis exclude the discontinuity.
+A localizer corrects its estimate in steps. In the preferred frame, the node compares the pose with
+the one about 0.1 seconds earlier, or with the previous sample when `sample_rate_hz` is below 10. A
+move of more than `relocalisation_jump_m` (0.5 meters) or a turn of more than
+`relocalisation_jump_deg` (45 degrees) records one `robot.localisation_jump`, and counts in
+`c3d.localisation_jumps`. The event carries `distance_m` and `rotation_deg`, measured over that
+comparison, `kind` (`position`, `rotation` or `both`) and `frame`. The pose itself is still
+recorded; the event lets an analysis exclude the discontinuity.
 
-Both thresholds are per sample. At a lower `sample_rate_hz` each sample covers more motion, so
-raise them in proportion, or fast driving and turning read as jumps.
+Comparing poses about 0.1 seconds apart, rather than consecutive samples, makes detection the same
+at any `sample_rate_hz` of 10 or more. A localizer that future-dates its transform, as AMCL does, is
+interpolated by tf between two of its updates, so one correction reaches the pose spread over every
+sample in between, and consecutive samples at a high rate would each see only a part of it. Two
+compared poses are never less than about 0.09 seconds apart, so at least half of a correction spread
+over up to about 0.18 seconds falls between one pair: a right-angle re-registration behind AMCL's
+7 Hz scans is recorded once at any rate of 10 Hz or more, unless it divides exactly in half between
+two comparisons, which then each see 45 degrees and neither exceeds the threshold. A correction spread over more than 0.1
+seconds, behind a localizer that updates slower than 10 Hz, is split between two comparisons at some
+timings. One smaller than twice a threshold can then reach it in neither, and a large one can reach
+it in both and be recorded twice. Nothing is compared across a change of reference frame, a stale
+transform or the start of a session.
+
+Both thresholds hold for 0.1 seconds of motion. Below a `sample_rate_hz` of 10, each sample covers
+more motion, so raise them in proportion, or fast driving and turning read as jumps.
 
 ### Stale transforms
 

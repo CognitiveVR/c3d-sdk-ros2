@@ -140,8 +140,8 @@ def heading_errors(rows, minimum_travel_meters):
 
     Only over segments long enough to have a direction: a stationary robot has no
     heading, and normalising a near-zero displacement amplifies float noise into
-    arbitrary angles. Consecutive samples at 10 Hz barely move, so segments are
-    grown until they clear the bound.
+    arbitrary angles. Consecutive samples at the default 30 Hz barely move, so
+    segments are grown until they clear the bound.
 
     REVERSING IS CLASSIFIED, NOT FOLDED AND NOT AVERAGED IN. A TurtleBot 4 undocks
     by reversing and Nav2 backs up during a recovery, so a correctly oriented robot

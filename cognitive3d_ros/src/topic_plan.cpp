@@ -72,17 +72,13 @@ Ingest DefaultIngestForType(const std::string& type, double* rate_hz_out) {
 
   if (IsBulkType(type)) {
     ingest = Ingest::kRefuse;
-  } else if (type == "tf2_msgs/msg/TFMessage") {
-    // tf aggregates well past 100 Hz. Sampling it at rate is the fastest way to
-    // blow the bandwidth budget, and analytics needs 10 Hz at most.
+  } else if (type == "nav_msgs/msg/Odometry" || type == "sensor_msgs/msg/JointState" ||
+             type == "sensor_msgs/msg/Imu" || type == "std_msgs/msg/Float32" ||
+             type == "std_msgs/msg/Int32MultiArray") {
+    // The robot's motion and its plain sensors, at the pose timeline's default
+    // rate. A `topic_config` rate sets another per topic.
     ingest = Ingest::kDownsample;
-    rate = 10.0;
-  } else if (type == "sensor_msgs/msg/JointState") {
-    ingest = Ingest::kDownsample;
-    rate = 5.0;
-  } else if (type == "nav_msgs/msg/Odometry") {
-    ingest = Ingest::kDownsample;
-    rate = 10.0;
+    rate = 30.0;
   } else if (type == "sensor_msgs/msg/BatteryState") {
     ingest = Ingest::kDownsample;
     rate = 1.0;

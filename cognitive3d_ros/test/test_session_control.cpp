@@ -1427,6 +1427,15 @@ TEST(ParameterValidation, AWholeNumberIsAcceptedWhereADoubleIsDeclared) {
   fs::remove_all(dir, ec);
 }
 
+// The spool's cap is the documented 1024 MiB, and reaches the spool as 1 GiB.
+TEST_F(LifecycleContractTest, TheDefaultSpoolCapIsOneGibibyte) {
+  MakeNode(/*auto_start_session=*/false);
+  ASSERT_EQ(node_->configure().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+  EXPECT_EQ(node_->get_parameter("spool_max_mb").as_int(), 1024);
+  EXPECT_EQ(node_->resolved_config().spool_max_bytes, 1024ull * 1024 * 1024);
+  node_->cleanup();
+}
+
 // The gaze envelope's `interval` is the time one sample stands for, so it follows the rate.
 TEST_F(LifecycleContractTest, TheGazeIntervalFollowsTheSampleRate) {
   MakeNode(/*auto_start_session=*/true, {{"sample_rate_hz", 4.0}});
@@ -1454,6 +1463,18 @@ TEST_F(LifecycleContractTest, TheGazeIntervalFollowsTheSampleRate) {
   }
   ASSERT_GT(gaze, 0) << "no gaze envelope reached the spool";
   EXPECT_EQ(at_the_rate, gaze);
+}
+
+// Ten periods at the default rate are a third of a second, well inside the gap between two
+// updates of a localiser that does not future-date its transform. The node's stale window at the
+// default rate is the five-second floor, so such a localiser is not counted as stopped.
+TEST_F(LifecycleContractTest, AtTheDefaultSampleRateTheStaleWindowIsFiveSeconds) {
+  MakeNode(/*auto_start_session=*/false);
+  ASSERT_EQ(node_->configure().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+  EXPECT_DOUBLE_EQ(node_->resolved_sampler_config().rate_hz, 30.0);
+  EXPECT_DOUBLE_EQ(node_->resolved_config().gaze_interval_s, 1.0 / 30.0);
+  EXPECT_DOUBLE_EQ(node_->resolved_sampler_config().stale_transform_after_s, 5.0);
+  node_->cleanup();
 }
 
 // A namespaced node takes battery and diagnostics by type only under its own namespace.
@@ -1519,7 +1540,7 @@ TEST(ParameterValidation, AnAllowlistedTopicWithNoRuleTakesItsTypesDefaultRate) 
   auto node = std::make_shared<cognitive3d_ros::Cognitive3DNode>(options);
   ASSERT_EQ(node->configure().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE)
       << node->configure_error();
-  EXPECT_DOUBLE_EQ(node->resolved_plan().Resolve("/odom", "nav_msgs/msg/Odometry").rate_hz, 10.0);
+  EXPECT_DOUBLE_EQ(node->resolved_plan().Resolve("/odom", "nav_msgs/msg/Odometry").rate_hz, 30.0);
   EXPECT_DOUBLE_EQ(
       node->resolved_plan().Resolve("/joint_states", "sensor_msgs/msg/JointState").rate_hz, 2.0);
   node->cleanup();
@@ -2229,7 +2250,7 @@ TEST(NodeIdentityProperties, ASessionReopenedAfterABackwardClockJumpCarriesTheWh
   const auto drive_clock_to = [&](double seconds) {
     rosgraph_msgs::msg::Clock message;
     message.clock = rclcpp::Time(static_cast<int64_t>(seconds * 1e9));
-    // The sample timer is a 10 Hz WALL timer and the jump is only observed on a tick, so this has
+    // The sample timer is a 30 Hz WALL timer and the jump is only observed on a tick, so this has
     // to let real time pass. `spin_some` does NOT wait out its argument -- it returns as soon as no
     // more work is ready -- so a loop of forty spin_somes can finish in microseconds and the timer
     // never fires. Sleeping is what makes the tick happen; without it the test reports a correct
@@ -3209,6 +3230,7 @@ void ExpectMediaProperties(const nlohmann::json& sent) {
   expect("c3d.ros.camera.front.vfov_degrees", 0.0);
   expect("c3d.ros.camera.front.fov_source", "camera_info");
   expect("c3d.ros.camera.front.camera_info_topic", "/camera_info");
+  expect("c3d.ros.camera.rear.rate_hertz", 30.0);
   expect("c3d.ros.camera.rear.hfov_degrees", 61.0);
   expect("c3d.ros.camera.rear.vfov_degrees", 45.5);
   expect("c3d.ros.camera.rear.fov_source", "parameter");
@@ -3218,11 +3240,11 @@ void ExpectMediaProperties(const nlohmann::json& sent) {
   expect("c3d.ros.cameras", "front,rear,side");
 
   expect("c3d.ros.lidar.scan.topic", "/scan");
-  expect("c3d.ros.lidar.scan.rate_hertz", 2.0);
+  expect("c3d.ros.lidar.scan.rate_hertz", 30.0);
   expect("c3d.ros.lidar.scan.message_type", "sensor_msgs/msg/LaserScan");
   expect("c3d.ros.lidar.scan.intensities", true);
   expect("c3d.ros.lidar.depth.topic", "/points");
-  expect("c3d.ros.lidar.depth.rate_hertz", 2.0);
+  expect("c3d.ros.lidar.depth.rate_hertz", 30.0);
   expect("c3d.ros.lidar.depth.message_type", "sensor_msgs/msg/PointCloud2");
   expect("c3d.ros.lidar.depth.pointcloud.voxel_leaf_meters", 0.05);
   expect("c3d.ros.lidar.depth.pointcloud.max_points", 5000);
@@ -3339,7 +3361,7 @@ TEST(GazeFrame, TheFrameItsConventionAndItsFailuresAreRecordedUnderTheGazeFrameN
 
 // The node gates every camera frame and every translated message on when it ARRIVED, by its own
 // clock. A camera whose driver never sets the stamp therefore records at its configured rate
-// rather than one frame per session, and an allowlisted odometry topic at its type's 10 Hz.
+// rather than one frame per session, and an allowlisted odometry topic at its type's 30 Hz.
 TEST(NodeRateGates, AZeroStampedCameraAndAnOdometryTopicAreGatedOnArrival) {
   const auto dir = fs::temp_directory_path() / ("c3d_arrival_" + std::to_string(::getpid()));
   fs::create_directories(dir);
@@ -3393,15 +3415,19 @@ TEST(NodeRateGates, AZeroStampedCameraAndAnOdometryTopicAreGatedOnArrival) {
   frame.data.assign(8 * 8 * 3, 64);
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(6000);
   auto next_frame = std::chrono::steady_clock::now();
+  auto next_odometry = next_frame;
   int published = 0;
   while (std::chrono::steady_clock::now() < deadline) {
-    if (std::chrono::steady_clock::now() >= next_frame) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= next_frame) {
       image->publish(frame);
-      nav_msgs::msg::Odometry speed;
+      next_frame += std::chrono::milliseconds(50);
+    }
+    if (now >= next_odometry) {
+      nav_msgs::msg::Odometry speed;  // a new value each time: sensors are change-gated
       speed.twist.twist.linear.x = 0.01 * published++;
       odometry->publish(speed);
-      odometry->publish(speed);
-      next_frame += std::chrono::milliseconds(50);
+      next_odometry += std::chrono::milliseconds(10);
     }
     executor.spin_some(std::chrono::milliseconds(5));
   }
@@ -3422,8 +3448,8 @@ TEST(NodeRateGates, AZeroStampedCameraAndAnOdometryTopicAreGatedOnArrival) {
       }
     }
   }
-  EXPECT_GE(speeds, 30u) << "odometry at 40 Hz into its type's 10 Hz gate";
-  EXPECT_LE(speeds, 62u);
+  EXPECT_GE(speeds, 90u) << "odometry at 100 Hz into its type's 30 Hz gate";
+  EXPECT_LE(speeds, 186u) << "a 30 Hz gate over about six seconds";
   std::error_code ec;
   fs::remove_all(dir, ec);
 }
@@ -3500,8 +3526,162 @@ TEST(NodeRateGates, UnderSimTimeOnWireTheRateIsPerSimulatedSecond) {
       }
     }
   }
-  EXPECT_GE(speeds, 5u) << "the odometry topic was barely recorded";
-  EXPECT_LE(speeds, 16u) << "10 Hz per simulated second, over about one simulated second";
+  EXPECT_GE(speeds, 15u) << "the odometry topic was barely recorded";
+  EXPECT_LE(speeds, 40u) << "30 Hz per simulated second, over about one simulated second";
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
+namespace {
+
+// Camera parts in the spool. A part is cut only around a frame that reached the session, so none
+// means no frame did.
+int SpooledCameraParts(const fs::path& dir) {
+  int parts = 0;
+  std::error_code ec;
+  for (const auto& entry : fs::recursive_directory_iterator(dir, ec)) {
+    if (!entry.is_regular_file()) continue;
+    std::ifstream in(entry.path(), std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    try {
+      if (nlohmann::json::parse(text).value("stream", std::string()) == "camera") ++parts;
+    } catch (const nlohmann::json::exception&) {
+    }
+  }
+  return parts;
+}
+
+// One camera frame stamped 50 ms ahead of its tf chain, through a running node: the chain stands
+// still for `catch_up_s` of ROS time after the frame is published and then catches up, and no
+// further frame arrives to prompt a retry. With `real_time_factor` above 0 the node runs on a
+// simulated clock that advances that much per wall-clock second. Returns the camera parts the
+// session spooled.
+int OneFrameAheadOfItsChain(const fs::path& dir, double catch_up_s, double real_time_factor = 0.0) {
+  const bool simulated = real_time_factor > 0.0;
+  rclcpp::NodeOptions options;
+  auto overrides = OfflineSessionOverrides(dir);
+  if (simulated) overrides.push_back({"use_sim_time", true});
+  overrides.push_back({"auto_start_session", true});
+  overrides.push_back({"remote_variables", false});
+  overrides.push_back({"reference_frame", std::string("odom")});
+  overrides.push_back({"fallback_reference_frame", std::string("")});
+  overrides.push_back({"discovery_period_s", 0.2});
+  overrides.push_back({"cameras", std::vector<std::string>{"front"}});
+  overrides.push_back({"camera.front.topic", std::string("/probe/held_image")});
+  overrides.push_back({"camera.front.camera_info_topic", std::string("")});
+  options.parameter_overrides(overrides);
+  auto node = std::make_shared<cognitive3d_ros::Cognitive3DNode>(options);
+
+  auto publishers = std::make_shared<rclcpp::Node>("c3d_test_hold_publishers");
+  auto image = publishers->create_publisher<sensor_msgs::msg::Image>("/probe/held_image", 10);
+  auto clock = publishers->create_publisher<rosgraph_msgs::msg::Clock>("/clock",
+                                                                      rclcpp::ClockQoS());
+  const auto wall_start = std::chrono::steady_clock::now();
+  const auto ros_now = [&]() {
+    if (!simulated) return publishers->now();
+    const double elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start).count();
+    return rclcpp::Time(static_cast<int64_t>((100.0 + real_time_factor * elapsed) * 1e9),
+                        RCL_ROS_TIME);
+  };
+  tf2_ros::TransformBroadcaster chain(publishers);
+  tf2_ros::StaticTransformBroadcaster mount(publishers);
+  geometry_msgs::msg::TransformStamped camera;
+  camera.header.frame_id = "base_link";
+  camera.child_frame_id = "camera_link";
+  camera.transform.rotation.w = 1.0;
+  mount.sendTransform(camera);
+  const auto send_chain = [&](const rclcpp::Time& stamp) {
+    geometry_msgs::msg::TransformStamped base;
+    base.header.stamp = stamp;
+    base.header.frame_id = "odom";
+    base.child_frame_id = "base_link";
+    base.transform.rotation.w = 1.0;
+    chain.sendTransform(base);
+  };
+
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(node->get_node_base_interface());
+  executor.add_node(publishers);
+  const auto spin_for = [&](std::chrono::milliseconds span, bool with_chain) {
+    const auto until = std::chrono::steady_clock::now() + span;
+    auto next = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() < until) {
+      if (simulated) {
+        rosgraph_msgs::msg::Clock tick;
+        tick.clock = ros_now();
+        clock->publish(tick);
+      }
+      if (with_chain && std::chrono::steady_clock::now() >= next) {
+        send_chain(ros_now());
+        next += std::chrono::milliseconds(50);
+      }
+      executor.spin_some(std::chrono::milliseconds(5));
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  };
+  if (node->configure().id() != lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE) return -1;
+  if (simulated) {
+    const auto clock_by = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (node->get_clock()->now().seconds() < 99.0 &&
+           std::chrono::steady_clock::now() < clock_by) {
+      spin_for(std::chrono::milliseconds(10), false);
+    }
+    if (node->get_clock()->now().seconds() < 99.0) return -1;
+  }
+  if (node->activate().id() != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) return -1;
+
+  // The chain at 20 Hz until the camera is subscribed and the pose timeline is on odom.
+  const auto subscribed_by = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (image->get_subscription_count() == 0 && std::chrono::steady_clock::now() < subscribed_by) {
+    spin_for(std::chrono::milliseconds(50), true);
+  }
+  if (image->get_subscription_count() == 0) return -1;
+  spin_for(std::chrono::milliseconds(500), true);
+
+  const rclcpp::Time last_chain = ros_now();
+  send_chain(last_chain);
+  sensor_msgs::msg::Image frame;
+  frame.header.stamp = last_chain + rclcpp::Duration::from_seconds(0.05);
+  frame.header.frame_id = "camera_link";
+  frame.width = 8;
+  frame.height = 8;
+  frame.encoding = "rgb8";
+  frame.step = 24;
+  frame.data.assign(8 * 8 * 3, 64);
+  image->publish(frame);
+  const double catch_up_wall_s = simulated ? catch_up_s / real_time_factor : catch_up_s;
+  spin_for(std::chrono::milliseconds(static_cast<int>(catch_up_wall_s * 1000.0)), false);
+  spin_for(std::chrono::milliseconds(300), true);
+
+  node->deactivate();
+  executor.remove_node(node->get_node_base_interface());
+  executor.remove_node(publishers);
+  node.reset();
+  return SpooledCameraParts(dir);
+}
+
+}  // namespace
+
+// The node holds a frame tf cannot pose yet and retries it on its own: the chain catches up a
+// tenth of a second after the frame, with no further frame to prompt a retry, and the frame is
+// recorded. It is dropped if the node never retries a held frame, or holds one for less than that.
+TEST(NodeMediaHold, AFrameAheadOfItsChainIsRecordedWhenTheChainCatchesUp) {
+  const auto dir = fs::temp_directory_path() / ("c3d_hold_" + std::to_string(::getpid()));
+  fs::create_directories(dir);
+  EXPECT_GE(OneFrameAheadOfItsChain(dir, 0.1), 1) << "the held frame never reached the session";
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
+// Under use_sim_time the hold runs on simulated time, the clock the transform arrives on. At a
+// quarter of real time the chain catches up 0.1 simulated seconds after the frame, which is 0.4 s
+// by the wall: inside the hold on its own clock, past it on the steady clock.
+TEST(NodeMediaHold, UnderSimTimeAHeldFrameWaitsInSimulatedTime) {
+  const auto dir = fs::temp_directory_path() / ("c3d_simhold_" + std::to_string(::getpid()));
+  fs::create_directories(dir);
+  EXPECT_GE(OneFrameAheadOfItsChain(dir, 0.1, 0.25), 1)
+      << "the held frame was dropped before its chain caught up in simulated time";
   std::error_code ec;
   fs::remove_all(dir, ec);
 }
@@ -4627,7 +4807,7 @@ TEST_F(LifecycleContractTest, AParameterReadAtConfigureIsNotSetWhileConfigured) 
     EXPECT_NE(result.reason.find("ros2 lifecycle set /cognitive3d cleanup"), std::string::npos)
         << result.reason;
   }
-  EXPECT_DOUBLE_EQ(node_->get_parameter("sample_rate_hz").as_double(), 10.0);
+  EXPECT_DOUBLE_EQ(node_->get_parameter("sample_rate_hz").as_double(), 30.0);
   EXPECT_FALSE(node_->set_parameters_atomically(
                         {{"session_name", std::string("mixed")}, {"sample_rate_hz", 20.0}})
                    .successful)

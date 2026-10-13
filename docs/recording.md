@@ -97,9 +97,8 @@ simulated second under `sim_time_on_wire`). Left out, it is the message type's d
 
 | message type | default |
 | -- | -- |
-| `nav_msgs/msg/Odometry` | 10 Hz |
-| `sensor_msgs/msg/JointState` | 5 Hz |
-| `sensor_msgs/msg/Imu`, `sensor_msgs/msg/LaserScan`, `sensor_msgs/msg/BatteryState`, `std_msgs/msg/Float32`, `std_msgs/msg/Int32MultiArray` | 1 Hz |
+| `nav_msgs/msg/Odometry`, `sensor_msgs/msg/JointState`, `sensor_msgs/msg/Imu`, `std_msgs/msg/Float32`, `std_msgs/msg/Int32MultiArray` | 30 Hz |
+| `sensor_msgs/msg/LaserScan`, `sensor_msgs/msg/BatteryState` | 1 Hz |
 | `nav2_msgs/msg/BehaviorTreeLog` | 1 Hz, the window its transition rate is averaged over |
 
 Each battery topic is held to its own rate. A status or health change on a message the limit

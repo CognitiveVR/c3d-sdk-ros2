@@ -106,13 +106,13 @@ read zero on most mobile robots.
 
 | parameter | type | default | unit | what it does |
 | -- | -- | -- | -- | -- |
-| `sample_rate_hz` | double | `10.0` | Hz | Pose samples per second, from 1/86400 (one a day) to 1000. A transform whose stamp stops advancing for 10 sample periods, and at least 5 seconds, is skipped as stale and counted in `c3d.stale_poses`. |
+| `sample_rate_hz` | double | `30.0` | Hz | Pose samples per second, from 1/86400 (one a day) to 1000. A transform whose stamp stops advancing for 10 sample periods, and at least 5 seconds, is skipped as stale and counted in `c3d.stale_poses`. |
 | `reference_frame` | string | `"map"` | — | The frame poses are read in when it resolves. Empty uses `fallback_reference_frame` alone. |
 | `fallback_reference_frame` | string | `"odom"` | — | The frame used when `reference_frame` does not resolve. A session that starts on it records `robot.reference_frame_unavailable`, and every switch records `robot.reference_frame_changed`. A path recorded in `odom` starts wherever the robot booted, not where it is in the scene. |
 | `reference_frame_grace_s` | double | `5.0` | seconds | How long the node waits for `reference_frame` once the fallback resolves, before it settles on the fallback. Nothing is recorded while it waits. `doctor` waits for the same time. A finite number, 0 or more: `0` adopts the fallback at once. |
 | `robot_frame` | string | `"base_link"` | — | The robot body frame whose pose is sampled. |
-| `relocalisation_jump_m` | double | `0.5` | meters | A step between consecutive samples in `reference_frame` larger than this records a `robot.localisation_jump` event. Must be positive. Per sample: at a lower `sample_rate_hz` one sample covers more ground, so raise it with a lower rate. |
-| `relocalisation_jump_deg` | double | `45.0` | degrees | The same, for a turn between consecutive samples. Must be positive. |
+| `relocalisation_jump_m` | double | `0.5` | meters | A step in `reference_frame` larger than this, between poses about 0.1 seconds apart, records a `robot.localisation_jump` event. Must be positive. Below a `sample_rate_hz` of 10 the poses are consecutive samples, each covering more ground, so raise it in proportion. |
+| `relocalisation_jump_deg` | double | `45.0` | degrees | The same, for a turn. Must be positive. |
 | `gaze_frame` | string | `""` | — | A frame the gaze channel reports instead of the robot body: its position, and its rotation with its forward axis as the rotation's forward. Empty uses `robot_frame`. A name that does not resolve falls back to the robot pose with no error in the session; it is counted in `c3d.gaze_frame_failures`, and `doctor`'s `gaze frame` check fails on it. |
 | `gaze_frame_convention` | string | `"auto"` | — | Which axis of `gaze_frame` is forward: `body_forward_x` for a REP-103 body frame, `optical_forward_z` for a camera optical frame, or `auto`, which picks `optical_forward_z` when a `_` or `/` separated part of the name is `optical` (any case) and the next part is not `flow`, and logs its choice. A wrong choice turns the gaze rotation 90 degrees off with no error. |
 
@@ -125,7 +125,7 @@ name. [Recording](recording.md) explains what each message type records.
 | parameter | type | default | unit | what it does |
 | -- | -- | -- | -- | -- |
 | `topics` | string[] | `[]` | — | The allowlist: topic names, or a prefix ending in `*` (`/robot1/*`). A `*` anywhere else refuses configure, because the entry would match nothing. `~name` refuses configure; write `~/name`. A `topic_config` key for a topic not listed here refuses configure: see [Per-topic rule keys](#per-topic-rule-keys). |
-| `topic_config.<key>.rate_hz` | double | `-1.0` | Hz | Samples per second, applied by the translator. 0 or less takes the message type's default: odometry 10 Hz, joint states 5 Hz, every other type 1 Hz, batteries included. The diagnostics and action status translators do not read it. |
+| `topic_config.<key>.rate_hz` | double | `-1.0` | Hz | Samples per second, applied by the translator. 0 or less takes the message type's default: 30 Hz for odometry, joint states, IMU, `Float32` and `Int32MultiArray`, and 1 Hz for every other type, batteries and laser scans included. The diagnostics and action status translators do not read it. |
 | `topic_config.<key>.series` | string | `""` | — | The sensor series the topic's values are recorded under. Set it to state a unit: `ultrasonic.distance_centimeters`. Empty derives the name from the topic (`/ultrasonic` records `ultrasonic.value`). Read only for `std_msgs/msg/Float32` and `std_msgs/msg/Int32MultiArray` topics; other types name their own series and ignore it, and the node warns when it subscribes one. Ignored, with a warning, on a `*` entry. |
 | `topic_config.<key>.ingest` | string | `""` | — | `refuse`, `metadata_once`, `derive_metrics`, `downsample` or `full_ingest`; any other value refuses configure. Empty takes the message type's default. Only `refuse` and `full_ingest` have an effect, described below. |
 | `topic_config.<key>.qos.reliability` | string | `""` | — | `reliable` or `best_effort`. Empty negotiates with the publishers. |
@@ -235,7 +235,7 @@ power loss.
 | parameter | type | default | unit | what it does |
 | -- | -- | -- | -- | -- |
 | `spool_dir` | string | `""` | — | The spool's directory. Empty resolves at configure to `$XDG_STATE_HOME/cognitive3d`, or else `$HOME/.local/state/cognitive3d`; configure refuses when neither names an absolute directory. One process per directory: configure refuses a directory another process holds, naming its process id, and a directory it cannot write. Give every node its own, including nodes in one component container. |
-| `spool_max_mb` | int | `512` | MiB | The spool's size cap, shared by every stream. A whole number from 1 to 1073741824. At the cap the spool evicts data, lowest-priority streams first, and that data never reaches the platform. Size it for the longest time the robot runs without a network. |
+| `spool_max_mb` | int | `1024` | MiB | The spool's size cap, shared by every stream. A whole number from 1 to 1073741824. At the cap the spool evicts data, lowest-priority streams first, and that data never reaches the platform. Size it for the longest time the robot runs without a network. |
 | `marker_heartbeat_s` | double | `5.0` | seconds | How often a live session refreshes its marker in the spool. Must be positive. |
 | `orphan_stale_after_s` | double | `30.0` | seconds | How long a session's marker may go unrefreshed before the next configure closes that session as ended abnormally. Must exceed `marker_heartbeat_s` by more than 0.05 seconds. |
 
@@ -266,7 +266,7 @@ what is refused.
 | -- | -- | -- | -- | -- |
 | `cameras` | string[] | `[]` | — | The camera names, each configured under `camera.<name>.*`. A name must be non-empty, carry no `.` or `/`, and appear once. A `camera.<name>.<field>` key whose name is not listed here, or whose field is not one of those below, refuses configure, naming the key. |
 | `camera.<name>.topic` | string | `""` | — | A `sensor_msgs/msg/Image` or `sensor_msgs/msg/CompressedImage` topic. Required for every listed name: empty refuses configure. A topic of another type is refused when it appears on the graph, not at configure; `doctor` checks it. |
-| `camera.<name>.rate_hz` | double | `1.0` | Hz | Frames accepted per second, counted on arrival. Must be positive. |
+| `camera.<name>.rate_hz` | double | `30.0` | Hz | Frames accepted per second, counted on arrival. Must be positive. |
 | `camera.<name>.format` | string | `"jpeg"` | — | The encoding. `jpeg` is the only accepted value. |
 | `camera.<name>.jpeg_quality` | int | `80` | — | The JPEG quality, from 1 to 100. |
 | `camera.<name>.max_width_px` | int | `640` | pixels | Wider frames are scaled down to this width, keeping the aspect ratio. `0` never resizes. |
@@ -280,7 +280,7 @@ what is refused.
 | `camera.<name>.qos.depth` | int | `-1` | messages | As for `topic_config.<key>.qos.depth`. |
 | `lidars` | string[] | `[]` | — | The lidar names, each configured under `lidar.<name>.*`, with the same rules as `cameras`. A `lidar.<name>.<field>` key whose name is not listed here, or whose field is not one of those below, refuses configure, naming the key. A lidar has no `qos.*` fields. |
 | `lidar.<name>.topic` | string | `""` | — | A `sensor_msgs/msg/LaserScan` or `sensor_msgs/msg/PointCloud2` topic. Required for every listed name. |
-| `lidar.<name>.rate_hz` | double | `2.0` | Hz | Scans accepted per second, counted on arrival. Must be positive. |
+| `lidar.<name>.rate_hz` | double | `30.0` | Hz | Scans accepted per second, counted on arrival. Must be positive. |
 | `lidar.<name>.frame` | string | `""` | — | As for a camera. Also set it when a point cloud's header names a frame its points are not in, which `doctor`'s optical frame check detects. |
 | `lidar.<name>.intensities` | bool | `false` | — | `LaserScan` only. Record intensities too, which doubles a scan's size. |
 | `lidar.<name>.pointcloud.voxel_leaf_m` | double | `0.05` | meters | `PointCloud2` only. The downsampling cell size, from 0 to 65; `0` keeps every point. |

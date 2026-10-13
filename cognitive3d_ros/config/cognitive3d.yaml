@@ -33,7 +33,7 @@
     dynamic_up_offset_meters: 0.0       # meters; Dynamic Object only
 
     # ---- Poses and the gaze channel ----------------------------------------------
-    sample_rate_hz: 10.0                # pose samples per second
+    sample_rate_hz: 30.0                # pose samples per second
     # Poses are read in reference_frame, or in the fallback while it does not resolve.
     # A path recorded in odom starts wherever the robot booted. An empty
     # reference_frame uses the fallback alone.
@@ -41,8 +41,9 @@
     fallback_reference_frame: "odom"
     reference_frame_grace_s: 5.0        # seconds to wait for reference_frame
     robot_frame: "base_link"
-    # A step or a turn between two samples in reference_frame larger than these
-    # records robot.localisation_jump. Per sample: raise them at a lower rate.
+    # A step or a turn in reference_frame larger than these, between poses about
+    # 0.1 s apart, records robot.localisation_jump. Below 10 Hz the poses are
+    # consecutive samples: raise them in proportion to the longer period.
     relocalisation_jump_m: 0.5          # meters
     relocalisation_jump_deg: 45.0       # degrees
     # A frame the gaze channel reports instead of robot_frame. A name that does not
@@ -67,7 +68,7 @@
     # type's default.
     # topic_config:
     #   odom:
-    #     rate_hz: -1.0                 # 0 or less: the type's default (odometry 10 Hz)
+    #     rate_hz: -1.0                 # 0 or less: the type's default (odometry 30 Hz)
     #     ingest: ""                    # only refuse and full_ingest have an effect
     #     series: ""                    # Float32 and Int32MultiArray topics only
     #     qos:
@@ -108,7 +109,7 @@
     # Every record is written here before upload. Empty is $XDG_STATE_HOME/cognitive3d,
     # else $HOME/.local/state/cognitive3d. One process per directory.
     spool_dir: ""
-    spool_max_mb: 512                   # MiB for every stream; data is evicted at the cap
+    spool_max_mb: 1024                  # MiB for every stream; data is evicted at the cap
     marker_heartbeat_s: 5.0             # seconds
     orphan_stale_after_s: 30.0          # seconds; must exceed marker_heartbeat_s
 
@@ -129,7 +130,7 @@
     # camera:
     #   front:
     #     topic: ""                     # Image or CompressedImage; required
-    #     rate_hz: 1.0                  # frames per second
+    #     rate_hz: 30.0                 # frames per second
     #     format: "jpeg"                # the only accepted value
     #     jpeg_quality: 80              # 1 to 100
     #     max_width_px: 640             # 0 never resizes
@@ -148,7 +149,7 @@
     # lidar:
     #   scan:
     #     topic: ""                     # LaserScan or PointCloud2; required
-    #     rate_hz: 2.0                  # scans per second
+    #     rate_hz: 30.0                 # scans per second
     #     frame: ""                     # empty uses header.frame_id
     #     intensities: false            # LaserScan only
     #     pointcloud:                   # PointCloud2 only

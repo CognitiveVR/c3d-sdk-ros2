@@ -18,7 +18,7 @@ or from the source archive on that version's GitHub Release page, into your own 
 `.claude/skills/`. Committed there, it is shared with your team and stays pinned to that version:
 
 ```bash
-git clone --depth 1 --branch v1.0.0 https://github.com/CognitiveVR/c3d-sdk-ros2.git /tmp/c3d-sdk-ros2
+git clone --depth 1 --branch v1.1.0 https://github.com/CognitiveVR/c3d-sdk-ros2.git /tmp/c3d-sdk-ros2
 mkdir -p .claude/skills
 cp -r /tmp/c3d-sdk-ros2/.claude/skills/integrate-cognitive3d-ros2 .claude/skills/
 ```

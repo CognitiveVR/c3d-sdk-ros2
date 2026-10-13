@@ -2,7 +2,7 @@
 # Replace every <placeholder> with a measured value, and delete each optional block that does
 # not apply: an empty list stops the node at startup. The application key never goes here; the
 # node reads it from C3D_APPLICATION_API_KEY in its environment.
-# Every parameter: https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.0.0/docs/configuration.md
+# Every parameter: https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/configuration.md
 
 /**:                                   # keep /**: a file keyed by node name configures nothing else
   ros__parameters:
