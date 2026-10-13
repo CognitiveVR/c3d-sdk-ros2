@@ -11,8 +11,10 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "c3d/spool.hpp"
@@ -524,11 +526,13 @@ namespace {
 // of yaw. tf2 interpolates `map -> odom` between the two future-dated entries either side of the
 // lookup time, so the correction reaches a latest-time lookup as a ramp one scan period long,
 // about a second late -- the shape no per-sample threshold sees at a high rate. Sampled at
-// `sample_hz` of wire time from 2 s to 8 s, publishing everything due before each sample.
-// Returns the number of samples recorded. The position cases use 1.2 m: a much larger correction
-// can reach the threshold in two consecutive comparisons and be recorded twice.
+// `sample_hz` of wire time from `from_s` to `to_s`, each sample up to `late_s` late, publishing
+// everything due before each sample. Returns the number of samples recorded. The position cases
+// use 1.2 m: a much larger correction can reach the threshold in two consecutive comparisons and
+// be recorded twice.
 int SampleAnAmclCorrection(tf2_ros::Buffer& buffer, PoseSampler& sampler, SessionRunner& runner,
-                           double sample_hz, double jump_m, double jump_deg) {
+                           double sample_hz, double jump_m, double jump_deg, double from_s = 2.0,
+                           double to_s = 8.0, double late_s = 0.0) {
   struct Pending {
     double published;
     geometry_msgs::msg::TransformStamped transform;
@@ -548,9 +552,13 @@ int SampleAnAmclCorrection(tf2_ros::Buffer& buffer, PoseSampler& sampler, Sessio
                    [](const Pending& a, const Pending& b) { return a.published < b.published; });
   std::size_t next = 0;
   int recorded = 0;
+  // A fixed sequence, so a failure names a timing that fails again.
+  std::uint32_t lateness = 12345u + static_cast<std::uint32_t>(from_s * 1e6);
   for (int n = 0;; ++n) {
-    const double now = 2.0 + n / sample_hz;
-    if (now > 8.0 + 1e-9) break;
+    const double on_time = from_s + n / sample_hz;
+    if (on_time > to_s + 1e-9) break;
+    lateness = lateness * 1664525u + 1013904223u;
+    const double now = on_time + late_s * static_cast<double>(lateness >> 8) / 16777216.0;
     while (next < pending.size() && pending[next].published <= now + 1e-9) {
       buffer.setTransform(pending[next++].transform, "test");
     }
@@ -564,13 +572,17 @@ struct AmclCase {
   double jump_m;
   double jump_deg;
   const char* kind;
+  // When sampling starts: where the samples fall against the correction.
+  double from_s = 2.0;
 };
 
 }  // namespace
 
-// One correction is one event, of the kind that crossed its threshold, at the default rate and
-// at 10 Hz alike. Compared sample to sample at 30 Hz, each step is about a quarter of the
-// correction -- 21 degrees, 0.28 m -- and nothing is recorded at all.
+// One correction is one event, of the kind that crossed its threshold, at the default rate, at
+// 10 Hz, and between them where a check spans two samples. Compared sample to sample at 30 Hz,
+// each step is about a quarter of the correction -- 21 degrees, 0.28 m -- and nothing is recorded
+// at all. The 13 and 14.5 Hz cases start where a check spanning one sample, 77 or 69 ms, would
+// leave no part of the turn over the threshold.
 class AmclCorrectionTest : public PoseSamplerTest,
                            public ::testing::WithParamInterface<AmclCase> {};
 
@@ -580,8 +592,8 @@ TEST_P(AmclCorrectionTest, ACorrectionTfSpreadsOverSeveralSamplesIsOneJump) {
   config.rate_hz = c.sample_hz;
   PoseSampler sampler(buffer_, config);
   const int recorded = SampleAnAmclCorrection(*buffer_, sampler, *runner_, c.sample_hz, c.jump_m,
-                                              c.jump_deg);
-  ASSERT_GT(recorded, static_cast<int>(5.5 * c.sample_hz))
+                                              c.jump_deg, c.from_s);
+  ASSERT_GT(recorded, static_cast<int>(0.9 * (8.0 - c.from_s) * c.sample_hz))
       << "the lookups failed, so no correction reached the pose";
   c3d::Vec3 last{};
   ASSERT_TRUE(sampler.last_body_position(&last));
@@ -598,11 +610,72 @@ INSTANTIATE_TEST_SUITE_P(
     RotationPositionAndBoth, AmclCorrectionTest,
     ::testing::Values(AmclCase{30.0, 0.0, 90.0, "rotation"}, AmclCase{30.0, 1.2, 0.0, "position"},
                       AmclCase{30.0, 1.2, 90.0, "both"}, AmclCase{10.0, 0.0, 90.0, "rotation"},
-                      AmclCase{10.0, 1.2, 0.0, "position"}),
+                      AmclCase{10.0, 1.2, 0.0, "position"},
+                      AmclCase{13.0, 0.0, 90.0, "rotation", 5.305},
+                      AmclCase{14.5, 0.0, 90.0, "rotation", 5.3}),
     [](const ::testing::TestParamInfo<AmclCase>& info) {
-      return std::string(info.param.kind) + "_at_" +
-             std::to_string(static_cast<int>(info.param.sample_hz)) + "_hz";
+      const long tenths = std::lround(info.param.sample_hz * 10.0);
+      std::string hz = std::to_string(tenths / 10);
+      if (tenths % 10 != 0) hz += "_" + std::to_string(tenths % 10);
+      return std::string(info.param.kind) + "_at_" + hz + "_hz";
     });
+
+// Detection does not depend on the rate from 10 Hz up, wherever the samples fall. A check spans
+// at least 0.09 s, so at least half of a correction tf spreads over AMCL's 1/7 s scan period
+// lands inside one check: a right angle is recorded once, and 1.2 m at least once. Swept over 40
+// phases of the samples against the correction, on time and up to 2 ms and 10 ms late, at rates
+// where a check spans one, two or three samples. Taking the sample nearest 0.1 s instead would
+// span 69 ms at 14.5 Hz and miss the turn at some phases.
+TEST_F(PoseSamplerTest, AnAmclCorrectionIsRecordedAtEveryRateAndPhaseFromTenHertz) {
+  // Its own runner, keeping a short tail of poses in memory: tens of thousands of samples need
+  // no spool.
+  c3d::Config cfg;
+  cfg.application_key = "K"; cfg.scene_id = "S"; cfg.scene_version = "1";
+  cfg.device_id = "robot";
+  cfg.auto_send_interval_s = 3600.0;
+  cfg.gaze_batch = std::size_t{1} << 30;
+  cfg.max_records_per_batch = 64;
+  auto spool = OwnSpool(&cfg);
+  SessionRunner runner(cfg, PoseConvention::kRep103, std::make_shared<CapturingTransport>(),
+                       spool, std::make_shared<c3d::NullLogger>());
+  ASSERT_TRUE(runner.Begin());
+
+  int runs = 0;
+  std::vector<std::string> wrong;
+  for (const double hz : {10.0, 11.0, 12.0, 13.0, 14.0, 14.5, 15.0, 17.0, 20.0, 25.0, 30.0}) {
+    for (const double late_s : {0.0, 0.002, 0.010}) {
+      for (int phase = 0; phase < 40; ++phase) {
+        for (const auto& [jump_m, jump_deg] :
+             std::vector<std::pair<double, double>>{{0.0, 90.0}, {1.2, 0.0}}) {
+          buffer_->clear();
+          PoseSamplerConfig config;
+          config.rate_hz = hz;
+          PoseSampler sampler(buffer_, config);
+          const double from_s = 5.3 + 0.005 * phase;
+          ASSERT_GT(SampleAnAmclCorrection(*buffer_, sampler, runner, hz, jump_m, jump_deg,
+                                           from_s, 6.6, late_s),
+                    0);
+          c3d::Vec3 last{};
+          ASSERT_TRUE(sampler.last_body_position(&last));
+          ASSERT_NEAR(last.x, jump_m, 1e-6) << "the correction never reached the pose";
+          ++runs;
+          const std::uint64_t events = sampler.relocalisation_jumps();
+          const bool right = jump_deg > 0.0 ? events == 1 : events == 1 || events == 2;
+          if (!right) {
+            wrong.push_back(std::to_string(hz) + " Hz, from " + std::to_string(from_s) + " s, " +
+                            std::to_string(late_s * 1000.0) + " ms late, " +
+                            (jump_deg > 0.0 ? "90 deg" : "1.2 m") + ": " +
+                            std::to_string(events) + " events");
+          }
+        }
+      }
+    }
+  }
+  std::string listed;
+  for (std::size_t i = 0; i < wrong.size() && i < 10; ++i) listed += "\n  " + wrong[i];
+  EXPECT_TRUE(wrong.empty()) << wrong.size() << " of " << runs << " corrections:" << listed;
+  runner.End("test");
+}
 
 // A discrete correction at 30 Hz is ONE event. Comparing every sample with the pose a tenth of a
 // second back would see the same step from each of the three samples after it.

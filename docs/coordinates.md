@@ -128,14 +128,17 @@ move of more than `relocalisation_jump_m` (0.5 meters) or a turn of more than
 comparison, `kind` (`position`, `rotation` or `both`) and `frame`. The pose itself is still
 recorded; the event lets an analysis exclude the discontinuity.
 
-Comparing poses 0.1 seconds apart, rather than consecutive samples, makes detection the same at any
-`sample_rate_hz` of 10 or more. A localizer that future-dates its transform, as AMCL does, is
+Comparing poses about 0.1 seconds apart, rather than consecutive samples, makes detection the same
+at any `sample_rate_hz` of 10 or more. A localizer that future-dates its transform, as AMCL does, is
 interpolated by tf between two of its updates, so one correction reaches the pose spread over every
-sample in between, and consecutive samples at a high rate would each see only a part of it. A
-correction spread over more than 0.1 seconds, behind a localizer that updates slower than 10 Hz, can
-still be split between two comparisons and reach the threshold in neither, or, when it is large,
-reach it in both and be recorded twice. Nothing is compared across a change of
-reference frame, a stale transform or the start of a session.
+sample in between, and consecutive samples at a high rate would each see only a part of it. Two
+compared poses are never less than about 0.09 seconds apart, so at least half of a correction spread
+over up to about 0.18 seconds falls between one pair: a right-angle re-registration behind AMCL's
+7 Hz scans is recorded once at any rate of 10 Hz or more. A correction spread over more than 0.1
+seconds, behind a localizer that updates slower than 10 Hz, is split between two comparisons at some
+timings. One smaller than twice a threshold can then reach it in neither, and a large one can reach
+it in both and be recorded twice. Nothing is compared across a change of reference frame, a stale
+transform or the start of a session.
 
 Both thresholds hold for 0.1 seconds of motion. Below a `sample_rate_hz` of 10, each sample covers
 more motion, so raise them in proportion, or fast driving and turning read as jumps.

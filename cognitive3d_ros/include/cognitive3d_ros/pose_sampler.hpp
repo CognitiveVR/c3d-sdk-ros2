@@ -157,6 +157,11 @@ double StaleTransformAfterSeconds(double rate_hz);
 // kRelocalisationCheckIntervalS less a tenth of a sample period (of the interval, below 10 Hz),
 // so a sample that arrives a little early is still the one checked: a 30 Hz timer checks every
 // third sample and never slips to every sixth, and below 10 Hz every sample is checked.
+//
+// A check never spans less than 0.09 s, which keeps at least half of a correction tf spreads over
+// a localiser period of up to about 0.18 s inside one check. Taking the sample nearest the
+// interval instead spans as little as 67 ms between 13 and 15 Hz, and misses a right angle behind
+// 7 Hz scans at some timings.
 bool RelocalisationCheckDue(double elapsed_s, double rate_hz);
 
 // The event-cap source key the pose channel's own events are charged to. Not a
