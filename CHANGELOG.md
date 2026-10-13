@@ -41,7 +41,7 @@ marks as provisional may change in a minor release, and its entry here says how 
 - Posing a camera frame or lidar scan no longer blocks the node's callback thread. A record whose
   transform has not arrived yet, such as one from a driver that stamps as it publishes, or one whose
   frame tf cannot resolve, used to wait up to 50 ms on that thread, delaying pose sampling with it.
-  It is now held for up to 50 ms and retried while the node does other work; a record that still has
+  It is now held for up to 0.2 s and retried while the node does other work; a record that still has
   no pose is dropped and counted as before.
 
 ## [1.0.0] - 2026-10-08

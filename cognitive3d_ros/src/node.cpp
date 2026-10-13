@@ -2553,8 +2553,7 @@ MediaEnvironment Cognitive3DNode::MakeMediaEnvironment() {
     RCLCPP_WARN(get_logger(), "%s", text.c_str());
   };
   environment.arrival_time = [this]() { return GateNow(); };
-  // The transform for a frame's stamp is usually a tf period or less behind it.
-  environment.pose_wait_s = 0.05;
+  environment.pose_wait_s = HeldRecords::kPoseHoldSeconds;
   environment.publishers = [this](const std::string& topic) { return count_publishers(topic); };
   return environment;
 }

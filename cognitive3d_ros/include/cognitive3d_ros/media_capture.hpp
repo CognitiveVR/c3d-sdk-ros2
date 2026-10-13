@@ -74,8 +74,12 @@ class HeldRecords {
   void Clear() { held_.clear(); }
   std::size_t size() const { return held_.size(); }
 
+  // How long the node holds a record for its pose. Holding costs memory, not the callback
+  // thread, so it covers a driver that stamps as it publishes on a slow chain -- up to a tf period
+  // behind, 50 ms at 20 Hz, plus transport -- with room to spare.
+  static constexpr double kPoseHoldSeconds = 0.2;
   // Past this many, the oldest is dropped: a chain that stopped would otherwise hold a frame from
-  // every arrival for the length of the wait.
+  // every arrival for the length of the wait. At 30 records a second a sensor holds at most 6.
   static constexpr std::size_t kMaxHeld = 8;
 
  private:

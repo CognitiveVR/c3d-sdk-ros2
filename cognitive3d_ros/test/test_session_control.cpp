@@ -3534,6 +3534,120 @@ TEST(NodeRateGates, UnderSimTimeOnWireTheRateIsPerSimulatedSecond) {
 
 namespace {
 
+// Camera parts in the spool. A part is cut only around a frame that reached the session, so none
+// means no frame did.
+int SpooledCameraParts(const fs::path& dir) {
+  int parts = 0;
+  std::error_code ec;
+  for (const auto& entry : fs::recursive_directory_iterator(dir, ec)) {
+    if (!entry.is_regular_file()) continue;
+    std::ifstream in(entry.path(), std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    try {
+      if (nlohmann::json::parse(text).value("stream", std::string()) == "camera") ++parts;
+    } catch (const nlohmann::json::exception&) {
+    }
+  }
+  return parts;
+}
+
+// One camera frame stamped 50 ms ahead of its tf chain, through a running node: the chain stands
+// still for `catch_up_s` after the frame is published and then catches up, and no further frame
+// arrives to prompt a retry. Returns the camera parts the session spooled.
+int OneFrameAheadOfItsChain(const fs::path& dir, double catch_up_s) {
+  rclcpp::NodeOptions options;
+  auto overrides = OfflineSessionOverrides(dir);
+  overrides.push_back({"auto_start_session", true});
+  overrides.push_back({"remote_variables", false});
+  overrides.push_back({"reference_frame", std::string("odom")});
+  overrides.push_back({"fallback_reference_frame", std::string("")});
+  overrides.push_back({"discovery_period_s", 0.2});
+  overrides.push_back({"cameras", std::vector<std::string>{"front"}});
+  overrides.push_back({"camera.front.topic", std::string("/probe/held_image")});
+  overrides.push_back({"camera.front.camera_info_topic", std::string("")});
+  options.parameter_overrides(overrides);
+  auto node = std::make_shared<cognitive3d_ros::Cognitive3DNode>(options);
+
+  auto publishers = std::make_shared<rclcpp::Node>("c3d_test_hold_publishers");
+  auto image = publishers->create_publisher<sensor_msgs::msg::Image>("/probe/held_image", 10);
+  tf2_ros::TransformBroadcaster chain(publishers);
+  tf2_ros::StaticTransformBroadcaster mount(publishers);
+  geometry_msgs::msg::TransformStamped camera;
+  camera.header.frame_id = "base_link";
+  camera.child_frame_id = "camera_link";
+  camera.transform.rotation.w = 1.0;
+  mount.sendTransform(camera);
+  const auto send_chain = [&](const rclcpp::Time& stamp) {
+    geometry_msgs::msg::TransformStamped base;
+    base.header.stamp = stamp;
+    base.header.frame_id = "odom";
+    base.child_frame_id = "base_link";
+    base.transform.rotation.w = 1.0;
+    chain.sendTransform(base);
+  };
+
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(node->get_node_base_interface());
+  executor.add_node(publishers);
+  const auto spin_for = [&](std::chrono::milliseconds span, bool with_chain) {
+    const auto until = std::chrono::steady_clock::now() + span;
+    auto next = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() < until) {
+      if (with_chain && std::chrono::steady_clock::now() >= next) {
+        send_chain(publishers->now());
+        next += std::chrono::milliseconds(50);
+      }
+      executor.spin_some(std::chrono::milliseconds(5));
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  };
+  if (node->configure().id() != lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE) return -1;
+  if (node->activate().id() != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) return -1;
+
+  // The chain at 20 Hz until the camera is subscribed and the pose timeline is on odom.
+  const auto subscribed_by = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (image->get_subscription_count() == 0 && std::chrono::steady_clock::now() < subscribed_by) {
+    spin_for(std::chrono::milliseconds(50), true);
+  }
+  if (image->get_subscription_count() == 0) return -1;
+  spin_for(std::chrono::milliseconds(500), true);
+
+  const rclcpp::Time last_chain = publishers->now();
+  send_chain(last_chain);
+  sensor_msgs::msg::Image frame;
+  frame.header.stamp = last_chain + rclcpp::Duration::from_seconds(0.05);
+  frame.header.frame_id = "camera_link";
+  frame.width = 8;
+  frame.height = 8;
+  frame.encoding = "rgb8";
+  frame.step = 24;
+  frame.data.assign(8 * 8 * 3, 64);
+  image->publish(frame);
+  spin_for(std::chrono::milliseconds(static_cast<int>(catch_up_s * 1000.0)), false);
+  spin_for(std::chrono::milliseconds(300), true);
+
+  node->deactivate();
+  executor.remove_node(node->get_node_base_interface());
+  executor.remove_node(publishers);
+  node.reset();
+  return SpooledCameraParts(dir);
+}
+
+}  // namespace
+
+// The node holds a frame tf cannot pose yet and retries it on its own: the chain catches up a
+// tenth of a second after the frame, with no further frame to prompt a retry, and the frame is
+// recorded. It is dropped if the node never retries a held frame, or holds one for less than that.
+TEST(NodeMediaHold, AFrameAheadOfItsChainIsRecordedWhenTheChainCatchesUp) {
+  const auto dir = fs::temp_directory_path() / ("c3d_hold_" + std::to_string(::getpid()));
+  fs::create_directories(dir);
+  EXPECT_GE(OneFrameAheadOfItsChain(dir, 0.1), 1) << "the held frame never reached the session";
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
+namespace {
+
 // Wire times carry five decimal places; the margin is ten times that resolution.
 constexpr double kWireResolution = 1e-4;
 

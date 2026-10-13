@@ -165,9 +165,11 @@ timeline uses, including its fallback; [Coordinates](coordinates.md) describes b
 `camera.<name>.frame` or `lidar.<name>.frame` when set, and otherwise the message's
 `header.frame_id`.
 
-A record whose pose cannot be looked up is dropped and counted in `pose_failures`, because a frame
-with no place in the scene cannot be drawn. So is every record while the pose timeline is still
-waiting for its preferred reference frame. A sensor whose frame never resolves therefore records
+A record whose transform has not arrived yet, as with a driver that stamps its frames as it
+publishes them, is held for up to 0.2 seconds and posed at its own stamp when the transform arrives.
+A record still without a pose then is dropped and counted in `pose_failures`, because a frame with
+no place in the scene cannot be drawn. So is every record while the pose timeline is still waiting
+for its preferred reference frame. A sensor whose frame never resolves therefore records
 nothing while the run looks configured; `doctor` checks each configured sensor's frame before a
 session opens ([doctor and verification](doctor-and-verification.md)).
 
@@ -307,11 +309,11 @@ next pose sample. At the default 30 records a second, an `Image` or a `PointClou
 for a small CPU: record a compressed or reduced-resolution topic there, or lower `max_width_px`, the
 point cloud's size or `rate_hz`.
 
-A record whose transform has not arrived yet, as with a driver that stamps its frames as it
-publishes them, is held for up to 50 milliseconds and posed when the transform arrives. Holding it
-costs the node no time: the node goes on with its other work and retries the held records. A record
-still without a pose after 50 milliseconds is dropped and counted in `pose_failures`, and so is
-the oldest held record once a sensor has 8 waiting.
+A record held for its transform, as [Poses and frames](#poses-and-frames) describes, costs the node
+no time: the node goes on with its other work and retries the held records every 10 milliseconds,
+and whenever the sensor's next record arrives. Once a sensor has 8 records waiting, the oldest is
+dropped and counted in `pose_failures`. Records still held when a session ends are discarded and
+not counted.
 
 ## What gets refused
 
