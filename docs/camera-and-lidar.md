@@ -167,11 +167,13 @@ timeline uses, including its fallback; [Coordinates](coordinates.md) describes b
 
 A record whose transform has not arrived yet, as with a driver that stamps its frames as it
 publishes them, is held for up to 0.2 seconds and posed at its own stamp when the transform arrives.
-A record still without a pose then is dropped and counted in `pose_failures`, because a frame with
-no place in the scene cannot be drawn. So is every record while the pose timeline is still waiting
-for its preferred reference frame. A sensor whose frame never resolves therefore records
-nothing while the run looks configured; `doctor` checks each configured sensor's frame before a
-session opens ([doctor and verification](doctor-and-verification.md)).
+The 0.2 seconds are the node's ROS time, the clock tf runs on, so under `use_sim_time` they are
+simulated seconds, however slowly the simulation runs. A record still without a pose then is
+dropped and counted in `pose_failures`, because a frame with no place in the scene cannot be drawn.
+So is every record while the pose timeline is still waiting for its preferred reference frame. A
+sensor whose frame never resolves therefore records nothing while the run looks configured;
+`doctor` checks each configured sensor's frame before a session opens
+([doctor and verification](doctor-and-verification.md)).
 
 A message whose header stamp is zero is placed at the time it arrived and posed at the latest
 transform, and the node warns once. A message with an empty `header.frame_id` and no configured

@@ -47,8 +47,12 @@ struct MediaEnvironment {
   // nothing that depends on it is said.
   std::function<std::size_t(const std::string& topic)> publishers;
   // How long a record whose pose `lookup_pose` cannot give yet is held for it, in seconds on the
-  // `arrival_time` clock. Held, not waited for: ServiceHeld retries it. 0 drops it at once.
+  // `pose_clock`. Held, not waited for: ServiceHeld retries it. 0 drops it at once.
   double pose_wait_s = 0.0;
+  // Seconds on the clock the transforms `lookup_pose` waits for arrive on: the tf buffer's, which
+  // under use_sim_time is simulated time, so a simulation slower than real time still gives a held
+  // record its whole wait. Unset is `arrival_time`.
+  std::function<double()> pose_clock;
 };
 
 // Records that passed the rate gate before tf could pose them, kept in arrival order. A driver

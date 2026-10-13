@@ -3552,11 +3552,15 @@ int SpooledCameraParts(const fs::path& dir) {
 }
 
 // One camera frame stamped 50 ms ahead of its tf chain, through a running node: the chain stands
-// still for `catch_up_s` after the frame is published and then catches up, and no further frame
-// arrives to prompt a retry. Returns the camera parts the session spooled.
-int OneFrameAheadOfItsChain(const fs::path& dir, double catch_up_s) {
+// still for `catch_up_s` of ROS time after the frame is published and then catches up, and no
+// further frame arrives to prompt a retry. With `real_time_factor` above 0 the node runs on a
+// simulated clock that advances that much per wall-clock second. Returns the camera parts the
+// session spooled.
+int OneFrameAheadOfItsChain(const fs::path& dir, double catch_up_s, double real_time_factor = 0.0) {
+  const bool simulated = real_time_factor > 0.0;
   rclcpp::NodeOptions options;
   auto overrides = OfflineSessionOverrides(dir);
+  if (simulated) overrides.push_back({"use_sim_time", true});
   overrides.push_back({"auto_start_session", true});
   overrides.push_back({"remote_variables", false});
   overrides.push_back({"reference_frame", std::string("odom")});
@@ -3570,6 +3574,16 @@ int OneFrameAheadOfItsChain(const fs::path& dir, double catch_up_s) {
 
   auto publishers = std::make_shared<rclcpp::Node>("c3d_test_hold_publishers");
   auto image = publishers->create_publisher<sensor_msgs::msg::Image>("/probe/held_image", 10);
+  auto clock = publishers->create_publisher<rosgraph_msgs::msg::Clock>("/clock",
+                                                                      rclcpp::ClockQoS());
+  const auto wall_start = std::chrono::steady_clock::now();
+  const auto ros_now = [&]() {
+    if (!simulated) return publishers->now();
+    const double elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start).count();
+    return rclcpp::Time(static_cast<int64_t>((100.0 + real_time_factor * elapsed) * 1e9),
+                        RCL_ROS_TIME);
+  };
   tf2_ros::TransformBroadcaster chain(publishers);
   tf2_ros::StaticTransformBroadcaster mount(publishers);
   geometry_msgs::msg::TransformStamped camera;
@@ -3593,8 +3607,13 @@ int OneFrameAheadOfItsChain(const fs::path& dir, double catch_up_s) {
     const auto until = std::chrono::steady_clock::now() + span;
     auto next = std::chrono::steady_clock::now();
     while (std::chrono::steady_clock::now() < until) {
+      if (simulated) {
+        rosgraph_msgs::msg::Clock tick;
+        tick.clock = ros_now();
+        clock->publish(tick);
+      }
       if (with_chain && std::chrono::steady_clock::now() >= next) {
-        send_chain(publishers->now());
+        send_chain(ros_now());
         next += std::chrono::milliseconds(50);
       }
       executor.spin_some(std::chrono::milliseconds(5));
@@ -3602,6 +3621,14 @@ int OneFrameAheadOfItsChain(const fs::path& dir, double catch_up_s) {
     }
   };
   if (node->configure().id() != lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE) return -1;
+  if (simulated) {
+    const auto clock_by = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (node->get_clock()->now().seconds() < 99.0 &&
+           std::chrono::steady_clock::now() < clock_by) {
+      spin_for(std::chrono::milliseconds(10), false);
+    }
+    if (node->get_clock()->now().seconds() < 99.0) return -1;
+  }
   if (node->activate().id() != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) return -1;
 
   // The chain at 20 Hz until the camera is subscribed and the pose timeline is on odom.
@@ -3612,7 +3639,7 @@ int OneFrameAheadOfItsChain(const fs::path& dir, double catch_up_s) {
   if (image->get_subscription_count() == 0) return -1;
   spin_for(std::chrono::milliseconds(500), true);
 
-  const rclcpp::Time last_chain = publishers->now();
+  const rclcpp::Time last_chain = ros_now();
   send_chain(last_chain);
   sensor_msgs::msg::Image frame;
   frame.header.stamp = last_chain + rclcpp::Duration::from_seconds(0.05);
@@ -3623,7 +3650,8 @@ int OneFrameAheadOfItsChain(const fs::path& dir, double catch_up_s) {
   frame.step = 24;
   frame.data.assign(8 * 8 * 3, 64);
   image->publish(frame);
-  spin_for(std::chrono::milliseconds(static_cast<int>(catch_up_s * 1000.0)), false);
+  const double catch_up_wall_s = simulated ? catch_up_s / real_time_factor : catch_up_s;
+  spin_for(std::chrono::milliseconds(static_cast<int>(catch_up_wall_s * 1000.0)), false);
   spin_for(std::chrono::milliseconds(300), true);
 
   node->deactivate();
@@ -3642,6 +3670,18 @@ TEST(NodeMediaHold, AFrameAheadOfItsChainIsRecordedWhenTheChainCatchesUp) {
   const auto dir = fs::temp_directory_path() / ("c3d_hold_" + std::to_string(::getpid()));
   fs::create_directories(dir);
   EXPECT_GE(OneFrameAheadOfItsChain(dir, 0.1), 1) << "the held frame never reached the session";
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
+// Under use_sim_time the hold runs on simulated time, the clock the transform arrives on. At a
+// quarter of real time the chain catches up 0.1 simulated seconds after the frame, which is 0.4 s
+// by the wall: inside the hold on its own clock, past it on the steady clock.
+TEST(NodeMediaHold, UnderSimTimeAHeldFrameWaitsInSimulatedTime) {
+  const auto dir = fs::temp_directory_path() / ("c3d_simhold_" + std::to_string(::getpid()));
+  fs::create_directories(dir);
+  EXPECT_GE(OneFrameAheadOfItsChain(dir, 0.1, 0.25), 1)
+      << "the held frame was dropped before its chain caught up in simulated time";
   std::error_code ec;
   fs::remove_all(dir, ec);
 }

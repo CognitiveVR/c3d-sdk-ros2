@@ -47,6 +47,10 @@ double ArrivalSeconds(const MediaEnvironment& environment) {
   return environment.arrival_time ? environment.arrival_time() : SteadySeconds();
 }
 
+double PoseClockSeconds(const MediaEnvironment& environment) {
+  return environment.pose_clock ? environment.pose_clock() : ArrivalSeconds(environment);
+}
+
 std::uint64_t WireMilliseconds(const MediaEnvironment& environment,
                                const std_msgs::msg::Header& header) {
   return ToMilliseconds(environment.wire_time ? environment.wire_time(header.stamp) : 0.0);
@@ -106,8 +110,8 @@ bool HeldRecords::Offer(const std::string& frame, const rclcpp::Time& stamp, Rec
     held_.pop_front();
     ++*pose_failures;
   }
-  held_.push_back(
-      Held{frame, stamp, ArrivalSeconds(environment) + environment.pose_wait_s, std::move(record)});
+  held_.push_back(Held{frame, stamp, PoseClockSeconds(environment) + environment.pose_wait_s,
+                       std::move(record)});
   return false;
 }
 
@@ -118,7 +122,7 @@ void HeldRecords::Service(const MediaEnvironment& environment, SessionRunner& ru
     held_.clear();
     return;
   }
-  const double now = ArrivalSeconds(environment);
+  const double now = PoseClockSeconds(environment);
   while (!held_.empty()) {
     Held& front = held_.front();
     c3d::Vec3 position;

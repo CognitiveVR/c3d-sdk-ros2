@@ -2554,6 +2554,8 @@ MediaEnvironment Cognitive3DNode::MakeMediaEnvironment() {
   };
   environment.arrival_time = [this]() { return GateNow(); };
   environment.pose_wait_s = HeldRecords::kPoseHoldSeconds;
+  // The tf buffer's clock.
+  environment.pose_clock = [this]() { return get_clock()->now().seconds(); };
   environment.publishers = [this](const std::string& topic) { return count_publishers(topic); };
   return environment;
 }

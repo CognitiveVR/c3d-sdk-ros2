@@ -1020,6 +1020,34 @@ TEST_F(MediaHoldTest, ARecordIsNeverWrittenAheadOfOneHeldBeforeIt) {
   EXPECT_EQ(capture.stats().scans, 2u);
 }
 
+// The hold runs on the clock the transform arrives on, not the clock records arrive on. Under
+// use_sim_time a simulation at a quarter of real time delivers the transform a quarter as fast,
+// so a held record keeps its whole wait in simulated seconds, four times as long by the wall.
+TEST_F(MediaHoldTest, AHeldRecordWaitsOnTheClockItsTransformArrivesOn) {
+  double simulated = 500.0;
+  environment_.pose_clock = [&simulated]() { return simulated; };
+  pose_until_ = 100.0;
+  LidarCapture capture(Scanner());
+  EXPECT_FALSE(capture.Handle("sensor_msgs/msg/LaserScan", ScanAt(100.03), environment_, *runner_));
+  ASSERT_EQ(capture.held(), 1u);
+
+  now_ += 0.1;
+  simulated += 0.025;
+  capture.ServiceHeld(environment_, *runner_);
+  EXPECT_EQ(capture.held(), 1u) << "dropped after 0.025 s of its clock, by the arrival clock's 0.1";
+  pose_until_ = 100.05;
+  capture.ServiceHeld(environment_, *runner_);
+  EXPECT_EQ(capture.stats().scans, 1u);
+  EXPECT_EQ(capture.stats().pose_failures, 0u);
+
+  pose_until_ = 100.0;
+  EXPECT_FALSE(capture.Handle("sensor_msgs/msg/LaserScan", ScanAt(100.1), environment_, *runner_));
+  simulated += 0.06;
+  capture.ServiceHeld(environment_, *runner_);
+  EXPECT_EQ(capture.held(), 0u) << "held past its wait on its own clock";
+  EXPECT_EQ(capture.stats().pose_failures, 1u);
+}
+
 TEST_F(MediaHoldTest, AStoppedChainHoldsAtMostTheCapAndCountsWhatItPushesOut) {
   pose_available_ = false;
   LidarCapture capture(Scanner());
