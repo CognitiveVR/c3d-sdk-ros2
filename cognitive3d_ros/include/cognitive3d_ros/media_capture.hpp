@@ -84,7 +84,8 @@ class HeldRecords {
   // behind, 50 ms at 20 Hz, plus transport -- with room to spare.
   static constexpr double kPoseHoldSeconds = 0.2;
   // Past this many, the oldest is dropped: a chain that stopped would otherwise hold a frame from
-  // every arrival for the length of the wait. At 30 records a second a sensor holds at most 6.
+  // every arrival for the length of the wait. At 30 records a second a sensor holds about 6, 7 with
+  // timer jitter.
   static constexpr std::size_t kMaxHeld = 8;
 
  private:

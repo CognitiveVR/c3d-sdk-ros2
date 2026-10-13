@@ -134,7 +134,8 @@ interpolated by tf between two of its updates, so one correction reaches the pos
 sample in between, and consecutive samples at a high rate would each see only a part of it. Two
 compared poses are never less than about 0.09 seconds apart, so at least half of a correction spread
 over up to about 0.18 seconds falls between one pair: a right-angle re-registration behind AMCL's
-7 Hz scans is recorded once at any rate of 10 Hz or more. A correction spread over more than 0.1
+7 Hz scans is recorded once at any rate of 10 Hz or more, unless it divides exactly in half between
+two comparisons, which then each see 45 degrees and neither exceeds the threshold. A correction spread over more than 0.1
 seconds, behind a localizer that updates slower than 10 Hz, is split between two comparisons at some
 timings. One smaller than twice a threshold can then reach it in neither, and a large one can reach
 it in both and be recorded twice. Nothing is compared across a change of reference frame, a stale
