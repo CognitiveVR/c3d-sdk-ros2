@@ -6,7 +6,7 @@ on:
   # `push` is filtered so a feature branch does not run twice. `pull_request` is not filtered: a
   # pull request based on another feature branch must still get CI.
   push:
-    branches: [main, develop]
+    branches: [main, development]
   pull_request:
   workflow_dispatch:
   # nightly.yml calls this on a schedule.
