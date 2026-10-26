@@ -125,6 +125,7 @@ set_property(TARGET c3d_core PROPERTY POSITION_INDEPENDENT_CODE ON)
 option(C3D_BUILD_TESTS "Build the core test suite" ON)
 if(C3D_BUILD_TESTS)
   enable_testing()
+  add_subdirectory(tools)
   add_subdirectory(test)
 endif()
 

@@ -16,6 +16,56 @@ No ROS graph, no simulator, no network. This is where the coordinate conversion,
 conformance, the spool recovery and every translator edge case live. In a sourced ROS workspace,
 `colcon test && colcon test-result --verbose` runs the ament half directly.
 
+### The pose encoder against the platform's vectors. By hand
+
+The pose block encoder (`core/include/c3d/pose.hpp`) writes a format the platform owns: its
+specification, reference implementation and conformance vectors are in Cognitive3D's
+`c3d-stream-formatter` repository, which is not public. The vectors are the acceptance test and
+are not in this repository, so CI skips the core tests that read them. With a checkout of the
+formatter, point the core tests at its vectors:
+
+```bash
+POSE_VECTORS=~/cvr/c3d-stream-formatter/vectors/pose tools/build_and_test.sh core
+```
+
+`PoseVectors.*` then encode every stored vector and compare each uncompressed body with the
+reference's byte for byte, cut the six `generated/` recipes, and check the tests' own decoder
+against `bad/`. The `PoseBlock*` tests need no vectors and run everywhere.
+
+The formatter's own judge is `verify_encoder`, which takes a Python function. It drives this
+encoder through `c3d_pose_encode_vector` (`core/tools/`, built with the core tests): one
+`input.json` on stdin, every block on stdout as a 4-byte little-endian length and its bytes. To
+run it, build the command into a host directory with the test image, then hand that command to
+the checker:
+
+```bash
+IMAGE=$(docker images c3d-sdk-ros2-test --format '{{.Repository}}:{{.Tag}}' | head -n1)
+mkdir -p /tmp/c3d-pose
+docker run --rm -v "$PWD":/src:ro -v /tmp/c3d-pose:/b "$IMAGE" bash -c \
+  'cmake -S /src/core -B /b >/dev/null && cmake --build /b -j"$(nproc)" --target c3d_pose_encode_vector >/dev/null'
+
+FORMATTER=~/cvr/c3d-stream-formatter
+PYTHONPATH=$FORMATTER PYTHONDONTWRITEBYTECODE=1 \
+uv run --no-project --with numpy --with zstandard --with lz4 -- python3 -c '
+import json, shlex, struct, subprocess, sys
+from c3d_stream_formatter.pose.vectors import verify_encoder
+def encode(inp):
+    out = subprocess.run(shlex.split(sys.argv[1]), input=json.dumps(inp).encode(),
+                         capture_output=True, check=True).stdout
+    blobs, i = [], 0
+    while i < len(out):
+        (n,) = struct.unpack_from("<I", out, i); blobs.append(out[i + 4:i + 4 + n]); i += 4 + n
+    return blobs
+problems = verify_encoder(sys.argv[2], encode)
+print("\n".join(problems) or "encoder pass rule: PASS"); sys.exit(bool(problems))
+' "docker run --rm -i -v /tmp/c3d-pose:/b $IMAGE /b/tools/c3d_pose_encode_vector" \
+  "$FORMATTER/vectors/pose"
+```
+
+It checks every stored vector and the `generated/` recipes; each problem names its vector. On a
+Linux host with the core dependencies installed, build the command natively and pass its path
+instead of the `docker run`.
+
 ## The Python suites. Every push, in CI
 
 ```bash

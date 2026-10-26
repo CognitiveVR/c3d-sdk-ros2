@@ -35,6 +35,10 @@
 # a manifest edit rebuilds on its own. IMAGE overrides the whole thing;
 # REBUILD_IMAGE=1 forces a rebuild of whatever tag is in play.
 #
+# POSE_VECTORS=<dir> mounts c3d-stream-formatter's vectors/pose read-only, and the
+# core tests then run the pose encoder against them (tools/README.md). Without it
+# those tests skip: the vectors are not in this repository.
+#
 # Superseded tags stay TAGGED, so `docker image prune` will not reclaim them.
 # Clear them out with:
 #   docker images 'c3d-sdk-ros2-test' --format '{{.Repository}}:{{.Tag}}' | xargs -r docker rmi
@@ -114,7 +118,12 @@ fi
 
 # The source mount is read-only on purpose: a build that needs to write into the
 # source tree is a build a partner cannot run from a package.
-docker run --rm -v "$REPO":/src:ro -e WHAT="$WHAT" "$IMAGE" bash -lc '
+VECTOR_ARGS=()
+if [ -n "${POSE_VECTORS:-}" ]; then
+  VECTOR_ARGS=(-v "$(cd "$POSE_VECTORS" && pwd)":/pose-vectors:ro -e C3D_POSE_VECTORS=/pose-vectors)
+fi
+
+docker run --rm -v "$REPO":/src:ro ${VECTOR_ARGS[@]+"${VECTOR_ARGS[@]}"} -e WHAT="$WHAT" "$IMAGE" bash -lc '
 set -euo pipefail
 
 # Runs a command with an EMPTY environment and a PATH that contains no ROS.
@@ -126,7 +135,8 @@ set -euo pipefail
 # line to core/CMakeLists.txt passes a check that only skips setup.bash, and
 # fails this one.
 ros_free() {
-  env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root "$@"
+  env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
+    C3D_POSE_VECTORS="${C3D_POSE_VECTORS:-}" "$@"
 }
 
 if [ "$WHAT" = all ] || [ "$WHAT" = core ] || [ "$WHAT" = humble ]; then
