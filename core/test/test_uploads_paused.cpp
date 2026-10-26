@@ -26,6 +26,7 @@
 #include "c3d/spool.hpp"
 #include "camera_payload.capnp.h"
 #include "fake_transport.hpp"
+#include "lidar_payload.capnp.h"
 #include "process_death.hpp"
 
 using namespace c3d;
@@ -77,14 +78,16 @@ bool EndsWith(const std::string& s, const std::string& suffix) {
 }
 
 // The session a request is filed under, read the way the gateway reads it: from
-// the JSON envelope, or from the packed Cap'n Proto header of a camera part.
+// the JSON envelope, or from the packed Cap'n Proto header of a camera or lidar part.
 std::string SessionOf(const FakeTransport::Request& r) {
-  if (EndsWith(r.url, "/v0/camera")) {
+  const bool camera = EndsWith(r.url, "/v0/camera");
+  if (camera || EndsWith(r.url, "/v0/lidar")) {
     kj::ArrayPtr<const kj::byte> bytes(reinterpret_cast<const kj::byte*>(r.body.data()),
                                        r.body.size());
     kj::ArrayInputStream stream(bytes);
     capnp::PackedMessageReader reader(stream);
-    return reader.getRoot<cvr::capnp::CameraPayload>().getSessionId().cStr();
+    return camera ? reader.getRoot<cvr::capnp::CameraPayload>().getSessionId().cStr()
+                  : reader.getRoot<cvr::capnp::LidarPayload>().getSessionId().cStr();
   }
   return json::parse(r.body).value("sessionid", "");
 }
@@ -128,29 +131,30 @@ TEST_F(UploadsPausedTest, NothingIsSentWhilePausedAndALaterConfigureOnlyProcessD
     auto spool = OpenSpool(dir_);
     auto cfg = MakeConfig(dir_.string());
     cfg.uploads_paused = true;
-    cfg.camera_flush_s = 0.05;
+    cfg.scan_block_idle_s = 0.05;
     auto session = Session::Create(cfg, transport, spool, std::make_shared<NullLogger>());
     ASSERT_NE(session, nullptr);
     EXPECT_TRUE(session->uploads_paused());
     ASSERT_TRUE(session->Begin());
     recorded_id = session->session_id();
 
-    // Camera frames across several time bounds: parts must still be cut on
-    // schedule with nothing uploading, or a paused run is one enormous part. Nothing
-    // here flushes, so only the worker's time bound can cut each one.
-    const auto camera_chunks = [&] {
+    // Scans across several idle closes: parts must still be cut on schedule with
+    // nothing uploading, or a paused run is one enormous part. Nothing here
+    // flushes, so only the worker's idle close can cut each one.
+    const auto lidar_chunks = [&] {
       std::size_t n = 0;
       for (const auto& e : fs::directory_iterator(dir_ / "chunks")) {
-        if (EndsWith(e.path().stem().string(), "-camera")) ++n;
+        if (EndsWith(e.path().stem().string(), "-lidar")) ++n;
       }
       return n;
     };
+    LaserScanData scan;
+    scan.ranges.assign(64, 2.0f);
     for (int i = 0; i < 3; ++i) {
       session->RecordGaze(1000.0 + i, Vec3{}, Quat{});
-      session->RecordCameraFrame("front", 1000000ull + i, i, "cam", Pose{}, "jpeg", 2, 2,
-                                 std::string(512, 'x'));
-      ASSERT_TRUE(WaitFor([&] { return camera_chunks() > static_cast<std::size_t>(i); }))
-          << "camera part " << i << " was not cut on camera_flush_s while paused";
+      session->RecordLaserScan("scan", 1000000ull + i, i, "base_scan", Pose{}, scan);
+      ASSERT_TRUE(WaitFor([&] { return lidar_chunks() > static_cast<std::size_t>(i); }))
+          << "lidar part " << i << " was not cut on scan_block_idle_s while paused";
     }
     session->RecordEvent("work", 1010.0, Vec3{});
     session->PumpUploads();  // an explicit drain must not send either
@@ -159,11 +163,11 @@ TEST_F(UploadsPausedTest, NothingIsSentWhilePausedAndALaterConfigureOnlyProcessD
     EXPECT_EQ(transport->count(), 0u) << "a paused session uploaded something";
     EXPECT_TRUE(session->stats().uploads_paused);
     spooled = spool->Count();
-    std::size_t camera_parts = 0;
+    std::size_t lidar_parts = 0;
     for (const auto& e : fs::directory_iterator(dir_ / "chunks")) {
-      if (EndsWith(e.path().stem().string(), "-camera")) ++camera_parts;
+      if (EndsWith(e.path().stem().string(), "-lidar")) ++lidar_parts;
     }
-    EXPECT_GE(camera_parts, 3u) << "camera parts were not cut on camera_flush_s while paused";
+    EXPECT_GE(lidar_parts, 3u) << "lidar parts were not cut on scan_block_idle_s while paused";
   }
   ASSERT_GT(spooled, 3u);
 
@@ -178,13 +182,13 @@ TEST_F(UploadsPausedTest, NothingIsSentWhilePausedAndALaterConfigureOnlyProcessD
       << spool->Count() << " chunk(s) never left without a Begin";
 
   EXPECT_EQ(transport->count(), spooled);
-  std::size_t camera_parts = 0;
+  std::size_t lidar_parts = 0;
   for (const auto& r : transport->requests()) {
     EXPECT_EQ(SessionOf(r), recorded_id)
         << "a drained chunk is not filed under the session that recorded it: " << r.url;
-    if (EndsWith(r.url, "/v0/camera")) ++camera_parts;
+    if (EndsWith(r.url, "/v0/lidar")) ++lidar_parts;
   }
-  EXPECT_GE(camera_parts, 3u);
+  EXPECT_GE(lidar_parts, 3u);
   EXPECT_FALSE(EventsParts(*transport, recorded_id).empty());
   EXPECT_TRUE(session->session_id().empty()) << "draining must not open a session";
 }

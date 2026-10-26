@@ -15,6 +15,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "c3d/scan_block.hpp"
+#include "c3d/sensor_blocks.hpp"
 #include "c3d/version.hpp"
 #include "c3d/wall_clock.hpp"
 #include "capnp_payloads.hpp"
@@ -26,6 +28,9 @@ namespace {
 
 constexpr const char* kSessionStart = "c3d.sessionStart";
 constexpr const char* kSessionEnd = "c3d.sessionEnd";
+
+// A scan block's ranges and intensities are compressed at this level, on the worker thread.
+constexpr int kScanBlockZstdLevel = 1;
 
 // The events part a recovered abnormalEnd takes when the orphan's marker does not
 // say which part comes next. Any number the session actually sent would put the
@@ -221,18 +226,15 @@ struct Session::Impl {
   std::vector<ManifestEntry> manifest_pending;
   std::unordered_map<std::string, SensorGate> sensor_gates;
 
-  // The binary buffers, bounded by bytes rather than by count. `*_opened_at` is
-  // when the FIRST record of the current part arrived, so the time bound measures
-  // the age of the oldest frame in the part and not the age of the newest.
-  std::vector<CameraFrameRecord> camera_frames;
-  std::uint64_t camera_buffered_bytes = 0;
-  double camera_opened_at = 0.0;
+  // One assembler per sensor, each grouping its sensor's records into the unit that
+  // becomes one part. They live for one session: Begin clears them, so every
+  // sequence starts at 0 again and no drop counter carries over.
+  std::map<std::string, VideoChunkAssembler> video_chunks;
+  std::map<std::string, ScanBlockAssembler> scan_blocks;
+  std::map<std::string, CloudObjectAssembler> cloud_objects;
   // The cameras whose unusable field of view has been warned about this session:
   // at 30 Hz a per-frame warning is the log.
   std::set<std::string> camera_fov_warned;
-  std::vector<LidarScanRecord> lidar_scans;
-  std::uint64_t lidar_buffered_bytes = 0;
-  double lidar_opened_at = 0.0;
   // Epoch milliseconds, resolved once at Begin. Every binary payload carries it,
   // and recomputing it per part would let two parts of one session disagree about
   // when the session started.
@@ -368,12 +370,6 @@ struct Session::Impl {
     envelope.format_version = FormatVersion(s);
     envelope.session_start_ms = session_start_ms;
     envelope.sdk_version = kSdkVersion;
-    auto it = part.find(s);
-    if (it == part.end()) {
-      part[s] = PartBase(s);
-      it = part.find(s);
-    }
-    envelope.part = static_cast<std::uint32_t>(it->second++);
     return envelope;
   }
 
@@ -411,11 +407,67 @@ struct Session::Impl {
     bool ticketed = false;
   };
 
+  // Parts an assembler has closed, each with the session id it closed under, waiting
+  // for the next TakeDue to move them into a batch.
+  std::vector<PendingPart> ready_binary;
+
+  // Each closed unit becomes one part whose closure owns it, so serialising it -- and
+  // for a scan block, encoding it -- happens on the thread that spools the batch,
+  // never under `mu`. Called with `mu` held.
+  void QueueCameraChunks(std::vector<CameraChunkRecord> chunks) {
+    for (CameraChunkRecord& chunk : chunks) {
+      PendingPart part;
+      part.stream = Stream::kCamera;
+      part.records = chunk.frames.size();
+      part.session_id = session_id;
+      part.serialize = [envelope = MakeBinaryEnvelope(Stream::kCamera),
+                        record = std::move(chunk)] {
+        return SerializeCameraChunk(envelope, record);
+      };
+      ready_binary.push_back(std::move(part));
+      ++stats.camera_chunks;
+    }
+  }
+  void QueueScanBlocks(std::vector<ScanBlockRecord> blocks) {
+    for (ScanBlockRecord& block : blocks) {
+      PendingPart part;
+      part.stream = Stream::kLidar;
+      part.records = block.scans.size();
+      part.session_id = session_id;
+      // A block the assembler accepted fails to encode only when zstd does, and the
+      // empty body that leaves is dropped by SpoolBatch rather than sent.
+      part.serialize = [envelope = MakeBinaryEnvelope(Stream::kLidar),
+                        record = std::move(block)] {
+        const scanblock::EncodedScanBlock encoded =
+            scanblock::Encode(record.scans, record.intensities, kScanBlockZstdLevel);
+        if (!encoded.ok) return std::string();
+        return SerializeScanBlock(envelope, record, encoded);
+      };
+      ready_binary.push_back(std::move(part));
+      ++stats.lidar_blocks;
+    }
+  }
+  void QueueCloudObjects(std::vector<CloudObjectRecord> objects) {
+    for (CloudObjectRecord& object : objects) {
+      PendingPart part;
+      part.stream = Stream::kLidar;
+      part.records = object.entries.size();
+      part.session_id = session_id;
+      part.serialize = [envelope = MakeBinaryEnvelope(Stream::kLidar),
+                        record = std::move(object)] {
+        return SerializeCloudObject(envelope, record);
+      };
+      ready_binary.push_back(std::move(part));
+      ++stats.lidar_blocks;
+    }
+  }
+
   // Moves every batch that is due out of the session, allocating each part its
-  // number, and takes a ticket for writing them. Caller holds `mu`; this does no
-  // I/O and no serialisation, only moves, so it is the only spooling work a
-  // Record* caller can ever wait behind.
-  PendingBatch TakeDue(bool force) {
+  // number, and takes a ticket for writing them. `force` takes every JSON batch,
+  // due or not; `close_binary` closes every open video chunk, scan block and cloud
+  // object. Caller holds `mu`; this does no I/O and no serialisation, only moves,
+  // so it is the only spooling work a Record* caller can ever wait behind.
+  PendingBatch TakeDue(bool force, bool close_binary) {
     PendingBatch batch;
     if (session_id.empty()) return batch;
     auto add = [&](Stream stream, std::size_t records, std::function<std::string()> serialize) {
@@ -474,31 +526,24 @@ struct Session::Impl {
       manifest_pending.clear();
     }
 
-    // Either bound cuts, and `force` cuts regardless, so End() and Flush() never
-    // leave a partial payload buffered in a process that is about to exit.
-    const double now = EpochSeconds();
-    if (!camera_frames.empty() &&
-        (force || camera_buffered_bytes >= cfg.camera_flush_bytes ||
-         now - camera_opened_at >= cfg.camera_flush_s)) {
-      const BinaryEnvelope envelope = MakeBinaryEnvelope(Stream::kCamera);
-      const std::size_t n = camera_frames.size();
-      add(Stream::kCamera, n, [envelope, records = std::move(camera_frames)] {
-        return SerializeCameraPayload(envelope, records);
-      });
-      camera_frames.clear();
-      camera_buffered_bytes = 0;
+    // Never on `force` alone: the auto-send timer forces, and a video chunk it cut
+    // would end its GOP early and cost every frame until the encoder's next
+    // keyframe. Both closes push onto ready_binary BEFORE it is moved, so what End()
+    // closes leaves in End()'s own batch rather than behind the session id it clears.
+    if (close_binary) {
+      for (auto& kv : video_chunks) QueueCameraChunks(kv.second.Close());
+      for (auto& kv : scan_blocks) QueueScanBlocks(kv.second.Close());
+      for (auto& kv : cloud_objects) QueueCloudObjects(kv.second.Close());
     }
-    if (!lidar_scans.empty() &&
-        (force || lidar_buffered_bytes >= cfg.lidar_flush_bytes ||
-         now - lidar_opened_at >= cfg.lidar_flush_s)) {
-      const BinaryEnvelope envelope = MakeBinaryEnvelope(Stream::kLidar);
-      const std::size_t n = lidar_scans.size();
-      add(Stream::kLidar, n, [envelope, records = std::move(lidar_scans)] {
-        return SerializeLidarPayload(envelope, records);
-      });
-      lidar_scans.clear();
-      lidar_buffered_bytes = 0;
+    const double now_steady = SteadySeconds();
+    for (auto& kv : scan_blocks) {
+      QueueScanBlocks(kv.second.CloseIfIdle(now_steady, cfg.scan_block_idle_s));
     }
+    for (auto& kv : cloud_objects) {
+      QueueCloudObjects(kv.second.CloseIfIdle(now_steady, cfg.cloud_object_idle_s));
+    }
+    for (PendingPart& part : ready_binary) batch.parts.push_back(std::move(part));
+    ready_binary.clear();
 
     if (!batch.parts.empty()) {
       batch.ticket = next_ticket++;
@@ -550,6 +595,7 @@ struct Session::Impl {
       if (part.carries_end) NoteEndSpooled(part.session_id);
       bool spooled = false;
       bool threw = false;
+      bool empty_body = false;
       std::string chunk_id;
       try {
         Chunk chunk;
@@ -563,7 +609,10 @@ struct Session::Impl {
         chunk.stream = part.stream;
         chunk.carries_properties = part.carries_properties;
         chunk.created_at = EpochSeconds();
-        spooled = spool->WriteNamed(chunk, &chunk_id);
+        // A part that serialised to nothing could not be encoded, and an empty body is
+        // no payload at all: it is dropped here rather than spooled and sent.
+        empty_body = chunk.body.empty();
+        if (!empty_body) spooled = spool->WriteNamed(chunk, &chunk_id);
       } catch (const std::exception& e) {
         threw = true;
         log->Error(std::string("could not spool a ") + StreamName(part.stream) + " part (" +
@@ -573,6 +622,10 @@ struct Session::Impl {
         log->Error(std::string("could not spool a ") + StreamName(part.stream) +
                    " part (a non-standard exception); " + std::to_string(part.records) +
                    " record(s) dropped");
+      }
+      if (empty_body) {
+        log->Error(std::string("could not encode a ") + StreamName(part.stream) + " part; " +
+                   std::to_string(part.records) + " record(s) dropped");
       }
       part.serialize = nullptr;  // the records go now, not when the batch does
       {
@@ -584,7 +637,7 @@ struct Session::Impl {
           if (part.carries_end) unsent_ends.erase(part.session_id);
           stats.records_dropped += part.records;
           if (threw) ++stats.serialization_failures;
-          else ++stats.spool_write_failures;
+          else if (!empty_body) ++stats.spool_write_failures;
         }
       }
       if (spooled) ++spooled_generation;
@@ -1546,7 +1599,7 @@ struct Session::Impl {
 
         const double now = EpochSeconds();
         const bool timer_due = (now - last_auto_send) >= cfg.auto_send_interval_s;
-        batch = TakeDue(timer_due);
+        batch = TakeDue(timer_due, false);
         if (timer_due) last_auto_send = now;
 
         recheck_due = recovery_recheck_steady > 0.0 &&
@@ -1759,25 +1812,24 @@ bool Session::Begin() {
     // spool by design, and a stale id can only ever be overwritten because the
     // pump clears on every removal.
 
-    // Part counters start fresh every session.
+    // Part counters start fresh every session. The binary streams have none: each
+    // of their payloads is numbered by its own sensor's sequence.
     impl_->part.clear();
-    for (Stream s : {Stream::kGaze, Stream::kEvents, Stream::kSensors, Stream::kDynamics,
-                     Stream::kCamera, Stream::kLidar}) {
+    for (Stream s : {Stream::kGaze, Stream::kEvents, Stream::kSensors, Stream::kDynamics}) {
       impl_->part[s] = PartBase(s);
     }
     // Milliseconds, from the same timestamp the session id embeds, so the binary
     // payloads name the same start the JSON streams do.
     impl_->session_start_ms =
         static_cast<std::uint64_t>(impl_->session_timestamp * 1000.0);
-    // Anything still buffered belongs to the session that just ended. End()
-    // flushes, so this is a defence rather than a routine clear -- but a frame
-    // carried across a session boundary would be filed under the wrong session id
-    // with a seq from the old one's counter.
-    impl_->camera_frames.clear();
-    impl_->camera_buffered_bytes = 0;
+    // An assembler lives for one session, so every sequence starts at 0 and no drop
+    // counter carries over. End() closes each one, so this discards nothing it
+    // buffered -- but a frame carried across a session boundary would be filed
+    // under the wrong session id with a seq from the old one's counter.
+    impl_->video_chunks.clear();
+    impl_->scan_blocks.clear();
+    impl_->cloud_objects.clear();
     impl_->camera_fov_warned.clear();
-    impl_->lidar_scans.clear();
-    impl_->lidar_buffered_bytes = 0;
 
     // Do not clear known_properties: anything the caller set before Begin is
     // legitimate session metadata. Re-mark the whole set as pending so a new
@@ -1812,7 +1864,15 @@ bool Session::Begin() {
     impl_->StartWorker();
   }
   impl_->log->Info("session " + id + " begun");
-  Flush();
+  // Not Flush(): the assemblers were cleared above, and a frame recorded since then belongs to an
+  // open chunk that closing here would cut short.
+  Impl::PendingBatch batch;
+  {
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    batch = impl_->TakeDue(true, false);
+    impl_->last_auto_send = EpochSeconds();
+  }
+  impl_->SpoolBatch(batch);
   return true;
 }
 
@@ -1842,7 +1902,7 @@ void Session::End(const std::string& reason, std::optional<double> end_time) {
     // The whole set rides the session's last gaze part as well as its first, so a session
     // whose opening part the spool cap evicted still delivers c3d.app.version.
     impl_->pending_properties = impl_->known_properties;
-    batch = impl_->TakeDue(true);
+    batch = impl_->TakeDue(true, true);
     for (auto& part : batch.parts) part.carries_end = part.stream == Stream::kEvents;
     impl_->active = false;
     id = impl_->session_id;
@@ -2077,42 +2137,37 @@ void Session::RemoveDynamic(const std::string& id, double t, const Vec3& positio
   RecordDynamic(id, t, position, rotation, std::nullopt, props);
 }
 
-void Session::RecordCameraFrame(const std::string& camera_id, std::uint64_t time_ms,
-                                std::uint32_t seq, const std::string& frame_id,
-                                const Pose& pose, const std::string& format,
-                                std::uint16_t width, std::uint16_t height,
-                                const std::string& bytes, const CameraFov& fov) {
+void Session::RecordCameraAccessUnit(const std::string& camera_id, const SensorEntry& entry,
+                                     const VideoChunkContext& context, std::string access_unit,
+                                     bool keyframe) {
+  const CameraFov fov{context.hfov_deg, context.vfov_deg};
   const bool fov_known = IsKnownCameraFov(fov);
   // "Not recorded" is 0 by 0, the default, and is no fault; anything else refused is.
   const bool fov_refused = !fov_known && !(fov.hfov_deg == 0.0f && fov.vfov_deg == 0.0f);
+  std::optional<VideoChunkContext> without_fov;
+  if (!fov_known) {
+    without_fov = context;
+    without_fov->hfov_deg = 0.0f;
+    without_fov->vfov_deg = 0.0f;
+  }
+  const VideoChunkContext& recorded = without_fov ? *without_fov : context;
   bool warn_fov = false;
   {
     std::lock_guard<std::mutex> lock(impl_->mu);
     if (!impl_->active) return;
-    if (bytes.empty()) {
+    if (access_unit.empty()) {
       ++impl_->stats.records_dropped;
       return;
     }
     if (fov_refused) warn_fov = impl_->camera_fov_warned.insert(camera_id).second;
-    if (impl_->camera_frames.empty()) impl_->camera_opened_at = EpochSeconds();
-    CameraFrameRecord record;
-    record.camera_id = camera_id;
-    record.time_ms = time_ms;
-    record.seq = seq;
-    record.frame_id = frame_id;
-    record.pose = pose;
-    record.format = format;
-    record.width = width;
-    record.height = height;
-    record.data = bytes;
-    if (fov_known) {
-      record.hfov_deg = fov.hfov_deg;
-      record.vfov_deg = fov.vfov_deg;
-    }
-    impl_->camera_buffered_bytes += bytes.size();
-    impl_->camera_frames.push_back(std::move(record));
+    VideoChunkAssembler& video =
+        impl_->video_chunks.try_emplace(camera_id, camera_id).first->second;
+    const std::uint64_t dropped_before = video.dropped_before_keyframe();
+    const std::uint64_t bytes = access_unit.size();
+    impl_->QueueCameraChunks(video.Append(entry, recorded, std::move(access_unit), keyframe));
+    impl_->stats.camera_access_units_dropped += video.dropped_before_keyframe() - dropped_before;
     ++impl_->stats.camera_frames;
-    impl_->stats.camera_bytes += bytes.size();
+    impl_->stats.camera_bytes += bytes;
   }
   // Outside the lock: a host's logger is not this file's to hold `mu` across.
   if (warn_fov) {
@@ -2128,23 +2183,20 @@ void Session::RecordLaserScan(const std::string& sensor_id, std::uint64_t time_m
                               const Pose& pose, const LaserScanData& scan) {
   std::lock_guard<std::mutex> lock(impl_->mu);
   if (!impl_->active) return;
-  if (scan.ranges.empty()) {
+  // The assembler refuses both as well, but says so only by returning nothing, which
+  // is also what it returns for a scan it kept: the drop is counted here or nowhere.
+  if (scan.ranges.empty() || scan.ranges.size() > scanblock::kMaxRaysPerScan) {
     ++impl_->stats.records_dropped;
     return;
   }
-  if (impl_->lidar_scans.empty()) impl_->lidar_opened_at = EpochSeconds();
-  LidarScanRecord record;
-  record.sensor_id = sensor_id;
-  record.time_ms = time_ms;
-  record.seq = seq;
-  record.frame_id = frame_id;
-  record.pose = pose;
-  record.is_pointcloud = false;
-  record.scan = scan;
+  SensorEntry entry;
+  entry.time_ms = time_ms;
+  entry.seq = seq;
+  entry.pose = pose;
+  ScanBlockAssembler& blocks = impl_->scan_blocks.try_emplace(sensor_id, sensor_id).first->second;
+  impl_->QueueScanBlocks(blocks.Append(entry, frame_id, scan, SteadySeconds()));
   const std::uint64_t size =
       static_cast<std::uint64_t>((scan.ranges.size() + scan.intensities.size()) * sizeof(float));
-  impl_->lidar_buffered_bytes += size;
-  impl_->lidar_scans.push_back(std::move(record));
   ++impl_->stats.lidar_scans;
   impl_->stats.lidar_bytes += size;
 }
@@ -2161,27 +2213,22 @@ void Session::RecordPointCloud(const std::string& sensor_id, std::uint64_t time_
     ++impl_->stats.records_dropped;
     return;
   }
-  if (impl_->lidar_scans.empty()) impl_->lidar_opened_at = EpochSeconds();
-  LidarScanRecord record;
-  record.sensor_id = sensor_id;
-  record.time_ms = time_ms;
-  record.seq = seq;
-  record.frame_id = frame_id;
-  record.pose = pose;
-  record.is_pointcloud = true;
-  record.cloud = cloud;
-  const std::uint64_t size = static_cast<std::uint64_t>(cloud.data.size());
-  impl_->lidar_buffered_bytes += size;
-  impl_->lidar_scans.push_back(std::move(record));
+  SensorEntry entry;
+  entry.time_ms = time_ms;
+  entry.seq = seq;
+  entry.pose = pose;
+  CloudObjectAssembler& objects =
+      impl_->cloud_objects.try_emplace(sensor_id, sensor_id).first->second;
+  impl_->QueueCloudObjects(objects.Append(entry, frame_id, cloud, SteadySeconds()));
   ++impl_->stats.lidar_scans;
-  impl_->stats.lidar_bytes += size;
+  impl_->stats.lidar_bytes += static_cast<std::uint64_t>(cloud.data.size());
 }
 
 void Session::Flush() {
   Impl::PendingBatch batch;
   {
     std::lock_guard<std::mutex> lock(impl_->mu);
-    batch = impl_->TakeDue(true);
+    batch = impl_->TakeDue(true, true);
     impl_->last_auto_send = EpochSeconds();
   }
   impl_->SpoolBatch(batch);

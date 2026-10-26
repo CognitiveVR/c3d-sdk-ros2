@@ -9,14 +9,6 @@
 #include "util.hpp"
 
 namespace c3d {
-namespace {
-
-// A part larger than the gateway's request body cap is answered 413, which is
-// not retryable, so the whole part is discarded and every frame in it is gone.
-// The cap is about 49 MiB; this leaves room for the header and the packing.
-constexpr std::uint64_t kMaxFlushBytes = 32ull * 1024 * 1024;
-
-}  // namespace
 
 std::string Config::Validate() const {
   // The mandatory-value checks report TOGETHER. Returning only the first one
@@ -57,8 +49,6 @@ std::string Config::Validate() const {
   // An unsigned size above INT64_MAX is a negative number that wrapped on its way
   // in, and it would read as "unbounded" rather than be refused.
   for (const auto& [name, value] : {std::make_pair("spool_max_bytes", spool_max_bytes),
-                                    std::make_pair("camera_flush_bytes", camera_flush_bytes),
-                                    std::make_pair("lidar_flush_bytes", lidar_flush_bytes),
                                     std::make_pair("gaze_batch", std::uint64_t{gaze_batch}),
                                     std::make_pair("event_batch", std::uint64_t{event_batch}),
                                     std::make_pair("sensor_batch", std::uint64_t{sensor_batch}),
@@ -103,17 +93,10 @@ std::string Config::Validate() const {
     return "scene_version must be 1 or greater; scene versions are numbered from 1 and the "
            "gateway rejects 0";
   // NaN fails `<= 0.0`, as it fails every comparison.
-  if (std::isnan(camera_flush_s) || camera_flush_s <= 0.0)
-    return "camera_flush_s must be a positive number of seconds";
-  if (std::isnan(lidar_flush_s) || lidar_flush_s <= 0.0)
-    return "lidar_flush_s must be a positive number of seconds";
-  // A bound below one frame cuts a payload per frame, which is the shape that
-  // makes the part counter and the HTTP overhead the dominant cost of the stream.
-  if (camera_flush_bytes < 1024 || lidar_flush_bytes < 1024)
-    return "camera_flush_bytes and lidar_flush_bytes are implausibly small";
-  if (camera_flush_bytes > kMaxFlushBytes || lidar_flush_bytes > kMaxFlushBytes)
-    return "camera_flush_bytes and lidar_flush_bytes cannot exceed 32 MiB; a part above the "
-           "gateway's body cap is rejected whole and discarded, taking every record in it";
+  if (std::isnan(scan_block_idle_s) || scan_block_idle_s <= 0.0)
+    return "scan_block_idle_s must be a positive number of seconds";
+  if (std::isnan(cloud_object_idle_s) || cloud_object_idle_s <= 0.0)
+    return "cloud_object_idle_s must be a positive number of seconds";
   if (spool_max_bytes < 1024) return "spool_max_bytes is implausibly small";
   if (!std::isfinite(retry_min_s) || !std::isfinite(retry_max_s))
     return "retry_min_s and retry_max_s must be finite numbers";

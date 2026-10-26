@@ -99,6 +99,9 @@ add_library(c3d_core STATIC
   src/sha256.cpp
   src/wall_clock.cpp
   src/pointcloud.cpp
+  src/scan_block.cpp
+  src/sensor_blocks.cpp
+  src/h264_encoder.cpp
   src/camera_fov.cpp
   src/capnp_payloads.cpp
   ${C3D_CAPNP_SOURCES}
@@ -120,6 +123,25 @@ target_link_libraries(c3d_core PRIVATE CURL::libcurl nlohmann_json::nlohmann_jso
                       CapnProto::capnp PkgConfig::ZSTD)
 target_compile_options(c3d_core PRIVATE -Wall -Wextra -Wpedantic)
 set_property(TARGET c3d_core PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+# The ffmpeg child must inherit none of this process's other descriptors (sockets, spool files,
+# DDS): glibc 2.34's posix_spawn_file_actions_addclosefrom_np closes them in the child before the
+# exec. Where it is missing, the encoder's own pipes are still close-on-exec, and only a descriptor
+# something else opened without that flag could leak.
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
+check_cxx_source_compiles("
+#include <spawn.h>
+int main() {
+  posix_spawn_file_actions_t actions;
+  posix_spawn_file_actions_init(&actions);
+  return posix_spawn_file_actions_addclosefrom_np(&actions, 3);
+}
+" C3D_HAVE_ADDCLOSEFROM_NP)
+unset(CMAKE_REQUIRED_DEFINITIONS)
+if(C3D_HAVE_ADDCLOSEFROM_NP)
+  target_compile_definitions(c3d_core PRIVATE C3D_HAVE_ADDCLOSEFROM_NP=1)
+endif()
 
 option(C3D_BUILD_TESTS "Build the core test suite" ON)
 if(C3D_BUILD_TESTS)

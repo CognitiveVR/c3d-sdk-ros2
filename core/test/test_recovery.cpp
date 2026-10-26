@@ -884,8 +884,9 @@ TEST_F(RecoveryTest, AStreamWhoseCredentialsAreRefusedStopsOnlyItself) {
   auto session = Session::Create(cfg, transport, spool, logger);
   ASSERT_TRUE(session->Begin());
   for (int i = 0; i < 3; ++i) {
-    session->RecordCameraFrame("cam", 1700000000000ull + i, i, "frame", Pose{}, "jpeg", 2, 2,
-                               std::string(100, 'x'));
+    session->RecordCameraAccessUnit(
+        "cam", SensorEntry{1700000000000ull + i, static_cast<std::uint32_t>(i), Pose{}},
+        VideoChunkContext{}, std::string(100, 'x'), true);
     session->RecordSensor("battery", 1000.0 + i, static_cast<double>(i));
     session->RecordEvent("event_" + std::to_string(i), 1000.0 + i, Vec3{});
     session->Flush();
@@ -987,8 +988,9 @@ TEST_F(RecoveryTest, ARefusedKeyIsProbedOncePerIntervalAStreamAtATime) {
   auto session = Session::Create(cfg, transport, spool, std::make_shared<NullLogger>());
   ASSERT_TRUE(session->Begin());
   for (int i = 0; i < 3; ++i) {
-    session->RecordCameraFrame("cam", 1700000000000ull + i, i, "frame", Pose{}, "jpeg", 2, 2,
-                               std::string(100, 'x'));
+    session->RecordCameraAccessUnit(
+        "cam", SensorEntry{1700000000000ull + i, static_cast<std::uint32_t>(i), Pose{}},
+        VideoChunkContext{}, std::string(100, 'x'), true);
     session->RecordEvent("event_" + std::to_string(i), 1000.0 + i, Vec3{});
     session->Flush();
   }

@@ -66,10 +66,6 @@ std::string HzLimitString(double hz) {
 }  // namespace
 
 std::uint64_t PartBase(Stream stream) {
-  // docs/data-format.md fixes the binary streams' part at 1, and the platform
-  // stores it with every record, which is what makes a lost or duplicated part
-  // visible from the stored data alone.
-  if (IsBinaryStream(stream)) return 1;
   switch (stream) {
     case Stream::kGaze:
     case Stream::kDynamics:
@@ -79,13 +75,13 @@ std::uint64_t PartBase(Stream stream) {
       return 1;
     case Stream::kCamera:
     case Stream::kLidar:
-      return 1;
+      break;
   }
-  return 1;
+  return 0;
 }
 
 const char* FormatVersion(Stream stream) {
-  if (stream == Stream::kSensors) return "2.0";
+  if (stream == Stream::kSensors || IsBinaryStream(stream)) return "2.0";
   return "1.0";
 }
 

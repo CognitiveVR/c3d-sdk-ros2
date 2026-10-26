@@ -63,13 +63,15 @@ struct EnvelopeContext {
   double gaze_interval = 0.1;
 };
 
-// The `part` counter base differs per stream, as the Unity SDK's own source sends it: gaze 0,
-// dynamics 0, events 1, sensors 1. The binary streams start at 1.
+// The `part` counter base of a JSON stream, as the Unity SDK's own source sends it: gaze 0,
+// dynamics 0, events 1, sensors 1. The binary streams carry no part: each of their payloads is
+// numbered by its own sensor's seq, so this answers nothing for them.
 std::uint64_t PartBase(Stream stream);
 
 // Sensors are the odd one out on two counts: the device id key is "name" rather
-// than "userid", and formatversion is "2.0" where every other stream sends
-// "1.0". Both verified in Unity SharedCore.cs.
+// than "userid", and formatversion is "2.0" where every other JSON stream sends
+// "1.0". Both verified in Unity SharedCore.cs. The camera and lidar payloads are
+// "2.0" as well, the version their schemas' header names.
 const char* FormatVersion(Stream stream);
 
 std::string SerializeGaze(const EnvelopeContext& ctx,
