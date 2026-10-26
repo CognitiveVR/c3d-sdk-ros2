@@ -53,6 +53,7 @@ class SessionRunner {
                 std::shared_ptr<c3d::ITransport> transport,
                 std::shared_ptr<c3d::ISpool> spool,
                 std::shared_ptr<c3d::ILogger> logger);
+  virtual ~SessionRunner() = default;
 
   // Closes any session left open by a previous process that died without an
   // orderly shutdown. Call once before Begin. Returns how many were recovered.
@@ -91,11 +92,15 @@ class SessionRunner {
   // The binary streams. Same rule as above: the pose arrives in ROS axes and the
   // convention is applied here, in one place, by `ScenePose` -- or, for a
   // LaserScan alone, by `ScanPlanePose`.
-  void RecordCameraFrame(const std::string& camera_id, std::uint64_t time_ms, std::uint32_t seq,
-                         const std::string& frame_id, const c3d::Vec3& ros_position,
-                         const c3d::Quat& ros_rotation, const std::string& format,
-                         std::uint16_t width, std::uint16_t height, const std::string& bytes,
-                         const c3d::CameraFov& fov);
+  //
+  // One encoded frame. Called on a camera encoder's reader thread, which Session's own lock makes
+  // safe. `context.frame_id` is set to `frame_id`. Virtual so a test can see what a camera hands
+  // the session, which no reader outside core can decode.
+  virtual void RecordCameraAccessUnit(const std::string& camera_id, std::uint64_t time_ms,
+                                      std::uint32_t seq, const std::string& frame_id,
+                                      const c3d::Vec3& ros_position, const c3d::Quat& ros_rotation,
+                                      c3d::VideoChunkContext context, std::string access_unit,
+                                      bool keyframe);
   void RecordLaserScan(const std::string& sensor_id, std::uint64_t time_ms, std::uint32_t seq,
                        const std::string& frame_id, const c3d::Vec3& ros_position,
                        const c3d::Quat& ros_rotation, const c3d::LaserScanData& scan);

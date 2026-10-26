@@ -26,6 +26,7 @@
 #include "c3d/version.hpp"
 #include "c3d/wall_clock.hpp"
 #include "cognitive3d_ros/doctor.hpp"
+#include "cognitive3d_ros/media_config.hpp"
 #include "cognitive3d_ros/qos_resolver.hpp"
 #include "cognitive3d_ros/run_doctor.hpp"
 #include "throttled_http_server.hpp"
@@ -561,6 +562,79 @@ TEST(Render, AdvisoriesOnlyReadsAsPassingWithNotes) {
   const std::string report = Render({CheckFrames("map", "odom", "base_link", false, true)});
   EXPECT_NE(report.find("with notes"), std::string::npos);
   EXPECT_EQ(report.find("FAIL"), std::string::npos);
+}
+
+// The camera encoder is the host's ffmpeg. With a camera configured, one that cannot run is FATAL
+// -- no camera could record -- and names the package; with none, nothing runs it, so nothing is
+// checked. A pass names the binary and the version it answered with. Configure refuses for the same
+// reason, and doctor reads that refusal back into this same check.
+TEST(DoctorChecks, TheCameraEncoderCheckIsFatalOnlyWhenACameraIsConfigured) {
+  CameraEncoderFacts facts;
+  facts.ffmpeg_path = "/opt/ffmpeg/bin/ffmpeg";
+  facts.problem = "cannot run /opt/ffmpeg/bin/ffmpeg: No such file or directory";
+
+  const Check no_camera = CheckCameraEncoder(facts);
+  EXPECT_EQ(no_camera.severity, Severity::kOk);
+  EXPECT_NE(no_camera.name.find("(NOT CHECKED)"), std::string::npos) << no_camera.name;
+
+  facts.cameras = 2;
+  const Check fatal = CheckCameraEncoder(facts);
+  EXPECT_EQ(fatal.name, "camera encoder");
+  EXPECT_EQ(fatal.severity, Severity::kFatal);
+  EXPECT_NE(fatal.detail.find("ffmpeg_path '/opt/ffmpeg/bin/ffmpeg'"), std::string::npos)
+      << fatal.detail;
+  EXPECT_NE(fatal.detail.find("No such file or directory"), std::string::npos) << fatal.detail;
+  EXPECT_NE(fatal.remedy.find("sudo apt install ffmpeg"), std::string::npos) << fatal.remedy;
+
+  facts.problem.clear();
+  facts.version = "ffmpeg version 6.1.1-3ubuntu5 Copyright (c) 2000-2023 the FFmpeg developers";
+  const Check pass = CheckCameraEncoder(facts);
+  EXPECT_EQ(pass.name, "camera encoder");
+  EXPECT_EQ(pass.severity, Severity::kOk);
+  EXPECT_NE(pass.detail.find("/opt/ffmpeg/bin/ffmpeg"), std::string::npos) << pass.detail;
+  EXPECT_NE(pass.detail.find("ffmpeg version 6.1.1"), std::string::npos) << pass.detail;
+
+  const auto refused = ChecksForConfigurationRefusal(
+      cognitive3d_ros::FfmpegProblem("/nonexistent", "cannot run /nonexistent") + ". " +
+      cognitive3d_ros::kFfmpegRemedy);
+  ASSERT_EQ(refused.size(), 1u);
+  EXPECT_EQ(refused[0].name, "camera encoder");
+  EXPECT_EQ(refused[0].severity, Severity::kFatal);
+  EXPECT_EQ(refused[0].detail,
+            cognitive3d_ros::FfmpegProblem("/nonexistent", "cannot run /nonexistent"));
+  EXPECT_NE(refused[0].remedy.find("sudo apt install ffmpeg"), std::string::npos);
+}
+
+// A camera's bytes cannot be measured from one frame, so they are estimated: 5120 bytes a frame at
+// 640x480 and crf 28, in proportion to the pixels, doubling every 4 crf steps lower -- the slope
+// the recorded footage showed -- times the rate. The check says it is an estimate.
+TEST(DoctorChecks, TheCameraSizeIsAnEstimateFromResolutionAndCrf) {
+  const double base = EstimatedCameraBytesPerSecond(640, 480, 28, 30.0);
+  EXPECT_DOUBLE_EQ(base, 153600.0);
+  EXPECT_DOUBLE_EQ(EstimatedCameraBytesPerSecond(640, 480, 24, 30.0), 2.0 * base);
+  EXPECT_DOUBLE_EQ(EstimatedCameraBytesPerSecond(640, 480, 32, 30.0), 0.5 * base);
+  EXPECT_DOUBLE_EQ(EstimatedCameraBytesPerSecond(320, 240, 28, 30.0), 0.25 * base);
+  EXPECT_DOUBLE_EQ(EstimatedCameraBytesPerSecond(640, 480, 28, 15.0), 0.5 * base);
+
+  MediaSensorFacts camera;
+  camera.kind = "camera";
+  camera.name = "front";
+  camera.topic = "/image";
+  camera.rate_hz = 30.0;
+  camera.topic_present = true;
+  camera.type = "sensor_msgs/msg/Image";
+  camera.type_handled = true;
+  camera.qos = "best_effort/volatile/keep_last(1)";
+  camera.frame = "camera_link";
+  camera.frame_resolves = true;
+  camera.sample_seen = true;
+  camera.prepared_width = 640;
+  camera.prepared_height = 480;
+  camera.crf = 24;
+  const Check check = CheckMediaSensor(camera);
+  EXPECT_EQ(check.severity, Severity::kOk);
+  EXPECT_NE(check.detail.find("about 300.0 KB/s estimated"), std::string::npos) << check.detail;
+  EXPECT_NE(check.detail.find("crf 24"), std::string::npos) << check.detail;
 }
 
 // `Config::Validate` reports every missing mandatory value in ONE string, so a refusal naming

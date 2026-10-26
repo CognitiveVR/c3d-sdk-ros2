@@ -46,8 +46,9 @@
   <depend>tf2_ros</depend>
   <depend>cognitive3d_ros_msgs</depend>
 
-  <!-- Camera frames are decoded, resized and JPEG-encoded here. -->
+  <!-- Camera frames are decoded and resized here; the H.264 encoder is ffmpeg, run as a separate process. -->
   <depend>cv_bridge</depend>
+  <exec_depend>ffmpeg</exec_depend>
 
   <!--
     Build-only. No installed header includes any of these, so a package building

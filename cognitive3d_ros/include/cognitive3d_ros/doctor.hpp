@@ -474,11 +474,14 @@ Check CheckPoseChannel(const PoseChannelFacts& facts);
 
 // One configured camera or lidar, as doctor found it on the graph.
 //
-// The size is MEASURED rather than assumed: doctor encodes one real message
-// through the capture's own encoder, so the estimate carries the operator's
-// jpeg_quality, max_width_px, voxel leaf and zstd level instead of a table of
-// guesses. `encoded_bytes == 0` with `sample_seen` false means nothing arrived in
-// the observation window, which is a fact about the topic, not about the size.
+// A lidar's size is MEASURED rather than assumed: doctor encodes one real message
+// through the capture's own encoder, so the figure carries the operator's voxel
+// leaf and zstd level instead of a table of guesses. A camera's cannot be: one
+// frame says nothing about a video stream whose bytes depend on what moves, so
+// doctor prepares one real frame the way the run does, for its size, and
+// estimates the rate from that size and `crf`. `sample_seen` false means nothing
+// arrived in the observation window, which is a fact about the topic, not about
+// the size.
 struct MediaSensorFacts {
   std::string kind;  // "camera" or "lidar"
   std::string name;
@@ -491,9 +494,15 @@ struct MediaSensorFacts {
   std::string frame;  // the frame a pose will be looked up for, empty when unknown
   bool frame_resolves = false;
   bool sample_seen = false;
+  // A lidar's: one sample's encoded size.
   std::uint64_t encoded_bytes = 0;
-  // Why the sample could not be encoded, when one arrived and the encoder refused
-  // it. This is the check that catches a camera pointed at a depth topic.
+  // A camera's: what one sample prepares to, 0 by 0 when it could not be, and the
+  // crf in force.
+  std::uint16_t prepared_width = 0;
+  std::uint16_t prepared_height = 0;
+  int crf = 0;
+  // Why the sample could not be prepared or encoded, when one arrived and was
+  // refused. This is the check that catches a camera pointed at a depth topic.
   std::string encode_error;
 
   // A PointCloud2's own points, counted in the SENSOR's axes before any
@@ -525,18 +534,33 @@ struct CameraFovFacts {
 };
 Check CheckCameraFov(const CameraFovFacts& facts);
 
-// A single frame or scan above this is WARNed on. The platform stores each frame
-// or scan as ONE record of at most 1 MiB, and drops a larger one after the upload
-// already answered 200. The margin below 1 MiB covers the framing the platform
-// adds around the payload.
-constexpr std::uint64_t kMediaRecordWarnBytes = 900ull * 1024;
+// Bytes per second a camera's video costs, ESTIMATED: 5120 bytes per frame at
+// 640x480 and crf 28, in proportion to the pixel count, doubling every 4 crf
+// steps lower, times `rate_hz`. Fitted to footage recorded across the 24 to 32
+// band, so it says what such a camera usually costs, not what this one will: the
+// bytes follow what the scene does.
+double EstimatedCameraBytesPerSecond(int width, int height, int crf, double rate_hz);
 Check CheckMediaSensor(const MediaSensorFacts& facts);
 
-// What the configured streams will cost, added up. WARN above this, because the
-// only limit is the configuration: nothing on the platform rate-limits a
-// session's streams.
+// What the configured streams will cost, added up: a lidar's measured sample and a
+// camera's estimate, each at its `rate_hz`. WARN above this, because the only
+// limit is the configuration: nothing on the platform rate-limits a session's
+// streams.
 constexpr double kMediaBandwidthWarnBytesPerSecond = 2.0 * 1024 * 1024;
 Check CheckMediaBandwidth(const std::vector<MediaSensorFacts>& facts);
+
+// Whether the binary `ffmpeg_path` names can encode the configured cameras.
+// FATAL only with a camera configured: without one nothing runs it, and a robot
+// that records no video needs no ffmpeg.
+struct CameraEncoderFacts {
+  std::size_t cameras = 0;
+  std::string ffmpeg_path;
+  // c3d::ProbeFfmpeg's answer: empty when it runs and lists libx264.
+  std::string problem;
+  // Its first `-version` line, when it ran.
+  std::string version;
+};
+Check CheckCameraEncoder(const CameraEncoderFacts& facts);
 
 // A cloud's frame NAME against the geometry of its own points.
 //

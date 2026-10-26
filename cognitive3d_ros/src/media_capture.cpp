@@ -19,8 +19,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
+#include <sstream>
+#include <system_error>
+#include <thread>
+#include <utility>
 #include <vector>
 
+#include "c3d/scan_block.hpp"
 #include "cognitive3d_ros/image_codec.hpp"
 #include "cognitive3d_ros/pointcloud_fields.hpp"
 #include "cognitive3d_ros/translators.hpp"
@@ -43,8 +49,24 @@ double SteadySeconds() {
   return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
+// A number of seconds as a sentence says it: "5", "2.5".
+std::string SecondsText(double seconds) {
+  std::ostringstream text;
+  text << seconds;
+  return text.str();
+}
+
 double ArrivalSeconds(const MediaEnvironment& environment) {
   return environment.arrival_time ? environment.arrival_time() : SteadySeconds();
+}
+
+// The wall clock less the steady clock, both real: it moves only when the wall clock steps.
+double WallClockOffset(const MediaEnvironment& environment) {
+  using namespace std::chrono;
+  const double wall = environment.wall_time
+                          ? environment.wall_time()
+                          : duration<double>(system_clock::now().time_since_epoch()).count();
+  return wall - (environment.steady_time ? environment.steady_time() : SteadySeconds());
 }
 
 double PoseClockSeconds(const MediaEnvironment& environment) {
@@ -65,16 +87,9 @@ bool ResolveFrameId(const std::string& configured, const std_msgs::msg::Header& 
   return !out->empty();
 }
 
-std::string EncodeJpeg(const cv::Mat& bgr, int quality) {
-  std::vector<int> parameters{cv::IMWRITE_JPEG_QUALITY, quality};
-  std::vector<std::uint8_t> buffer;
-  if (!cv::imencode(".jpg", bgr, buffer, parameters)) return std::string();
-  return std::string(reinterpret_cast<const char*>(buffer.data()), buffer.size());
-}
-
 // INTER_AREA, which is the right filter for shrinking: the bilinear default
 // samples rather than averages, so a downscaled sensor image comes out aliased
-// and a JPEG of an aliased image is both larger and worse.
+// and video of an aliased image is both larger and worse.
 cv::Mat ShrinkToWidth(const cv::Mat& source, int max_width_px) {
   if (max_width_px <= 0 || source.cols <= max_width_px) return source;
   const int height = std::max(1, static_cast<int>(std::lround(
@@ -83,6 +98,34 @@ cv::Mat ShrinkToWidth(const cv::Mat& source, int max_width_px) {
   cv::Mat resized;
   cv::resize(source, resized, cv::Size(max_width_px, height), 0, 0, cv::INTER_AREA);
   return resized;
+}
+
+// The frame the encoder takes: scaled to `max_width_px`, then cropped to even by dropping the last
+// column and row, as one contiguous bgr24 buffer.
+bool PrepareDecoded(const cv::Mat& bgr, int max_width_px, PreparedFrame* out, std::string* why) {
+  const cv::Mat shrunk = ShrinkToWidth(bgr, max_width_px);
+  const int width = shrunk.cols & ~1;
+  const int height = shrunk.rows & ~1;
+  if (width < 2 || height < 2) {
+    *why = "a frame of " + std::to_string(shrunk.cols) + "x" + std::to_string(shrunk.rows) +
+           " is too small to encode";
+    return false;
+  }
+  // The wire's width and height are UInt16.
+  if (width > 65535 || height > 65535) {
+    *why = "a frame of " + std::to_string(shrunk.cols) + "x" + std::to_string(shrunk.rows) +
+           " is larger than the 65535 pixels a side the wire carries; set max_width_px";
+    return false;
+  }
+  const std::size_t row_bytes = static_cast<std::size_t>(width) * 3;
+  out->bgr24.resize(row_bytes * static_cast<std::size_t>(height));
+  for (int row = 0; row < height; ++row) {
+    std::memcpy(&out->bgr24[row_bytes * static_cast<std::size_t>(row)], shrunk.ptr(row),
+                row_bytes);
+  }
+  out->width = static_cast<std::uint16_t>(width);
+  out->height = static_cast<std::uint16_t>(height);
+  return true;
 }
 
 }  // namespace
@@ -180,16 +223,75 @@ bool MediaPointCloudAxisSigns(const std::string& type, const rclcpp::SerializedM
   return true;
 }
 
-CameraCapture::CameraCapture(CameraConfig config) : config_(std::move(config)) {}
+H264EncoderFactory DefaultH264EncoderFactory() {
+  return [](const c3d::H264EncoderSettings& settings, c3d::OnAccessUnit on_access_unit,
+            c3d::OnEncoderFailure on_failure) {
+    return c3d::NewFfmpegH264Encoder(settings, std::move(on_access_unit), std::move(on_failure));
+  };
+}
+
+CameraCapture::CameraCapture(CameraConfig config, std::string ffmpeg_path,
+                             H264EncoderFactory factory)
+    : config_(std::move(config)),
+      ffmpeg_path_(std::move(ffmpeg_path)),
+      factory_(std::move(factory)) {}
+
+CameraCapture::~CameraCapture() {
+  std::unique_ptr<c3d::IH264Encoder> encoder;
+  {
+    std::lock_guard<std::mutex> lock(pending_mu_);
+    runner_ = nullptr;
+    warn_once_ = nullptr;
+    arrival_time_ = nullptr;
+    encoder = std::move(encoder_);
+  }
+  if (encoder) encoder->Finish(0.0);
+  encoder.reset();
+  c3d::SweepLeftoverChildren();
+}
+
+CameraStats CameraCapture::stats() const {
+  std::lock_guard<std::mutex> lock(stats_mu_);
+  return stats_;
+}
+
+void CameraCapture::AddToStats(std::uint64_t CameraStats::*field, std::uint64_t amount) {
+  std::lock_guard<std::mutex> lock(stats_mu_);
+  stats_.*field += amount;
+}
+
+bool CameraCapture::has_encoder() const {
+  std::lock_guard<std::mutex> lock(pending_mu_);
+  return encoder_ != nullptr;
+}
 
 void CameraCapture::Reset() {
-  stats_ = CameraStats{};
+  StopEncoder();
+  {
+    std::lock_guard<std::mutex> lock(stats_mu_);
+    CameraStats fresh;
+    fresh.dropped_at_stop = stats_.dropped_at_stop;
+    fresh.dropped_no_session = stats_.dropped_no_session;
+    stats_ = fresh;
+  }
   seq_ = 0;
   gate_.Reset();
   held_.Clear();
   frame_id_warned_ = false;
   refusal_warned_ = false;
   unstamped_warned_ = false;
+  start_warned_ = false;
+  clock_step_warned_ = false;
+  std::lock_guard<std::mutex> lock(pending_mu_);
+  failed_ = false;
+  previous_stop_killed_ = false;
+  last_accepted_ = 0.0;
+  last_attempt_ = 0.0;
+  last_attempt_refused_ = false;
+  backoff_until_ = 0.0;
+  pending_start_reason_ = StartReason::kNone;
+  failure_warned_ = false;
+  no_session_warned_ = false;
 }
 
 c3d::CameraFov CameraFovFromCameraInfo(const sensor_msgs::msg::CameraInfo& info) {
@@ -259,12 +361,11 @@ bool CameraCapture::AcceptHeader(const std_msgs::msg::Header& header,
   return gate_.Accept(ArrivalSeconds(environment), config_.rate_hz);
 }
 
-bool CameraCapture::Emit(const std_msgs::msg::Header& header, std::string bytes,
-                         std::uint16_t width, std::uint16_t height,
+bool CameraCapture::Emit(const std_msgs::msg::Header& header, PreparedFrame frame,
                          const MediaEnvironment& environment, SessionRunner& runner) {
   std::string frame_id;
   if (!ResolveFrameId(config_.frame, header, &frame_id)) {
-    ++stats_.pose_failures;
+    AddToStats(&CameraStats::pose_failures);
     if (!frame_id_warned_ && environment.warn_once) {
       frame_id_warned_ = true;
       environment.warn_once("camera '" + config_.name + "' on " + config_.topic +
@@ -275,15 +376,25 @@ bool CameraCapture::Emit(const std_msgs::msg::Header& header, std::string bytes,
   }
 
   const std::uint64_t time_ms = WireMilliseconds(environment, header);
-  auto record = [this, frame_id, time_ms, bytes = std::move(bytes), width, height](
+  auto record = [this, frame_id, time_ms, frame = std::move(frame)](
                     const c3d::Vec3& position, const c3d::Quat& rotation,
-                    const MediaEnvironment& environment, SessionRunner& runner) {
+                    const MediaEnvironment& environment, SessionRunner& runner) mutable {
     const bool first_of_session = seq_ == 0;
     const c3d::CameraFov fov = CurrentFov();
-    runner.RecordCameraFrame(config_.name, time_ms, seq_++, frame_id, position, rotation,
-                             config_.format, width, height, bytes, fov);
-    ++stats_.frames;
-    stats_.bytes += bytes.size();
+    c3d::SensorEntry entry;
+    entry.time_ms = time_ms;
+    // Every posed frame takes a seq, fed or not, so a frame the encoder dropped is a gap in seq
+    // rather than a hole in the chunk.
+    entry.seq = seq_++;
+    entry.pose = c3d::Pose{position, rotation};
+    c3d::VideoChunkContext context;
+    context.frame_id = frame_id;
+    context.width = frame.width;
+    context.height = frame.height;
+    context.nominal_fps = static_cast<float>(config_.rate_hz);
+    context.hfov_deg = fov.hfov_deg;
+    context.vfov_deg = fov.vfov_deg;
+    const bool fed = FeedFrame(std::move(frame), entry, context, environment, runner);
     // A CameraInfo topic nothing publishes leaves every frame of the session without a field of
     // view, which the session's fov_source does not show. Not said of a publisher that has not
     // sent yet: its first CameraInfo reaches the frames after it.
@@ -296,36 +407,331 @@ bool CameraCapture::Emit(const std_msgs::msg::Header& header, std::string bytes,
                             "vfov_degrees, or point camera." + config_.name +
                             ".camera_info_topic at the driver's CameraInfo");
     }
-    return true;
+    return fed;
   };
-  return held_.Offer(frame_id, header.stamp, std::move(record), environment, runner,
-                     &stats_.pose_failures);
+  std::uint64_t pose_failures = 0;
+  const bool fed = held_.Offer(frame_id, header.stamp, std::move(record), environment, runner,
+                               &pose_failures);
+  if (pose_failures > 0) AddToStats(&CameraStats::pose_failures, pose_failures);
+  return fed;
 }
 
 void CameraCapture::ServiceHeld(const MediaEnvironment& environment, SessionRunner& runner) {
-  held_.Service(environment, runner, &stats_.pose_failures);
+  std::uint64_t pose_failures = 0;
+  held_.Service(environment, runner, &pose_failures);
+  if (pose_failures > 0) AddToStats(&CameraStats::pose_failures, pose_failures);
 }
 
-bool CameraCapture::EncodeCompressed(const sensor_msgs::msg::CompressedImage& compressed,
-                                     std::string* bytes, std::uint16_t* width,
-                                     std::uint16_t* height, std::string* why) const {
-  const std::string raw(reinterpret_cast<const char*>(compressed.data.data()),
-                        compressed.data.size());
-  std::uint16_t source_width = 0;
-  std::uint16_t source_height = 0;
-  // Pass-through is the whole point of subscribing to the compressed topic: the
-  // publisher already paid for the encode, and re-encoding a JPEG loses quality
-  // to no end. It is only correct when nothing else has to change, which is why
-  // the width test reads the JPEG itself rather than trusting configuration.
-  if (CompressedFormatIsJpeg(compressed.format) &&
-      JpegDimensions(raw, &source_width, &source_height) &&
-      (config_.max_width_px <= 0 || source_width <= config_.max_width_px)) {
-    *bytes = raw;
-    *width = source_width;
-    *height = source_height;
-    return true;
+// The restart rules, in precedence order. Every one reads the same `now`, the arrival clock read
+// once for this frame, and after a stop the frame goes on down the table, so a restart and the feed
+// it was for happen on one frame:
+//
+//   1. under a backoff: the frame is dropped; nothing starts or stops
+//   2. the running instance has failed: stopped at once, unclassified -- its on_failure already
+//      set the backoff and the reason
+//   3. a different size or frame: stopped with the full timeout, reason `other`
+//   4. the wall clock moved more than kWallClockStepSeconds against the steady clock since the
+//      encoder started: stopped with the full timeout, reason `other`, said once a session. The
+//      encoder stamps frames by the wall clock and cuts a chunk every 3 s of stamps, so a step
+//      forward would make every frame a chunk of its own, and a step back would cut no chunk
+//      until the clock had made the step up again
+//   5. nothing accepted for a chunk's length while the refusals went on through it: wedged,
+//      stopped at once, reason `wedge`, backed off
+//   6. nothing accepted for a chunk's length and no refusals through it: a quiet gap, stopped
+//      with the full timeout, or with the reap time alone when the last stop had to kill and its
+//      replacement has delivered nothing since
+//   7. no encoder and no backoff: started, and counted by the reason the last stop left
+//
+// A stop that had to kill turns the reason into `failure` and sets the backoff from on_failure,
+// whatever row asked for the stop, so a kill is never counted as a gap or a size change.
+bool CameraCapture::FeedFrame(PreparedFrame frame, const c3d::SensorEntry& entry,
+                              const c3d::VideoChunkContext& context,
+                              const MediaEnvironment& environment, SessionRunner& runner) {
+  const double now = ArrivalSeconds(environment);
+  const double wall_offset = WallClockOffset(environment);
+  const auto bind = [&]() {
+    runner_ = &runner;
+    warn_once_ = environment.warn_once;
+    arrival_time_ = environment.arrival_time;
+  };
+
+  bool stop = false;
+  bool wedged = false;
+  double wall_step = 0.0;  // non-zero when row 4 stops the encoder
+  double stop_timeout = c3d::kH264FinishTimeoutSeconds;
+  {
+    std::lock_guard<std::mutex> lock(pending_mu_);
+    bind();
+    if (now < backoff_until_) {
+      // Row 1.
+      AddToStats(&CameraStats::dropped_backlog);
+      return false;
+    }
+    if (encoder_) {
+      if (failed_) {
+        // Row 2.
+        stop = true;
+        stop_timeout = 0.0;
+      } else if (frame.width != encoder_width_ || frame.height != encoder_height_ ||
+                 context.frame_id != encoder_frame_id_) {
+        // Row 3.
+        stop = true;
+        pending_start_reason_ = StartReason::kOther;
+      } else if (std::fabs(wall_offset - encoder_wall_offset_) > kWallClockStepSeconds) {
+        // Row 4.
+        stop = true;
+        wall_step = wall_offset - encoder_wall_offset_;
+        pending_start_reason_ = StartReason::kOther;
+      } else if (now - last_accepted_ >= c3d::kVideoChunkSeconds) {
+        stop = true;
+        if (last_attempt_refused_ && now - last_attempt_ < c3d::kVideoChunkSeconds) {
+          // Row 5.
+          wedged = true;
+          stop_timeout = 0.0;
+          pending_start_reason_ = StartReason::kWedge;
+        } else {
+          // Row 6.
+          stop_timeout =
+              previous_stop_killed_ ? c3d::kH264ReapSeconds : c3d::kH264FinishTimeoutSeconds;
+          pending_start_reason_ = StartReason::kGap;
+        }
+      }
+    }
+  }
+  if (stop) StopEncoder(stop_timeout);
+  if (wall_step != 0.0 && !clock_step_warned_ && environment.warn_once) {
+    clock_step_warned_ = true;
+    environment.warn_once("camera '" + config_.name + "': the wall clock stepped " +
+                          (wall_step > 0.0 ? "forward" : "back") + " by " +
+                          SecondsText(std::fabs(wall_step)) +
+                          " seconds while its encoder ran. The encoder times its " +
+                          SecondsText(c3d::kVideoChunkSeconds) +
+                          "-second chunks by the wall clock, so it was restarted");
   }
 
+  bool start = false;
+  StartReason reason = StartReason::kNone;
+  {
+    std::lock_guard<std::mutex> lock(pending_mu_);
+    bind();
+    if (wedged) backoff_until_ = now + kEncoderRestartMinSeconds;
+    if (!encoder_) {
+      if (now < backoff_until_) {
+        // Row 1, for a backoff the stop above just raised.
+        AddToStats(&CameraStats::dropped_backlog);
+        return false;
+      }
+      start = true;
+      reason = pending_start_reason_;
+    }
+  }
+
+  if (start) {
+    // Row 7.
+    c3d::H264EncoderSettings settings;
+    settings.ffmpeg_path = ffmpeg_path_;
+    settings.preset = config_.preset;
+    settings.crf = config_.crf;
+    settings.max_bitrate_kbps = config_.max_bitrate_kbps;
+    settings.width = frame.width;
+    settings.height = frame.height;
+    settings.fps = config_.rate_hz;
+    std::unique_ptr<c3d::IH264Encoder> encoder =
+        factory_(settings, [this](c3d::EncodedAccessUnit unit) { OnAccessUnit(std::move(unit)); },
+                 [this](const c3d::EncoderFailure& failure) { OnEncoderFailure(failure); });
+    std::string error = encoder ? std::string() : std::string("no encoder was built");
+    if (!encoder || !encoder->Start(&error)) {
+      encoder.reset();
+      {
+        std::lock_guard<std::mutex> lock(pending_mu_);
+        backoff_until_ = now + kEncoderRestartMinSeconds;
+      }
+      AddToStats(&CameraStats::dropped_backlog);
+      if (!start_warned_ && environment.warn_once) {
+        start_warned_ = true;
+        environment.warn_once("camera '" + config_.name + "': the encoder could not start (" +
+                              error + "); its frames are dropped, and it is tried again every " +
+                              SecondsText(kEncoderRestartMinSeconds) +
+                              " seconds. Check that ffmpeg_path '" + ffmpeg_path_ +
+                              "' still runs");
+      }
+      return false;
+    }
+    std::lock_guard<std::mutex> lock(pending_mu_);
+    encoder_ = std::move(encoder);
+    encoder_width_ = frame.width;
+    encoder_height_ = frame.height;
+    encoder_frame_id_ = context.frame_id;
+    encoder_wall_offset_ = wall_offset;
+    last_accepted_ = now;
+    last_attempt_refused_ = false;
+    if (reason == StartReason::kFailure || reason == StartReason::kWedge) {
+      AddToStats(&CameraStats::encoder_restarts);
+    } else if (reason == StartReason::kGap) {
+      AddToStats(&CameraStats::gap_restarts);
+    }
+    // Unless the new instance has already died, whose on_failure set the reason for the next.
+    if (!failed_) pending_start_reason_ = StartReason::kNone;
+  }
+
+  c3d::IH264Encoder* encoder = nullptr;
+  std::uint64_t token = 0;
+  {
+    std::lock_guard<std::mutex> lock(pending_mu_);
+    encoder = encoder_.get();
+    token = next_token_++;
+    pending_[token] = Pending{entry, context};
+  }
+  // Unlocked: the encoder may deliver this very frame's unit on another thread, or on this one.
+  const bool fed = encoder->Feed(std::move(frame.bgr24), token);
+  {
+    std::lock_guard<std::mutex> lock(pending_mu_);
+    last_attempt_ = now;
+    last_attempt_refused_ = !fed;
+    if (fed) {
+      last_accepted_ = now;
+    } else {
+      pending_.erase(token);
+    }
+  }
+  if (!fed) AddToStats(&CameraStats::dropped_backlog);
+  return fed;
+}
+
+void CameraCapture::StopEncoder(double timeout_s) {
+  std::unique_ptr<c3d::IH264Encoder> encoder;
+  {
+    std::lock_guard<std::mutex> lock(pending_mu_);
+    encoder = std::move(encoder_);
+    if (encoder) {
+      previous_stop_killed_ = false;
+      stopping_on_ = std::this_thread::get_id();
+    }
+  }
+  // Unlocked: the reader keeps delivering, and takes pending_mu_ for each unit, until Finish has
+  // joined it.
+  if (encoder) encoder->Finish(timeout_s);
+  encoder.reset();
+  std::lock_guard<std::mutex> lock(pending_mu_);
+  stopping_on_ = std::thread::id();
+  failed_ = false;
+  // Frames the stop abandoned never come back; their tokens would wait here for good.
+  pending_.clear();
+  runner_ = nullptr;
+  warn_once_ = nullptr;
+  arrival_time_ = nullptr;
+}
+
+void CameraCapture::OnAccessUnit(c3d::EncodedAccessUnit unit) {
+  Pending pending;
+  SessionRunner* runner = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(pending_mu_);
+    const auto found = pending_.find(unit.token);
+    if (found == pending_.end()) return;
+    pending = std::move(found->second);
+    pending_.erase(found);
+    runner = runner_;
+    // A unit shows the instance encodes, so the kill before it no longer shortens its quiet-gap
+    // stop. A stop that kills reports it after the last unit it delivers.
+    previous_stop_killed_ = false;
+  }
+  if (runner == nullptr || !runner->active()) {
+    AddToStats(&CameraStats::dropped_no_session);
+    std::function<void(const std::string&)> warn;
+    {
+      std::lock_guard<std::mutex> lock(pending_mu_);
+      if (!no_session_warned_ && warn_once_) {
+        no_session_warned_ = true;
+        warn = warn_once_;
+      }
+    }
+    if (warn) {
+      warn("camera '" + config_.name + "': access units arrived after the session ended: the "
+           "encoder was not stopped first, and they are counted in c3d.camera." + config_.name +
+           ".dropped_no_session");
+    }
+    return;
+  }
+  // The parameter sets from the unit itself, never from the encoder that is current now: a
+  // restart on the node's thread may already have replaced the one that made this unit.
+  pending.context.codec_params = std::move(unit.codec_params);
+  pending.context.encoder_settings = std::move(unit.encoder_settings);
+  const std::uint64_t bytes = unit.bytes.size();
+  // A copy: the context is moved into the call, in an order the reference would not survive.
+  const std::string frame_id = pending.context.frame_id;
+  runner->RecordCameraAccessUnit(config_.name, pending.entry.time_ms, pending.entry.seq, frame_id,
+                                 pending.entry.pose.position, pending.entry.pose.rotation,
+                                 std::move(pending.context), std::move(unit.bytes),
+                                 unit.keyframe);
+  std::lock_guard<std::mutex> lock(stats_mu_);
+  ++stats_.frames;
+  stats_.bytes += bytes;
+}
+
+void CameraCapture::OnEncoderFailure(const c3d::EncoderFailure& failure) {
+  std::function<double()> clock;
+  bool at_stop = false;
+  {
+    std::lock_guard<std::mutex> lock(pending_mu_);
+    at_stop = stopping_on_ == std::this_thread::get_id();
+    clock = arrival_time_;
+  }
+  // Read unlocked: the arrival clock is the node's, which locks itself.
+  const double now = clock ? clock() : SteadySeconds();
+  std::function<void(const std::string&)> warn;
+  bool backed_off = false;
+  bool wedge = false;
+  {
+    std::lock_guard<std::mutex> lock(pending_mu_);
+    failed_ = true;
+    previous_stop_killed_ = failure.killed;
+    // The wedge row kills on purpose, with Finish(0); it set its reason before the stop.
+    wedge = at_stop && failure.killed && pending_start_reason_ == StartReason::kWedge;
+    // A healthy encoder never needs the kill, so a stop that killed is a failure like a death
+    // while running, and both cost the backoff: one spawn per kEncoderRestartMinSeconds, however
+    // persistent the cause. A stop that drained, even with a non-zero exit, costs nothing.
+    if (!at_stop || failure.killed) {
+      backed_off = true;
+      backoff_until_ = now + kEncoderRestartMinSeconds;
+      pending_start_reason_ = StartReason::kFailure;
+    }
+    if (!failure_warned_ && warn_once_) {
+      failure_warned_ = true;
+      warn = warn_once_;
+    }
+  }
+  if (failure.abandoned > 0) AddToStats(&CameraStats::dropped_at_stop, failure.abandoned);
+  if (!warn) return;
+  std::string cause;
+  if (wedge) {
+    cause = "it was wedged, taking no frame for " + SecondsText(c3d::kVideoChunkSeconds) +
+            " seconds while frames kept arriving, and was killed";
+  } else if (failure.killed) {
+    cause = "it did not finish in time and was killed";
+  } else if (failure.exit_code > 0) {
+    cause = "it exited with code " + std::to_string(failure.exit_code);
+  } else if (failure.exit_code < 0) {
+    cause = "it died from a signal";
+  } else {
+    cause = "it stopped";
+  }
+  if (failure.abandoned > 0) {
+    cause += ", and " + std::to_string(failure.abandoned) +
+             " frame(s) it had accepted were lost (c3d.camera." + config_.name +
+             ".dropped_at_stop)";
+  }
+  const std::string why = failure.why.empty() ? std::string() : " (" + failure.why + ")";
+  warn("camera '" + config_.name + "': its encoder failed: " + cause + why +
+       (backed_off ? ". After a crash or a kill no encoder starts for " +
+                         SecondsText(kEncoderRestartMinSeconds) + " seconds."
+                   : std::string(".")));
+}
+
+bool CameraCapture::PrepareCompressed(const sensor_msgs::msg::CompressedImage& compressed,
+                                      PreparedFrame* out, std::string* why) const {
+  // Decoded whatever its format: the encoder takes pixels, and a JPEG passed through as it was
+  // published would be a second stream format for every reader.
   const cv::Mat decoded = cv::imdecode(
       cv::Mat(1, static_cast<int>(compressed.data.size()), CV_8UC1,
               const_cast<std::uint8_t*>(compressed.data.data())),
@@ -334,24 +740,15 @@ bool CameraCapture::EncodeCompressed(const sensor_msgs::msg::CompressedImage& co
     *why = "OpenCV cannot decode a CompressedImage with format '" + compressed.format + "'";
     return false;
   }
-  const cv::Mat shrunk = ShrinkToWidth(decoded, config_.max_width_px);
-  *bytes = EncodeJpeg(shrunk, config_.jpeg_quality);
-  if (bytes->empty()) {
-    *why = "the JPEG encoder produced nothing";
-    return false;
-  }
-  *width = static_cast<std::uint16_t>(shrunk.cols);
-  *height = static_cast<std::uint16_t>(shrunk.rows);
-  return true;
+  return PrepareDecoded(decoded, config_.max_width_px, out, why);
 }
 
-bool CameraCapture::EncodeImage(const sensor_msgs::msg::Image& image, std::string* bytes,
-                                std::uint16_t* width, std::uint16_t* height,
-                                std::string* why) const {
+bool CameraCapture::PrepareImage(const sensor_msgs::msg::Image& image, PreparedFrame* out,
+                                 std::string* why) const {
   if (IsDepthEncoding(image.encoding)) {
     *why = "encoding '" + image.encoding +
-           "' is DEPTH, and a depth image run through a JPEG encoder is a grey rectangle that "
-           "looks like a picture. Point this camera at the colour topic.";
+           "' is DEPTH, and a depth image encoded as video is a grey rectangle that looks like a "
+           "picture. Point this camera at the colour topic.";
     return false;
   }
   if (!AcceptedImageEncoding(image.encoding)) {
@@ -369,22 +766,12 @@ bool CameraCapture::EncodeImage(const sensor_msgs::msg::Image& image, std::strin
     *why = std::string("cv_bridge could not convert it to bgr8: ") + e.what();
     return false;
   }
-  const cv::Mat shrunk = ShrinkToWidth(bgr, config_.max_width_px);
-  *bytes = EncodeJpeg(shrunk, config_.jpeg_quality);
-  if (bytes->empty()) {
-    *why = "the JPEG encoder produced nothing";
-    return false;
-  }
-  *width = static_cast<std::uint16_t>(shrunk.cols);
-  *height = static_cast<std::uint16_t>(shrunk.rows);
-  return true;
+  return PrepareDecoded(bgr, config_.max_width_px, out, why);
 }
 
-bool CameraCapture::MeasureEncodedFrame(const std::string& type,
-                                        const rclcpp::SerializedMessage& message,
-                                        std::uint64_t* bytes, std::uint16_t* width,
-                                        std::uint16_t* height, std::string* why) const {
-  std::string encoded;
+bool CameraCapture::PrepareFrame(const std::string& type,
+                                 const rclcpp::SerializedMessage& message, PreparedFrame* out,
+                                 std::string* why) const {
   std::string ignored;
   if (why == nullptr) why = &ignored;
   if (type == "sensor_msgs/msg/CompressedImage") {
@@ -393,20 +780,18 @@ bool CameraCapture::MeasureEncodedFrame(const std::string& type,
       *why = "the message could not be deserialized as a CompressedImage";
       return false;
     }
-    if (!EncodeCompressed(compressed, &encoded, width, height, why)) return false;
-  } else if (type == "sensor_msgs/msg/Image") {
+    return PrepareCompressed(compressed, out, why);
+  }
+  if (type == "sensor_msgs/msg/Image") {
     sensor_msgs::msg::Image image;
     if (!Deserialize(message, &image)) {
       *why = "the message could not be deserialized as an Image";
       return false;
     }
-    if (!EncodeImage(image, &encoded, width, height, why)) return false;
-  } else {
-    *why = "type " + type + " is not an image";
-    return false;
+    return PrepareImage(image, out, why);
   }
-  if (bytes != nullptr) *bytes = encoded.size();
-  return true;
+  *why = "type " + type + " is not an image";
+  return false;
 }
 
 bool CameraCapture::Handle(const std::string& type, const rclcpp::SerializedMessage& message,
@@ -414,32 +799,30 @@ bool CameraCapture::Handle(const std::string& type, const rclcpp::SerializedMess
   if (runner.session() == nullptr) return false;
 
   std_msgs::msg::Header header;
-  std::string bytes;
-  std::uint16_t width = 0;
-  std::uint16_t height = 0;
+  PreparedFrame frame;
   std::string why;
-  bool encoded = false;
+  bool prepared = false;
 
   if (type == "sensor_msgs/msg/CompressedImage") {
     sensor_msgs::msg::CompressedImage compressed;
     if (!Deserialize(message, &compressed)) return false;
-    // The gate runs BEFORE the encode: a dropped frame must cost a deserialize,
-    // not a JPEG.
+    // The gate runs BEFORE the conversion: a dropped frame must cost a deserialize,
+    // not a decode.
     if (!AcceptHeader(compressed.header, environment)) return false;
     header = compressed.header;
-    encoded = EncodeCompressed(compressed, &bytes, &width, &height, &why);
+    prepared = PrepareCompressed(compressed, &frame, &why);
   } else if (type == "sensor_msgs/msg/Image") {
     sensor_msgs::msg::Image image;
     if (!Deserialize(message, &image)) return false;
     if (!AcceptHeader(image.header, environment)) return false;
     header = image.header;
-    encoded = EncodeImage(image, &bytes, &width, &height, &why);
+    prepared = PrepareImage(image, &frame, &why);
   } else {
     return false;
   }
 
-  if (!encoded) {
-    ++stats_.refused;
+  if (!prepared) {
+    AddToStats(&CameraStats::refused);
     if (!refusal_warned_ && environment.warn_once) {
       refusal_warned_ = true;
       environment.warn_once("camera '" + config_.name + "' on " + config_.topic +
@@ -447,7 +830,23 @@ bool CameraCapture::Handle(const std::string& type, const rclcpp::SerializedMess
     }
     return false;
   }
-  return Emit(header, std::move(bytes), width, height, environment, runner);
+  return Emit(header, std::move(frame), environment, runner);
+}
+
+void StopCameraEncoders(const std::vector<std::unique_ptr<CameraCapture>>& cameras) {
+  std::vector<std::thread> stopping;
+  stopping.reserve(cameras.size());
+  for (const auto& camera : cameras) {
+    CameraCapture* capture = camera.get();
+    try {
+      stopping.emplace_back([capture]() { capture->StopEncoder(); });
+    } catch (const std::system_error&) {
+      // No thread to be had: this one stops here, in turn, rather than not at all.
+      capture->StopEncoder();
+    }
+  }
+  for (auto& thread : stopping) thread.join();
+  c3d::SweepLeftoverChildren();
 }
 
 LidarCapture::LidarCapture(LidarConfig config) : config_(std::move(config)) {}
@@ -505,10 +904,25 @@ bool LidarCapture::MeasureEncodedScan(const std::string& type,
       *why = "the message could not be deserialized as a LaserScan";
       return false;
     }
-    // A LaserScan goes uncompressed, so its size is exactly its float arrays.
-    const std::size_t floats =
-        scan.ranges.size() + (config_.intensities ? scan.intensities.size() : 0);
-    if (bytes != nullptr) *bytes = floats * sizeof(float);
+    c3d::LaserScanData data;
+    data.angle_min = scan.angle_min;
+    data.angle_max = scan.angle_max;
+    data.angle_increment = scan.angle_increment;
+    data.range_min = scan.range_min;
+    data.range_max = scan.range_max;
+    data.ranges.assign(scan.ranges.begin(), scan.ranges.end());
+    // Handle keeps intensities only when configured, and a block encodes them only when the scan
+    // carries one per ray; a configured lidar that publishes none is sized without them, not
+    // refused.
+    const bool intensities =
+        config_.intensities && scan.intensities.size() == scan.ranges.size();
+    if (intensities) data.intensities.assign(scan.intensities.begin(), scan.intensities.end());
+    const c3d::scanblock::EncodedScanBlock block = c3d::scanblock::Encode({data}, intensities, 1);
+    if (!block.ok) {
+      *why = "the scan block codec refused the scan: " + block.reason;
+      return false;
+    }
+    if (bytes != nullptr) *bytes = block.ranges.size() + block.intensities.size();
     return true;
   }
   if (type != "sensor_msgs/msg/PointCloud2") {
@@ -546,6 +960,20 @@ bool LidarCapture::Handle(const std::string& type, const rclcpp::SerializedMessa
     if (!Deserialize(message, &scan)) return false;
     if (scan.ranges.empty()) return false;
     if (!AcceptHeader(scan.header, environment)) return false;
+    // Refused here, before it is posed, as well as by the session: a scan the session would drop
+    // must not count in this lidar's series as recorded.
+    if (scan.ranges.size() > c3d::scanblock::kMaxRaysPerScan) {
+      ++stats_.refused;
+      if (!refusal_warned_ && environment.warn_once) {
+        refusal_warned_ = true;
+        environment.warn_once("lidar '" + config_.name + "' on " + config_.topic +
+                              " publishes LaserScans of " + std::to_string(scan.ranges.size()) +
+                              " rays, and a scan block holds at most " +
+                              std::to_string(c3d::scanblock::kMaxRaysPerScan) +
+                              ": its scans are refused");
+      }
+      return false;
+    }
 
     std::string frame_id;
     if (!ResolveFrame(scan.header, environment, &frame_id)) return false;

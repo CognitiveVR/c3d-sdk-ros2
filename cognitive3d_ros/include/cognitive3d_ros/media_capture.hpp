@@ -11,9 +11,16 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 
+#include "c3d/h264_encoder.hpp"
 #include "c3d/media.hpp"
+#include "c3d/sensor_blocks.hpp"
 #include "cognitive3d_ros/coordinate_transform.hpp"
 #include "cognitive3d_ros/media_config.hpp"
 #include "cognitive3d_ros/pointcloud_fields.hpp"
@@ -54,6 +61,11 @@ struct MediaEnvironment {
   // under use_sim_time is simulated time, so a simulation slower than real time still gives a held
   // record its whole wait. Unset is `arrival_time`.
   std::function<double()> pose_clock;
+  // The real clocks, whatever the clock policy: epoch seconds by the system clock, and seconds by
+  // the steady clock. The camera encoder stamps frames by the first, so the two moving apart is a
+  // wall-clock step it must restart for; see CameraCapture::FeedFrame. Unset is the real clock.
+  std::function<double()> wall_time;
+  std::function<double()> steady_time;
 };
 
 // Records that passed the rate gate before tf could pose them, kept in arrival order. A driver
@@ -99,10 +111,29 @@ class HeldRecords {
 };
 
 struct CameraStats {
+  // Access units that reached the session, and their encoded bytes.
   std::uint64_t frames = 0;
   std::uint64_t bytes = 0;
   std::uint64_t pose_failures = 0;
-  std::uint64_t refused = 0;  // encodings we will not encode, and decode failures
+  std::uint64_t refused = 0;  // encodings we will not convert, and decode failures
+  // Posed frames never fed: the encoder's queue was full, no encoder could start, or the frame
+  // came while a restart's backoff ran.
+  std::uint64_t dropped_backlog = 0;
+  // Frames an encoder accepted and could not finish when it was stopped: the sum of its
+  // `abandoned`.
+  std::uint64_t dropped_at_stop = 0;
+  // Every restart counts in exactly one of these, when the replacement starts: encoder_restarts
+  // after a failure or a wedge, gap_restarts after a quiet gap on a healthy encoder, which a
+  // paused or time-lapse camera makes. A restart after a size or frame change, a wall-clock step, a
+  // stop or a Reset counts in neither.
+  std::uint64_t encoder_restarts = 0;
+  std::uint64_t gap_restarts = 0;
+  // Access units that arrived with no session to take them.
+  //
+  // This and dropped_at_stop count for the life of the capture, not per session: the stop that
+  // ends a session comes after that session's last telemetry tick, so a per-session count of
+  // either would never be recorded by any series. Reset keeps both.
+  std::uint64_t dropped_no_session = 0;
 };
 
 struct LidarStats {
@@ -111,7 +142,8 @@ struct LidarStats {
   std::uint64_t pose_failures = 0;
   std::uint64_t dropped_oversize = 0;
   std::uint64_t dropped_range = 0;
-  std::uint64_t refused = 0;  // clouds whose layout we cannot read
+  // Clouds whose layout we cannot read, and LaserScans with more rays than a scan block holds.
+  std::uint64_t refused = 0;
 };
 
 // The header of whichever of the four message types these two streams take.
@@ -139,15 +171,48 @@ bool MediaPointCloudAxisSigns(const std::string& type, const rclcpp::SerializedM
 // an uncalibrated driver's all-zero `k`.
 c3d::CameraFov CameraFovFromCameraInfo(const sensor_msgs::msg::CameraInfo& info);
 
-// One configured camera: the rate gate, the encoder and the per-sensor counters.
+// Builds the encoder a camera feeds. The default runs the host's ffmpeg; a test hands in its own.
+using H264EncoderFactory = std::function<std::unique_ptr<c3d::IH264Encoder>(
+    const c3d::H264EncoderSettings&, c3d::OnAccessUnit, c3d::OnEncoderFailure)>;
+H264EncoderFactory DefaultH264EncoderFactory();
+
+// One frame as the encoder takes it: bgr24, row after row, exactly width * height * 3 bytes, with
+// both dimensions even, which 4:2:0 video needs.
+struct PreparedFrame {
+  std::string bgr24;
+  std::uint16_t width = 0;
+  std::uint16_t height = 0;
+};
+
+// One configured camera: the rate gate, the frame preparation, the encoder and the per-sensor
+// counters.
+//
+// The encoder runs on threads of its own and hands each frame back as an access unit; this class
+// pairs each with the pose and time its frame was fed with, and records it into the session. The
+// node's one callback thread feeds, starts and stops the encoder; the encoder's reader thread
+// delivers. One encoder instance at a time, and a new one whenever the stream it makes could not
+// continue the old: a size or frame change, a wall-clock step, a quiet gap, a failure or a wedge --
+// see FeedFrame.
 class CameraCapture {
  public:
-  explicit CameraCapture(CameraConfig config);
+  CameraCapture(CameraConfig config, std::string ffmpeg_path,
+                H264EncoderFactory factory = DefaultH264EncoderFactory());
+  // Nothing is delivered or warned from here: the runner pointer and the stored warning are
+  // cleared first, then the encoder is killed with Finish(0), then the leftover children swept. A
+  // capture destroyed without a stop loses its tail rather than touching a runner that may be
+  // gone.
+  ~CameraCapture();
+  CameraCapture(const CameraCapture&) = delete;
+  CameraCapture& operator=(const CameraCapture&) = delete;
 
   const CameraConfig& config() const { return config_; }
-  const CameraStats& stats() const { return stats_; }
-  // Per session, like every other translator: the seq counter starts at 0 for
-  // each session and the rate gate forgets where it was.
+  // A copy, taken under the stats lock: the encoder's reader thread advances frames and bytes
+  // while the node's telemetry tick reads them.
+  CameraStats stats() const;
+  // Per session, like every other translator. The encoder is stopped FIRST, while the session it
+  // fed can still take its tail; then the seq counter starts again at 0, the rate gate forgets
+  // where it was, the held frames, the warnings and the restart state go, and every count but
+  // dropped_at_stop and dropped_no_session starts again at 0.
   void Reset();
 
   // The field of view the next frame carries: the parameters when set, otherwise
@@ -170,48 +235,124 @@ class CameraCapture {
   void HandleCameraInfo(const sensor_msgs::msg::CameraInfo& info,
                         const MediaEnvironment& environment);
 
-  // True when a frame reached the session; false also for one held for its pose, which
-  // ServiceHeld records. `type` is the graph's type name, so a topic that changes publisher
-  // mid-run is handled rather than assumed.
+  // True when a frame was fed to the encoder; false also for one held for its pose, which
+  // ServiceHeld feeds. Its access unit reaches the session from the encoder's reader thread.
+  // `type` is the graph's type name, so a topic that changes publisher mid-run is handled rather
+  // than assumed.
   bool Handle(const std::string& type, const rclcpp::SerializedMessage& message,
               const MediaEnvironment& environment, SessionRunner& runner);
-  // Records the held frames tf can now pose. Called on a timer as well as from Handle.
+  // Feeds the held frames tf can now pose. Called on a timer as well as from Handle.
   void ServiceHeld(const MediaEnvironment& environment, SessionRunner& runner);
   std::size_t held() const { return held_.size(); }
 
-  // What this configuration WOULD send for one message: the same encode the run
-  // performs, with no gate, no pose, no session and no counter touched.
-  //
-  // `doctor` sizes the stream with this. It is the same code path rather than a
-  // second estimate on purpose -- a preflight that works the number out for
-  // itself drifts out of step with the run silently, which is the failure class
-  // `doctor` exists to end.
-  bool MeasureEncodedFrame(const std::string& type, const rclcpp::SerializedMessage& message,
-                           std::uint64_t* bytes, std::uint16_t* width, std::uint16_t* height,
-                           std::string* why) const;
+  // One message as the run prepares it -- converted to bgr24, scaled to max_width_px, cropped to
+  // even -- with no gate, no pose, no session and no counter touched. `doctor` reports a camera's
+  // size with this: the same code path rather than a second idea of it, which would drift out of
+  // step with the run silently.
+  bool PrepareFrame(const std::string& type, const rclcpp::SerializedMessage& message,
+                    PreparedFrame* out, std::string* why) const;
+
+  // Finish(timeout_s), then releases the instance, so there is no encoder afterwards and the next
+  // frame starts a new one with a keyframe. The last access units reach the session before this
+  // returns. A failure the stop itself raised has already done its work: the backoff and the
+  // start reason are set. Clears the runner pointer and the stored warning. Idempotent: with no
+  // encoder it does nothing else.
+  void StopEncoder(double timeout_s = c3d::kH264FinishTimeoutSeconds);
+  bool has_encoder() const;
+
+  // How long after a crash, a kill or a start that failed no encoder is started, on the arrival
+  // clock: one spawn per 5 s at most, whatever the cause.
+  static constexpr double kEncoderRestartMinSeconds = 5.0;
+  // How far the wall clock may move against the steady clock under a running encoder before the
+  // encoder is restarted. NTP's slewing stays far under it; a step does not.
+  static constexpr double kWallClockStepSeconds = 1.0;
 
  private:
-  bool EncodeImage(const sensor_msgs::msg::Image& image, std::string* bytes, std::uint16_t* width,
-                   std::uint16_t* height, std::string* why) const;
-  bool EncodeCompressed(const sensor_msgs::msg::CompressedImage& compressed, std::string* bytes,
-                        std::uint16_t* width, std::uint16_t* height, std::string* why) const;
-  bool Emit(const std_msgs::msg::Header& header, std::string bytes, std::uint16_t width,
-            std::uint16_t height, const MediaEnvironment& environment, SessionRunner& runner);
+  // Why the next encoder will start, which decides what that start counts as.
+  enum class StartReason { kNone, kFailure, kWedge, kGap, kOther };
+  // What an access unit is recorded with: the frame's time, seq and pose in ROS axes, and its
+  // chunk context without the parameter sets, which ride on the unit itself.
+  struct Pending {
+    c3d::SensorEntry entry;
+    c3d::VideoChunkContext context;
+  };
+
+  bool PrepareImage(const sensor_msgs::msg::Image& image, PreparedFrame* out,
+                    std::string* why) const;
+  bool PrepareCompressed(const sensor_msgs::msg::CompressedImage& compressed, PreparedFrame* out,
+                         std::string* why) const;
+  bool Emit(const std_msgs::msg::Header& header, PreparedFrame frame,
+            const MediaEnvironment& environment, SessionRunner& runner);
   // The rate gate on the message's arrival, saying once when its stamp is zero.
   bool AcceptHeader(const std_msgs::msg::Header& header, const MediaEnvironment& environment);
+  // One posed frame: the restart rules, then the encoder. True when the encoder took it.
+  bool FeedFrame(PreparedFrame frame, const c3d::SensorEntry& entry,
+                 const c3d::VideoChunkContext& context, const MediaEnvironment& environment,
+                 SessionRunner& runner);
+  void OnAccessUnit(c3d::EncodedAccessUnit unit);
+  void OnEncoderFailure(const c3d::EncoderFailure& failure);
+  void AddToStats(std::uint64_t CameraStats::*field, std::uint64_t amount = 1);
 
   CameraConfig config_;
-  CameraStats stats_;
+  std::string ffmpeg_path_;
+  H264EncoderFactory factory_;
   std::uint32_t seq_ = 0;
   RateGate gate_;
   // One per warning: a warning that shared another's flag would be silenced by it.
   bool frame_id_warned_ = false;
   bool refusal_warned_ = false;
   bool unstamped_warned_ = false;
+  bool start_warned_ = false;
+  bool clock_step_warned_ = false;
   c3d::CameraFov camera_info_fov_;
   bool camera_info_warned_ = false;
   HeldRecords held_;
+
+  mutable std::mutex stats_mu_;
+  CameraStats stats_;
+
+  // Everything below is read and written under pending_mu_: the reader thread pops tokens and
+  // reads the runner, and on_failure arrives on the reader thread or inside Finish. It is never
+  // held across Start, Feed, Finish, a runner call or a warning: the reader takes it to pop a
+  // token, so a stop that held it would deadlock. The instance itself is started, fed and
+  // stopped by its one owner: the node's callback thread, or the thread StopCameraEncoders gives
+  // this capture.
+  mutable std::mutex pending_mu_;
+  std::unique_ptr<c3d::IH264Encoder> encoder_;  // null after any StopEncoder
+  std::uint16_t encoder_width_ = 0;
+  std::uint16_t encoder_height_ = 0;
+  std::string encoder_frame_id_;
+  // The wall clock less the steady clock when the running encoder started.
+  double encoder_wall_offset_ = 0.0;
+  std::map<std::uint64_t, Pending> pending_;
+  std::uint64_t next_token_ = 0;
+  // Set by FeedFrame and cleared by StopEncoder; a unit that finds it null is counted in
+  // dropped_no_session.
+  SessionRunner* runner_ = nullptr;
+  std::function<void(const std::string&)> warn_once_;
+  // The arrival clock on_failure reads its backoff from, so every time here is on one clock.
+  std::function<double()> arrival_time_;
+  bool failed_ = false;  // set by on_failure; cleared by StopEncoder and Reset
+  // The last stop's Finish had to kill. Cleared by the replacement's first delivered unit: an
+  // encoder that delivers is healthy, and its drain owes nothing to the one before it.
+  bool previous_stop_killed_ = false;
+  // last_accepted is set when an encoder starts and advanced only by a Feed that took the frame.
+  double last_accepted_ = 0.0;
+  double last_attempt_ = 0.0;
+  bool last_attempt_refused_ = false;
+  double backoff_until_ = 0.0;  // 0 when none
+  StartReason pending_start_reason_ = StartReason::kNone;
+  // The thread a StopEncoder runs Finish on, while it does: on_failure there is the stop's own
+  // report, anywhere else an instance that died while running.
+  std::thread::id stopping_on_;
+  bool failure_warned_ = false;
+  bool no_session_warned_ = false;
 };
+
+// Stops every camera's encoder at once, each on a thread of its own, then sweeps the leftover
+// children once: N cameras cost one kH264FinishTimeoutSeconds plus kH264ReapSeconds at worst, not
+// N of them, and a child that died since the last stop is reaped even when no session follows.
+void StopCameraEncoders(const std::vector<std::unique_ptr<CameraCapture>>& cameras);
 
 // One configured lidar. LaserScan and PointCloud2 share the rate gate, the pose
 // lookup and the counters; only the payload differs.
@@ -220,7 +361,8 @@ class LidarCapture {
   explicit LidarCapture(LidarConfig config);
 
   const LidarConfig& config() const { return config_; }
-  const LidarStats& stats() const { return stats_; }
+  // A copy, as CameraCapture's is, for the same reader.
+  LidarStats stats() const { return stats_; }
   void Reset();
 
   // As CameraCapture::Handle, and held scans the same way.
@@ -229,10 +371,12 @@ class LidarCapture {
   void ServiceHeld(const MediaEnvironment& environment, SessionRunner& runner);
   std::size_t held() const { return held_.size(); }
 
-  // The lidar twin of CameraCapture::MeasureEncodedFrame, and the same reason.
-  // A point cloud is encoded through `c3d::pointcloud::Encode` here exactly as it
-  // is at run time, so the estimate reflects the voxel leaf and zstd level the
-  // operator configured rather than a guess about them.
+  // What this configuration WOULD send for one message, with no gate, no pose, no session and
+  // no counter touched -- the same code path as the run rather than a second estimate, for the
+  // reason CameraCapture::PrepareFrame is. A point cloud is encoded through
+  // `c3d::pointcloud::Encode` exactly as it is at run time, so the figure reflects the voxel leaf
+  // and zstd level the operator configured. A LaserScan is sized as a block of one scan, an upper
+  // bound on what it adds to a real block.
   bool MeasureEncodedScan(const std::string& type, const rclcpp::SerializedMessage& message,
                           PoseConvention convention, std::uint64_t* bytes,
                           std::string* why) const;

@@ -130,12 +130,13 @@
     # camera:
     #   front:
     #     topic: ""                     # Image or CompressedImage; required
-    #     rate_hz: 30.0                 # frames per second
-    #     format: "jpeg"                # the only accepted value
-    #     jpeg_quality: 80              # 1 to 100
+    #     rate_hz: 30.0                 # frames accepted per second; a chunk is 3 s of real time
+    #     preset: "ultrafast"           # or veryfast
+    #     crf: 28                       # 24 to 32; lower is higher quality and more bytes
+    #     max_bitrate_kbps: 0           # 0 is no cap
     #     max_width_px: 640             # 0 never resizes
     #     frame: ""                     # empty uses header.frame_id
-    #     hfov_degrees: 0.0             # full angles in degrees, sent with every frame;
+    #     hfov_degrees: 0.0             # full angles in degrees, sent with every chunk;
     #     vfov_degrees: 0.0             #   both or neither, 0 < angle < 180; 0 is unset
     #     camera_info_topic: "auto"     # field of view from CameraInfo while those are unset;
     #                                   #   auto is the image topic's sibling, "" none
@@ -149,7 +150,7 @@
     # lidar:
     #   scan:
     #     topic: ""                     # LaserScan or PointCloud2; required
-    #     rate_hz: 30.0                 # scans per second
+    #     rate_hz: 30.0                 # scans per second; a LaserScan block is 3 s, a cloud object 2 MiB or 5 s
     #     frame: ""                     # empty uses header.frame_id
     #     intensities: false            # LaserScan only
     #     pointcloud:                   # PointCloud2 only
@@ -158,14 +159,10 @@
     #       color: "none"               # or rgb565, rgb332, rgb888
     #       intensity: "none"           # or uint8
     #       max_points: 100000          # a larger cloud is dropped whole
-    #       zstd_level: 1               # 0 to 22
+    #       zstd_level: 3               # 0 to 22
     #
-    # Records upload in parts, cut at whichever bound comes first. The byte bounds
-    # run from 1024 to 33554432.
-    camera_flush_s: 2.0
-    camera_flush_bytes: 4194304
-    lidar_flush_s: 2.0
-    lidar_flush_bytes: 4194304
+    # The camera encoder, searched on PATH unless it contains a slash.
+    ffmpeg_path: "ffmpeg"
 
     # ---- Described sensors (provisional) -----------------------------------------
     # Session properties describing a plain sensor, so Session Replay can draw it.

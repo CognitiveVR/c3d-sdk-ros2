@@ -16,14 +16,18 @@ struct CameraConfig {
   std::string name;
   std::string topic;
   double rate_hz = 30.0;
-  // "jpeg" is the only implemented value. "jpegxl" is reserved on the wire and
-  // refused here, because a value the gateway accepts and no browser renders is
-  // worse than a configure error.
-  std::string format = "jpeg";
-  int jpeg_quality = 80;
+  // x264's speed preset: "ultrafast" or "veryfast", the two measured on a robot's
+  // CPU. veryfast spends more CPU for fewer bytes.
+  std::string preset = "ultrafast";
+  // The constant rate factor, kMinCameraCrf to kMaxCameraCrf: lower is higher
+  // quality and more bytes.
+  int crf = 28;
+  // A bitrate cap in kilobits per second, passed as -maxrate with a buffer of
+  // twice that. 0 is no cap; at most kMaxCameraBitrateKbps.
+  int max_bitrate_kbps = 0;
   // 0 means never resize. Above 0, a wider frame is scaled down with the aspect
   // ratio kept -- and the width that reaches the wire is the one that was sent,
-  // not the one that was configured.
+  // cropped to even, not the one that was configured.
   int max_width_px = 640;
   // Empty means the message's own `header.frame_id`. Set it when the publisher
   // leaves the header blank, which is commoner than it should be.
@@ -45,6 +49,13 @@ struct CameraConfig {
   bool fov_set() const { return hfov_degrees != 0.0 || vfov_degrees != 0.0; }
 };
 
+// The crf band the encoder's sizes and picture quality were measured over;
+// outside it neither is known.
+constexpr int kMinCameraCrf = 24;
+constexpr int kMaxCameraCrf = 32;
+// 1 Gbit/s: far past anything a robot's camera needs, and short of where twice it overflows an int.
+constexpr int kMaxCameraBitrateKbps = 1000000;
+
 struct LidarConfig {
   std::string name;
   std::string topic;
@@ -63,6 +74,12 @@ struct LidarConfig {
 // records nothing, an unknown `color` is a 400 per part, and a camera with no
 // topic is a stream that never starts while the run looks configured.
 std::string ValidateCameraConfig(const CameraConfig& camera);
+
+// Why `ffmpeg_path` cannot encode the configured cameras, given c3d::ProbeFfmpeg's reason, and
+// what to do about it. Configure refuses with the two joined by ". "; doctor's `camera encoder`
+// check says the same, and reads a refusal back into the two.
+std::string FfmpegProblem(const std::string& ffmpeg_path, const std::string& why);
+extern const char* const kFfmpegRemedy;
 
 // The CameraInfo topic beside an image topic, by image_transport's convention: a
 // transport publishes under the base topic (`/cam/image_raw/compressed` is the

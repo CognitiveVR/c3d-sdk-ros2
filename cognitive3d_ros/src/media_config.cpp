@@ -32,15 +32,18 @@ std::string ValidateCameraConfig(const CameraConfig& camera) {
   if (!Finite(camera.rate_hz) || camera.rate_hz <= 0.0) {
     return where + "rate_hz must be a positive number of frames per second";
   }
-  if (camera.format != "jpeg") {
-    // `jpegxl` is a reserved wire value with no encoder anywhere in the ROS image
-    // stack and no browser that renders it reliably, so accepting it here would
-    // produce a stream nothing downstream can open.
-    return where + "format must be 'jpeg' (the only implemented value; 'jpegxl' is reserved on "
-                   "the wire and not implemented), got '" + camera.format + "'";
+  if (camera.preset != "ultrafast" && camera.preset != "veryfast") {
+    return where + "preset must be 'ultrafast' or 'veryfast', got '" + camera.preset + "'";
   }
-  if (camera.jpeg_quality < 1 || camera.jpeg_quality > 100) {
-    return where + "jpeg_quality must be between 1 and 100";
+  if (camera.crf < kMinCameraCrf || camera.crf > kMaxCameraCrf) {
+    return where + "crf must be from " + std::to_string(kMinCameraCrf) + " to " +
+           std::to_string(kMaxCameraCrf) + "; lower is higher quality and more bytes, got " +
+           std::to_string(camera.crf);
+  }
+  if (camera.max_bitrate_kbps < 0 || camera.max_bitrate_kbps > kMaxCameraBitrateKbps) {
+    return where + "max_bitrate_kbps must be 0 (no cap) or a number of kilobits per second up to " +
+           std::to_string(kMaxCameraBitrateKbps) + ", got " +
+           std::to_string(camera.max_bitrate_kbps);
   }
   if (camera.max_width_px < 0) {
     return where + "max_width_px must be 0 (never resize) or a positive width";
@@ -60,6 +63,15 @@ std::string ValidateCameraConfig(const CameraConfig& camera) {
            (camera.hfov_degrees == 0.0 ? "vfov_degrees" : "hfov_degrees") + " is set";
   }
   return ValidateQosOverride(camera.qos, "camera." + camera.name);
+}
+
+const char* const kFfmpegRemedy =
+    "Install it with `sudo apt install ffmpeg`, or set ffmpeg_path to a binary that runs and lists "
+    "the libx264 encoder";
+
+std::string FfmpegProblem(const std::string& ffmpeg_path, const std::string& why) {
+  return "ffmpeg_path '" + ffmpeg_path + "' cannot run as the camera encoder, so no camera can "
+         "record: " + why;
 }
 
 std::string ValidateLidarConfig(const LidarConfig& lidar) {

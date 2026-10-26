@@ -101,6 +101,7 @@ std::vector<std::pair<std::string, double>> UploadSeries(const c3d::Stats& stats
       {"c3d.serialization_failures", static_cast<double>(stats.serialization_failures)},
       {"c3d.spool_write_failures", static_cast<double>(stats.spool_write_failures)},
       {"c3d.thread_exceptions", static_cast<double>(stats.thread_exceptions)},
+      {"c3d.camera_access_units_dropped", static_cast<double>(stats.camera_access_units_dropped)},
   };
 }
 

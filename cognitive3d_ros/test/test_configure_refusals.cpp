@@ -137,8 +137,7 @@ TEST_F(ConfigureRefusals, ThresholdsAndIntervalsOutsideTheirRangeAreRefusedByNam
       {"relocalisation_jump_m", -1.0},       {"relocalisation_jump_m", 0.0},
       {"relocalisation_jump_m", kNaN},       {"relocalisation_jump_deg", -45.0},
       {"relocalisation_jump_deg", kNaN},     {"reference_frame_grace_s", -1.0},
-      {"reference_frame_grace_s", kNaN},     {"camera_flush_s", kNaN},
-      {"lidar_flush_s", kNaN},
+      {"reference_frame_grace_s", kNaN},
   };
   for (const auto& bad : refused) {
     const std::string refusal = RefusalWith(bad);
@@ -147,6 +146,39 @@ TEST_F(ConfigureRefusals, ThresholdsAndIntervalsOutsideTheirRangeAreRefusedByNam
   }
   EXPECT_EQ(RefusalWith({"reference_frame_grace_s", 0.0}), "")
       << "no grace is a choice: the fallback is adopted as soon as it resolves";
+}
+
+// A camera is encoded by the binary `ffmpeg_path` names, asked at configure: one that cannot run
+// would drop every frame while the run looked configured. The refusal names the binary and the
+// package to install.
+TEST_F(ConfigureRefusals, ACameraWithNoUsableFfmpegRefusesConfigureNamingThePackage) {
+  const std::string refusal = RefusalWith({"ffmpeg_path", std::string("/nonexistent/ffmpeg")});
+  EXPECT_EQ(refusal.rfind("ffmpeg_path '/nonexistent/ffmpeg'", 0), 0u) << refusal;
+  EXPECT_NE(refusal.find("sudo apt install ffmpeg"), std::string::npos) << refusal;
+  EXPECT_EQ(Configure(*node_), "") << "the shared node's own ffmpeg is the image's";
+
+  // Without a camera nothing runs it, so nothing is asked.
+  auto no_camera = MakeNode(DryRun({{"ffmpeg_path", std::string("/nonexistent/ffmpeg")}}));
+  EXPECT_EQ(Configure(*no_camera), "");
+}
+
+// A camera has no `jpeg_quality` or `format` field: a params file that carries one is refused as a
+// field the camera does not have, naming the fields it does, rather than configuring and applying
+// nothing of it.
+TEST_F(ConfigureRefusals, AJpegQualityKeyIsRefusedAsAFieldTheCameraNoLongerHas) {
+  for (const rclcpp::Parameter& gone : {rclcpp::Parameter("camera.front.jpeg_quality", 80),
+                                        rclcpp::Parameter("camera.front.format",
+                                                          std::string("jpeg"))}) {
+    auto parameters = SharedNodeParameters();
+    parameters.push_back(gone);
+    const auto node = MakeNode(parameters);
+    const std::string refusal = Configure(*node);
+    EXPECT_EQ(refusal.rfind(gone.get_name() + " is not a parameter: a camera's fields are ", 0),
+              0u)
+        << refusal;
+    EXPECT_NE(refusal.find("crf"), std::string::npos) << refusal;
+    EXPECT_NE(refusal.find("preset"), std::string::npos) << refusal;
+  }
 }
 
 // A camera's field of view is two full angles or none. One angle alone is half a frustum, and an

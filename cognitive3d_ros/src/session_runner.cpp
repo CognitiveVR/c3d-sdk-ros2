@@ -1,5 +1,7 @@
 #include "cognitive3d_ros/session_runner.hpp"
 
+#include <utility>
+
 #include "c3d/version.hpp"
 
 namespace cognitive3d_ros {
@@ -89,17 +91,20 @@ c3d::Pose ScanPlanePose(const c3d::Vec3& ros_position, const c3d::Quat& ros_rota
   return pose;
 }
 
-void SessionRunner::RecordCameraFrame(const std::string& camera_id, std::uint64_t time_ms,
-                                      std::uint32_t seq, const std::string& frame_id,
-                                      const c3d::Vec3& ros_position,
-                                      const c3d::Quat& ros_rotation, const std::string& format,
-                                      std::uint16_t width, std::uint16_t height,
-                                      const std::string& bytes, const c3d::CameraFov& fov) {
+void SessionRunner::RecordCameraAccessUnit(const std::string& camera_id, std::uint64_t time_ms,
+                                           std::uint32_t seq, const std::string& frame_id,
+                                           const c3d::Vec3& ros_position,
+                                           const c3d::Quat& ros_rotation,
+                                           c3d::VideoChunkContext context,
+                                           std::string access_unit, bool keyframe) {
   if (!session_) return;
+  c3d::SensorEntry entry;
+  entry.time_ms = time_ms;
+  entry.seq = seq;
+  entry.pose = ScenePose(ros_position, ros_rotation, convention_);
   // The field of view is two angles and no direction, so no convention applies to it.
-  session_->RecordCameraFrame(camera_id, time_ms, seq, frame_id,
-                              ScenePose(ros_position, ros_rotation, convention_), format,
-                              width, height, bytes, fov);
+  context.frame_id = frame_id;
+  session_->RecordCameraAccessUnit(camera_id, entry, context, std::move(access_unit), keyframe);
 }
 
 void SessionRunner::RecordLaserScan(const std::string& sensor_id, std::uint64_t time_ms,

@@ -123,6 +123,7 @@ TEST(UploadSeries, EveryCounterCoreKeepsHasItsOwnSeries) {
   stats.serialization_failures = 7;
   stats.spool_write_failures = 8;
   stats.thread_exceptions = 9;
+  stats.camera_access_units_dropped = 10;
   std::map<std::string, double> series;
   for (const auto& [name, value] : cognitive3d_ros::UploadSeries(stats)) {
     EXPECT_TRUE(series.emplace(name, value).second) << name << " twice";
@@ -133,7 +134,7 @@ TEST(UploadSeries, EveryCounterCoreKeepsHasItsOwnSeries) {
       {"c3d.chunks_deferred", 5.0},             {"c3d.upload_deferred_streams", 1.0},
       {"c3d.chunks_evicted", 6.0},
       {"c3d.serialization_failures", 7.0},      {"c3d.spool_write_failures", 8.0},
-      {"c3d.thread_exceptions", 9.0},
+      {"c3d.thread_exceptions", 9.0},          {"c3d.camera_access_units_dropped", 10.0},
   };
   EXPECT_EQ(series, expected);
 }

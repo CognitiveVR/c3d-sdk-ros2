@@ -15,6 +15,7 @@
 #include "c3d/environment.hpp"
 #include "c3d/version.hpp"
 #include "c3d/wall_clock.hpp"
+#include "cognitive3d_ros/media_config.hpp"
 #include "cognitive3d_ros/qos_resolver.hpp"
 #include <sstream>
 
@@ -326,10 +327,20 @@ Check CheckSpoolDirectory(const std::string& directory, bool writable, int orpha
   return {"spool directory", Severity::kOk, directory + " is writable", ""};
 }
 
+namespace {
+
+Check CameraEncoderRefused(const std::string& detail) {
+  return {"camera encoder", Severity::kFatal, detail,
+          std::string(kFfmpegRemedy) + ". Configure refuses for the same reason."};
+}
+
+}  // namespace
+
 std::vector<Check> ChecksForConfigurationRefusal(const std::string& configure_error) {
   std::vector<Check> checks;
   std::vector<std::string> unrecognised;
   bool recognised_any = false;
+  const std::string ffmpeg_remedy = std::string(". ") + kFfmpegRemedy;
 
   for (const std::string& problem : SplitConfigurationProblems(configure_error)) {
     // A refused configure never reaches the gathering layer, so these are the only route to the
@@ -343,6 +354,13 @@ std::vector<Check> ChecksForConfigurationRefusal(const std::string& configure_er
       recognised_any = true;
     } else if (problem == "spool_dir is empty") {
       checks.push_back(CheckSpoolDirectory("", true, 0));
+      recognised_any = true;
+    } else if (problem.size() > ffmpeg_remedy.size() &&
+               problem.compare(problem.size() - ffmpeg_remedy.size(), ffmpeg_remedy.size(),
+                               ffmpeg_remedy) == 0) {
+      // The node's refusal is the problem and the remedy joined; the check carries them apart.
+      checks.push_back(CameraEncoderRefused(problem.substr(0, problem.size() -
+                                                                  ffmpeg_remedy.size())));
       recognised_any = true;
     } else {
       unrecognised.push_back(problem);
@@ -1402,7 +1420,22 @@ Check CheckPoseChannel(const PoseChannelFacts& facts) {
           ""};
 }
 
+double EstimatedCameraBytesPerSecond(int width, int height, int crf, double rate_hz) {
+  const double pixels = static_cast<double>(width) * static_cast<double>(height);
+  return 5120.0 * pixels / (640.0 * 480.0) * std::pow(2.0, (28.0 - crf) / 4.0) * rate_hz;
+}
+
 namespace {
+
+// A lidar's measured sample, or a camera's estimate, at its rate; 0 when there is neither.
+double SensorBytesPerSecond(const MediaSensorFacts& facts) {
+  if (!facts.sample_seen) return 0.0;
+  if (facts.kind == "camera") {
+    return EstimatedCameraBytesPerSecond(facts.prepared_width, facts.prepared_height, facts.crf,
+                                         facts.rate_hz);
+  }
+  return static_cast<double>(facts.encoded_bytes) * facts.rate_hz;
+}
 
 std::string Bytes(std::uint64_t n) {
   std::ostringstream os;
@@ -1467,34 +1500,29 @@ Check CheckMediaSensor(const MediaSensorFacts& facts) {
         "`ros2 topic hz " + facts.topic + "`.";
     return check;
   }
-  if (facts.encoded_bytes == 0) {
+  const bool camera = facts.kind == "camera";
+  if (camera ? facts.prepared_width == 0 : facts.encoded_bytes == 0) {
     check.severity = Severity::kFatal;
-    check.detail = "a sample arrived and could not be encoded: " + facts.encode_error;
+    check.detail = std::string("a sample arrived and could not be ") +
+                   (camera ? "prepared" : "encoded") + ": " + facts.encode_error;
     check.remedy = "nothing from this sensor would reach a session. Fix the topic or the "
                    "configuration named above.";
     return check;
   }
 
   std::ostringstream detail;
-  detail << facts.topic << " [" << facts.type << "] qos=" << facts.qos << " frame=" << facts.frame
-         << ", one sample encodes to " << Bytes(facts.encoded_bytes) << " -- about "
-         << Bytes(static_cast<std::uint64_t>(static_cast<double>(facts.encoded_bytes) *
-                                             facts.rate_hz))
-         << "/s at " << facts.rate_hz << " Hz";
-  check.detail = detail.str();
-
-  if (facts.encoded_bytes > kMediaRecordWarnBytes) {
-    check.severity = Severity::kAdvisory;
-    check.remedy =
-        "one " + facts.kind + " record from " + facts.name + " is " +
-        Bytes(facts.encoded_bytes) +
-        ", near or over the 1 MiB the platform stores per frame or scan -- and a record over it "
-        "is dropped AFTER the upload answered 200. Nothing downstream reports that. " +
-        (facts.kind == "camera"
-             ? std::string("Lower max_width_px or jpeg_quality.")
-             : std::string("Lower max_points, or raise voxel_leaf_m, or drop the per-point "
-                           "attributes: position: int16_mm and color: none halve a cloud."));
+  detail << facts.topic << " [" << facts.type << "] qos=" << facts.qos << " frame=" << facts.frame;
+  if (camera) {
+    detail << ", one frame prepares to " << facts.prepared_width << "x" << facts.prepared_height
+           << "; about " << Bytes(static_cast<std::uint64_t>(SensorBytesPerSecond(facts)))
+           << "/s estimated (from that size, crf " << facts.crf << " and " << facts.rate_hz
+           << " Hz, by a model fitted to recorded footage; not measured on this camera)";
+  } else {
+    detail << ", one sample encodes to " << Bytes(facts.encoded_bytes) << " -- about "
+           << Bytes(static_cast<std::uint64_t>(SensorBytesPerSecond(facts))) << "/s at "
+           << facts.rate_hz << " Hz";
   }
+  check.detail = detail.str();
   return check;
 }
 
@@ -1649,14 +1677,15 @@ Check CheckMediaBandwidth(const std::vector<MediaSensorFacts>& facts) {
   double total = 0.0;
   int measured = 0;
   for (const auto& sensor : facts) {
-    if (!sensor.sample_seen || sensor.encoded_bytes == 0) continue;
-    total += static_cast<double>(sensor.encoded_bytes) * sensor.rate_hz;
+    const double rate = SensorBytesPerSecond(sensor);
+    if (rate <= 0.0) continue;
+    total += rate;
     ++measured;
   }
   if (measured == 0) {
     check.name = "camera/lidar bandwidth (NOT CHECKED)";
     check.detail = facts.empty() ? "no cameras or lidars are configured"
-                                 : "no sample was encoded, so there is nothing to size";
+                                 : "no sample was prepared or encoded, so there is nothing to size";
     return check;
   }
 
@@ -1668,9 +1697,20 @@ Check CheckMediaBandwidth(const std::vector<MediaSensorFacts>& facts) {
     check.severity = Severity::kAdvisory;
     check.remedy =
         "nothing on the platform rate-limits this, so the configuration IS the limit. Lower "
-        "rate_hz, max_width_px or jpeg_quality, or raise the point cloud's voxel_leaf_m.";
+        "rate_hz or max_width_px, raise a camera's crf, or raise the point cloud's voxel_leaf_m.";
   }
   return check;
+}
+
+Check CheckCameraEncoder(const CameraEncoderFacts& facts) {
+  if (facts.cameras == 0) {
+    return {"camera encoder (NOT CHECKED)", Severity::kOk,
+            "no camera is configured, so nothing runs " + facts.ffmpeg_path, ""};
+  }
+  if (!facts.problem.empty()) {
+    return CameraEncoderRefused(FfmpegProblem(facts.ffmpeg_path, facts.problem));
+  }
+  return {"camera encoder", Severity::kOk, facts.ffmpeg_path + ": " + facts.version, ""};
 }
 
 std::string Render(const std::vector<Check>& checks, const std::string& runtime) {
