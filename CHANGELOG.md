@@ -8,6 +8,47 @@ marks as provisional may change in a minor release, and its entry here says how 
 
 ## [Unreleased]
 
+### Added
+
+- `ffmpeg_path`, the encoder binary, default `ffmpeg`, and per camera `camera.<name>.preset`,
+  `camera.<name>.crf` and `camera.<name>.max_bitrate_kbps`, up to 1,000,000.
+- Session properties per camera `c3d.ros.camera.<name>.codec`, `.preset`, `.crf`,
+  `.max_bitrate_kilobits_per_second` and `.chunk_seconds`, and per `PointCloud2` lidar
+  `c3d.ros.lidar.<name>.pointcloud.encoding`, the encoding the clouds are written in.
+- Health series per camera, `dropped_backlog`, `dropped_at_stop`, `encoder_restarts`,
+  `gap_restarts` and `dropped_no_session`, as `c3d.camera.<name>.<series>`, and
+  `c3d.camera_access_units_dropped`.
+- `doctor`'s `camera encoder` check, which is FATAL when a camera is configured and `ffmpeg` cannot
+  run. Its `camera/<name>` check reports an estimated size and rate.
+
+### Changed
+
+- **BREAKING:** Camera frames are stored as 3 second H.264 chunks, encoded by the host's `ffmpeg`,
+  not as JPEG frames. `camera.<name>.format` and `camera.<name>.jpeg_quality` are removed, and
+  configure now refuses a params file that sets either, naming the key, so a node configured with
+  them does not start. The session properties of the same names are removed too. Migrate: delete
+  both keys, set `preset` and `crf` if you want other than `ultrafast` and `28`, and install
+  `ffmpeg`.
+- **BREAKING:** Laser scans are stored as blocks of 3 seconds of uint16 codes, 1 mm up to a
+  `range_max` of 65 m and 1 cm beyond, delta coded, byte shuffled and compressed with zstd, and a
+  scan with more than 65,535 rays is refused. Migrate: read `ScanBlock` as
+  [Data format](docs/data-format.md#laser-scan-blocks) describes.
+- **BREAKING:** Point clouds are delta coded per plane and packed into objects that close at 2 MiB or 5
+  seconds, a single cloud over 2 MiB being an object of its own, and `lidar.<name>.pointcloud.zstd_level` defaults to 3, up from 1. Migrate: read
+  `CloudBlock` as [Data format](docs/data-format.md#point-cloud-objects) describes, and set
+  `zstd_level: 1` to keep the old level.
+- **BREAKING:** `camera_flush_s`, `camera_flush_bytes`, `lidar_flush_s` and `lidar_flush_bytes` are
+  removed: a chunk, a block or an object closes by its own rule. Migrate: delete them.
+- **BREAKING:** The camera and lidar payloads carry `formatVersion` `"2.0"`, under the schemas
+  `CameraPayload` with `FrameMeta`, and `LidarPayload` with `ScanBlock` and `CloudBlock`. Migrate:
+  deploy a gateway that reads them before this release; one that does not cannot read the
+  camera and lidar streams.
+- A camera on a `CompressedImage` topic is decoded and encoded again as H.264. Its JPEG is no
+  longer stored as published, so a compressed topic now costs the CPU of a decode as well as the
+  encode.
+- `doctor` no longer warns about an encoded camera or lidar record over 900 KiB: a chunk, a block
+  or an object closes by its own rule.
+
 ## [1.1.0] - 2026-10-13
 
 ### Changed

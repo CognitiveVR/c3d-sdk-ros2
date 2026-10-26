@@ -50,8 +50,10 @@ Before you start:
   ROS packages they depend on without a version, so apt installs the ones the robot lacks and
   leaves the installed ones as they are. Only the SDK's own packages require an exact version, of
   one another.
-- Keep Ubuntu's `universe` component enabled. The Cap'n Proto runtime library comes from it, and
-  stock Ubuntu and the official ROS images enable it.
+- Keep Ubuntu's `universe` component enabled. The Cap'n Proto runtime library and `ffmpeg` come
+  from it, and stock Ubuntu and the official ROS images enable it. The `cognitive3d-ros` deb
+  depends on `ffmpeg`, the camera encoder, so apt installs it with the SDK. On a machine that
+  already has OpenCV, which `cv_bridge` brings, it adds about 100 MB.
 
 This downloads the three packages for the machine you run it on, checks them against `SHA256SUMS`,
 previews the install and then installs them:
@@ -139,9 +141,13 @@ installation, with `--no-install-recommends`:
 | Humble | about 280 packages, 181 MB download, 721 MB on disk | 738 MB on disk |
 | Jazzy | about 280 packages, 192 MB download, 811 MB on disk | 852 MB on disk |
 
-Plan for roughly 720 to 850 MB of free space. On a robot that boots from an SD card, check the
+These figures were measured before `cognitive3d_ros` depended on `ffmpeg`, the camera encoder. Measured by apt simulation on arm64, it adds 85 MB on Ubuntu 22.04, 106 MB on Ubuntu 24.04
+and 108 MB on Debian trixie when OpenCV is already installed, as it is here, because only its
+filter and device libraries are new; on a bare OS it adds 387 to 676 MB.
+
+Plan for roughly 800 to 960 MB of free space. On a robot that boots from an SD card, check the
 free space before you install. If your robot already has `cv_bridge` installed, for example for a
-camera driver, most of that space is already used and the SDK adds little. The three debs
+camera driver, most of that space is already used and the SDK adds little beyond `ffmpeg`'s 85 to 108 MB. The three debs
 themselves are under 1 MB together.
 
 Leave out `--no-install-recommends` and apt also installs every recommended package, which is
@@ -156,8 +162,13 @@ Cap'n Proto has no rosdep key, so rosdep cannot install it. Install it by name f
 
 ```bash
 sudo apt update
-sudo apt install capnproto libcapnp-dev
+sudo apt install capnproto libcapnp-dev ffmpeg
 ```
+
+`ffmpeg` is the camera encoder: the node runs it as a child process to encode camera frames as
+H.264, and does not link it. It is needed only when a camera is configured. On a machine that
+already has OpenCV, which `cv_bridge` brings, it adds about 100 MB, because the codec libraries
+are already installed and what it adds is mostly its filter and device libraries.
 
 Then install colcon and rosdep, if you do not have them, and initialize rosdep once per machine:
 
@@ -186,7 +197,9 @@ Nav2 package, add `--skip-keys nav2_msgs` to the `rosdep install` line and
 `--packages-skip cognitive3d_ros_nav2` to the `colcon build` line.
 
 A missing Cap'n Proto shows up as a CMake error from `find_package(CapnProto)` while
-`cognitive3d_ros` configures.
+`cognitive3d_ros` configures. A missing `ffmpeg` does not stop the build: it stops a node with a
+camera configured at configure, naming the package, and `doctor`'s `camera encoder` check says so
+before that.
 
 ## Check the install
 

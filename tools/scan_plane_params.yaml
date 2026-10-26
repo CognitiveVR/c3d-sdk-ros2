@@ -35,12 +35,9 @@
         topic: "/fake/camera/image_raw"
         rate_hz: 2.0
         max_width_px: 160
-        jpeg_quality: 70
     lidars: ["scan"]
     lidar:
       scan:
         topic: "/fake/scan"
         rate_hz: 2.0
         intensities: true
-    camera_flush_s: 2.0
-    lidar_flush_s: 2.0

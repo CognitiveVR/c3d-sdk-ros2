@@ -82,6 +82,200 @@ BLOCK_RGB332 = bytes.fromhex(
     '92 ff'               # C: 0x92, 0xFF
     '07 08')              # I: 7, 8
 
+# BLOCK_INT16 with planarDeltaShuffleZstd's position transform: each plane as the differences
+# between consecutive points (int16 wrap, the first against 0), low bytes then high bytes. The
+# colour and intensity planes are unchanged.
+BLOCK_INT16_DELTA = bytes.fromhex(
+    'e854c3 03f289'       # X deltas: 1000, -3500, 35267 wrapping to -30269
+    '00f40b 0001fe'       # Y deltas: 0, 500, -501
+    'fa0600 00ff80'       # Z deltas: 250, -250, -32768
+    '0000 ffff 1084'
+    '00 80 ff')
+
+# 1 point, same format: (7, -7, 0) mm, colour 0x8410, intensity 42. One value per plane is its own
+# delta, so the transformed block is the plain one.
+BLOCK_ONE_POINT = bytes.fromhex('0700 f9ff 0000 1084 2a')
+
+# Two scans of four rays. Range codes: 1000, 0xFFFF (+inf), 0xFFFE (NaN), 2000, then
+# 0x0000 (-inf), 1500, 1501, 1499.
+SCAN_RANGES_UINT16 = bytes.fromhex('e803 ffff feff d007' '0000 dc05 dd05 db05')
+# The same codes as deltaShuffleZstd before the zstd: per scan, each code minus the previous
+# ray's (ray 0 against 0), then the low byte of every value, then the high byte of every value.
+SCAN_RANGES_SHUFFLED = bytes.fromhex(
+    'e817ffd2 00dc01fe'   # low bytes of 0x03E8 0xFC17 0xFFFF 0x07D2 | 0x0000 0x05DC 0x0001 0xFFFE
+    '03fcff07 000500ff')  # high bytes
+SCAN_RANGE_CODES = [1000, 0xFFFF, 0xFFFE, 2000, 0, 1500, 1501, 1499]
+# Intensity codes 7, 8, 9, 10, then 100 four times, in both layouts.
+SCAN_INTENSITIES_UINT16 = bytes.fromhex('0700 0800 0900 0a00' '6400 6400 6400 6400')
+SCAN_INTENSITIES_SHUFFLED = bytes.fromhex('07010101 64000000' '00000000 00000000')
+
+# One chunk's stream, as x264 writes it with four-byte start codes: an IDR frame's access unit
+# (delimiter, SPS, PPS, IDR slice), then a P frame's (delimiter, non-IDR slice).
+ACCESS_UNIT_IDR = bytes.fromhex(
+    '00000001 0910' '00000001 6742c01eaabb' '00000001 68ce3c80' '00000001 65888421')
+ACCESS_UNIT_P = bytes.fromhex('00000001 0910' '00000001 419a02')
+
+
+class InverseDeltaShuffle(unittest.TestCase):
+    def test_inverse_delta_shuffle_recovers_a_hand_worked_block(self):
+        data = bytes.fromhex('0A 02 FF 05 00 FA 00 00 FF 00 00 FF')
+        self.assertEqual(dump.inverse_delta_shuffle(data, 3), [10, 12, 11, 5, 5, 65535])
+
+
+class DequantiseRange(unittest.TestCase):
+    def test_dequantise_restores_the_sentinels(self):
+        self.assertEqual(dump.dequantise_range(0xFFFF, 'millimetre'), math.inf)
+        self.assertTrue(math.isnan(dump.dequantise_range(0xFFFE, 'centimetre')))
+        self.assertEqual(dump.dequantise_range(0, 'millimetre'), -math.inf)
+        self.assertAlmostEqual(dump.dequantise_range(12345, 'millimetre'), 12.345)
+        self.assertAlmostEqual(dump.dequantise_range(1234, 'centimetre'), 12.34)
+
+
+class NalUnits(unittest.TestCase):
+    def test_split_nal_units_sees_both_start_codes(self):
+        data = bytes.fromhex('00000001 67aabb 000001 68cc 000001 65ddeeff')
+        self.assertEqual(dump.split_nal_units(data), [(7, 0, 7), (8, 7, 5), (5, 12, 7)])
+
+    def test_a_unit_cut_off_after_its_start_code_has_no_type(self):
+        # At the end of the data, and before the next start code: neither has a header byte.
+        self.assertEqual(dump.split_nal_units(bytes.fromhex('00000001 0910 00000001')),
+                         [(9, 0, 6), (None, 6, 4)])
+        self.assertEqual(dump.split_nal_units(bytes.fromhex('000001 00000001 65aa')),
+                         [(None, 0, 3), (5, 3, 6)])
+
+
+class AvcC(unittest.TestCase):
+    def test_parse_avcc_reads_profile_and_parameter_sets(self):
+        sps = bytes.fromhex('67 42 C0 1E AA BB')
+        pps = bytes.fromhex('68 CE 3C 80')
+        record = (bytes([1, 0x42, 0xC0, 0x1E, 0xFF, 0xE1]) + len(sps).to_bytes(2, 'big') + sps
+                  + bytes([1]) + len(pps).to_bytes(2, 'big') + pps + b'\xFD\xF8\xF8\x00')
+        parsed = dump.parse_avcc(record)
+        self.assertEqual((parsed['profile'], parsed['level']), (0x42, 0x1E))
+        self.assertEqual((parsed['sps'], parsed['pps']), (sps, pps))
+
+
+class PlanarDeltaShuffle(unittest.TestCase):
+    def test_inverse_delta_shuffle_planes_round_trips(self):
+        plain = bytes.fromhex(
+            '0100 0400 0700'      # X: 1, 4, 7
+            '0200 0500 0800'      # Y: 2, 5, 8
+            '0300 0600 0900'      # Z: 3, 6, 9
+            'ff0000 00ff00 0000ff'
+            '0a141e')
+        transformed = bytes.fromhex(
+            '010303 000000'       # X deltas 1,3,3: low bytes, then high bytes
+            '020303 000000'
+            '030303 000000'
+            'ff0000 00ff00 0000ff'
+            '0a141e')
+        self.assertEqual(dump.inverse_delta_shuffle_planes(transformed, 3, 2), plain)
+        self.assertEqual(dump.inverse_delta_shuffle_planes(plain, 3, 4), plain)
+        wrapping = bytes.fromhex('ff7f 0080 0000' + '0000 0000 0000' * 2)
+        wrapped = bytes.fromhex('ff0100 7f0080' + '000000 000000' * 2)
+        self.assertEqual(dump.inverse_delta_shuffle_planes(wrapped, 3, 2), wrapping)
+
+
+class AccessUnits(unittest.TestCase):
+    def test_each_access_unit_lists_its_nal_types_after_the_delimiter(self):
+        self.assertEqual(dump.access_unit_json(ACCESS_UNIT_IDR),
+                         {'nalTypes': [9, 7, 8, 5], 'startsWithAud': True})
+        self.assertEqual(dump.access_unit_json(ACCESS_UNIT_P),
+                         {'nalTypes': [9, 1], 'startsWithAud': True})
+
+    def test_an_access_unit_that_does_not_open_on_a_delimiter_says_so(self):
+        cases = {
+            'no delimiter at all': ACCESS_UNIT_P[6:],
+            'a stray byte before the delimiter': b'\xab' + ACCESS_UNIT_P,
+            # Two bytes late: the delimiter's start code is broken, and the SPS comes first.
+            'sliced two bytes late': ACCESS_UNIT_IDR[2:],
+            'empty': b'',
+        }
+        for name, unit in cases.items():
+            with self.subTest(name):
+                self.assertFalse(dump.access_unit_json(unit)['startsWithAud'])
+
+
+class OffsetsTile(unittest.TestCase):
+    def test_spans_back_to_back_from_zero_to_the_last_byte_tile(self):
+        self.assertTrue(dump.offsets_tile([(0, 32), (32, 13)], 45))
+        self.assertTrue(dump.offsets_tile([], 0))
+
+    def test_a_gap_an_overlap_a_late_start_or_an_unowned_tail_does_not_tile(self):
+        cases = {
+            'gap': ([(0, 32), (33, 12)], 45),
+            'overlap': ([(0, 32), (31, 14)], 45),
+            'late start': ([(1, 31), (32, 13)], 45),
+            'unowned tail': ([(0, 32), (32, 13)], 46),
+            'no frames over bytes': ([], 45),
+        }
+        for name, (spans, total) in cases.items():
+            with self.subTest(name):
+                self.assertFalse(dump.offsets_tile(spans, total))
+
+
+class ScanCodes(unittest.TestCase):
+    def test_uint16_codes_are_read_scan_major_little_endian(self):
+        self.assertEqual(dump.decode_scan_codes(SCAN_RANGES_UINT16, 4, 'uint16'), SCAN_RANGE_CODES)
+
+    @NEEDS_ZSTANDARD
+    def test_a_delta_shuffled_block_is_decompressed_and_summed_per_scan(self):
+        compressed = zstandard.ZstdCompressor(level=1).compress(SCAN_RANGES_SHUFFLED)
+        self.assertEqual(dump.decode_scan_codes(compressed, 4, 'deltaShuffleZstd'),
+                         SCAN_RANGE_CODES)
+
+    def test_an_empty_field_needs_no_zstandard(self):
+        # `intensities` is empty unless configured, and reading a block without them must not
+        # depend on the one package a scan needs only to decompress something.
+        with unittest.mock.patch.dict(sys.modules, {'zstandard': None}):
+            self.assertEqual(dump.decode_scan_codes(b'', 4, 'deltaShuffleZstd'), [])
+
+    def test_an_encoding_that_is_neither_enumerant_is_refused(self):
+        with self.assertRaises(ValueError):
+            dump.decode_scan_codes(SCAN_RANGES_UINT16, 4, 'zstd')
+
+
+class CloudDecode(unittest.TestCase):
+    FORMAT = ('int16_mm', 'rgb565', 'uint8')
+
+    def plain_points(self):
+        points, consistent = dump.decode_planar_block(BLOCK_INT16, 3, *self.FORMAT)
+        self.assertTrue(consistent)
+        return points
+
+    def test_delta_shuffled_positions_come_back_as_the_plain_block(self):
+        points, consistent = dump.decode_cloud(
+            BLOCK_INT16_DELTA, 0, len(BLOCK_INT16_DELTA), 3, *self.FORMAT,
+            'planarDeltaShuffleZstd', 0)
+        self.assertTrue(consistent)
+        self.assertEqual(points, self.plain_points())
+
+    def test_planar_zstd_positions_are_not_transformed(self):
+        points, consistent = dump.decode_cloud(
+            BLOCK_INT16, 0, len(BLOCK_INT16), 3, *self.FORMAT, 'planarZstd', 0)
+        self.assertTrue(consistent)
+        self.assertEqual(points, self.plain_points())
+
+    def test_each_cloud_is_read_from_its_own_slice(self):
+        data = BLOCK_INT16_DELTA + BLOCK_ONE_POINT
+        points, consistent = dump.decode_cloud(
+            data, len(BLOCK_INT16_DELTA), len(BLOCK_ONE_POINT), 1, *self.FORMAT,
+            'planarDeltaShuffleZstd', 0)
+        self.assertTrue(consistent)
+        self.assertEqual([dump.point_json(point) for point in points],
+                         [[0.007, -0.007, 0.0, [132, 130, 132], 42]])
+
+    def test_a_slice_past_the_end_of_data_is_not_consistent(self):
+        _points, consistent = dump.decode_cloud(
+            BLOCK_INT16, 0, len(BLOCK_INT16) + 4, 3, *self.FORMAT, 'planarZstd', 0)
+        self.assertFalse(consistent)
+
+    def test_a_short_delta_block_is_read_as_it_stands_and_is_not_consistent(self):
+        points, consistent = dump.decode_cloud(
+            BLOCK_INT16_DELTA[:10], 0, 10, 3, *self.FORMAT, 'planarDeltaShuffleZstd', 0)
+        self.assertFalse(consistent)
+        self.assertEqual(len(points), 1)
+
 
 class StreamFromFilename(unittest.TestCase):
     def test_the_two_capture_suffixes(self):
@@ -290,15 +484,15 @@ class Decompression(unittest.TestCase):
         self.assertEqual(dump.decompress_block(compressed, 3), BLOCK_INT16)
 
 
-class JpegFilename(unittest.TestCase):
-    def test_the_four_components_in_order(self):
-        self.assertEqual(dump.jpeg_filename('1757000000_robot7', 'front', 4, 11),
-                         '1757000000_robot7-front-4-11.jpg')
+class H264Filename(unittest.TestCase):
+    def test_the_three_components_in_order(self):
+        self.assertEqual(dump.h264_filename('1757000000_robot7', 'front', 4),
+                         '1757000000_robot7-front-4.h264')
 
     def test_payload_text_cannot_steer_the_path(self):
-        name = dump.jpeg_filename('../../etc', 'a/b', 1, 2)
+        name = dump.h264_filename('../../etc', 'a/b', 2)
         self.assertNotIn('/', name)
-        self.assertEqual(name, '.._.._etc-a_b-1-2.jpg')
+        self.assertEqual(name, '.._.._etc-a_b-2.h264')
 
 
 class CommandLine(unittest.TestCase):
@@ -317,89 +511,118 @@ class CommandLine(unittest.TestCase):
 class RoundTripThroughTheSchemas(unittest.TestCase):
     """Build a payload with pycapnp, pack it, and read it back through the CLI."""
 
+    HEADER = {
+        'userId': 'robot7',
+        'sessionId': '1757000000_robot7',
+        'sceneId': 'd3b07384-d9a0-4c9b-8f1e-000000000001',
+        'sceneVersion': 3,
+        'formatVersion': '2.0',
+        'sessionStartMs': 1757000000123,
+        'sdkVersion': '2.0.0',
+    }
+
     def setUp(self):
         self.directory = pathlib.Path(tempfile.mkdtemp())
         self.camera, self.lidar = dump.load_schemas(dump.SCHEMA_DIR)
 
     def write_header(self, payload):
-        payload.userId = 'robot7'
-        payload.sessionId = '1757000000_robot7'
-        payload.sceneId = 'd3b07384-d9a0-4c9b-8f1e-000000000001'
-        payload.sceneVersion = 3
-        payload.formatVersion = '1.0'
-        payload.sessionStartMs = 1757000000123
-        payload.sdkVersion = '1.2.0'
-        payload.part = 4
+        for field, value in self.HEADER.items():
+            setattr(payload, field, value)
 
-    def camera_capture(self):
+    def write_capture(self, payload, name):
+        path = self.directory / name
+        path.write_bytes(payload.to_bytes_packed())
+        return path
+
+    def camera_capture(self, name='000007-camera.bin', keyframes=(True, False), gap=b''):
+        """One chunk of an IDR frame then a P frame, flagged `keyframes`, with `gap` between."""
         payload = self.camera.CameraPayload.new_message()
         self.write_header(payload)
+        payload.cameraId = 'front'
+        payload.seq = 4
+        payload.startMs = 1757000001000
+        payload.endMs = 1757000001500
+        payload.codec = 'h264'
+        payload.width = 160
+        payload.height = 120
+        payload.nominalFps = 2.0
+        payload.frameId = 'camera_link'
+        payload.hfovDegrees = 61.0
+        payload.vfovDegrees = 45.5
         frames = payload.init('frames', 2)
-        frames[0].cameraId = 'front'
         frames[0].time = 1757000001000
         frames[0].seq = 11
-        frames[0].frameId = 'camera_link'
         frames[0].pose.px = 1.5
         frames[0].pose.pz = -0.25
         frames[0].pose.qz = 0.5
         frames[0].pose.qw = 0.8660254
-        frames[0].format = 'jpeg'
-        frames[0].width = 320
-        frames[0].height = 240
-        frames[0].hfovDegrees = 61.0
-        frames[0].vfovDegrees = 45.5
-        frames[0].data = b'\xff\xd8\xff\xe0 pretend jpeg'
-        frames[1].cameraId = 'rear'
-        frames[1].time = 1757000001200
+        frames[0].byteOffset = 0
+        frames[0].byteLength = len(ACCESS_UNIT_IDR)
+        frames[0].keyframe = keyframes[0]
+        frames[1].time = 1757000001500
         frames[1].seq = 12
-        frames[1].frameId = 'camera_link'
-        frames[1].format = 'jpeg'
-        frames[1].width = 64
-        frames[1].height = 48
-        frames[1].data = b'no marker here'
-        path = self.directory / '000007-camera.bin'
-        path.write_bytes(payload.to_bytes_packed())
-        return path
+        frames[1].byteOffset = len(ACCESS_UNIT_IDR) + len(gap)
+        frames[1].byteLength = len(ACCESS_UNIT_P)
+        frames[1].keyframe = keyframes[1]
+        payload.data = ACCESS_UNIT_IDR + gap + ACCESS_UNIT_P
+        return self.write_capture(payload, name)
 
-    def lidar_capture(self):
+    def scan_capture(self, encoding, ranges, intensities, name='000008-lidar.bin'):
+        """Two scans of four rays, with their codes already laid out as `encoding` says."""
         payload = self.lidar.LidarPayload.new_message()
         self.write_header(payload)
-        scans = payload.init('scans', 2)
-        scans[0].sensorId = 'scan'
-        scans[0].time = 1757000002000
-        scans[0].seq = 5
-        scans[0].frameId = 'base_scan'
-        laserscan = scans[0].init('laserscan')
-        laserscan.angleMin = -math.pi
-        laserscan.angleMax = math.pi
-        laserscan.angleIncrement = 2 * math.pi / 4
-        laserscan.timeIncrement = 0.0001
-        laserscan.scanTime = 0.2
-        laserscan.rangeMin = 0.1
-        laserscan.rangeMax = 12.0
-        ranges = laserscan.init('ranges', 4)
-        ranges[0] = 1.0
-        ranges[1] = math.inf
-        ranges[2] = math.nan
-        ranges[3] = 2.0
-        intensities = laserscan.init('intensities', 2)
-        intensities[0] = 7.0
-        intensities[1] = 8.0
-        scans[1].sensorId = 'points'
-        scans[1].time = 1757000002500
-        scans[1].seq = 6
-        scans[1].frameId = 'base_link'
-        cloud = scans[1].init('pointcloud')
-        cloud.pointCount = 3
-        cloud.position = 'int16_mm'
-        cloud.color = 'rgb565'
-        cloud.intensity = 'uint8'
-        cloud.voxelLeafMm = 50
-        cloud.zstdLevel = 0
-        cloud.data = BLOCK_INT16
-        path = self.directory / '000008-lidar.bin'
-        path.write_bytes(payload.to_bytes_packed())
-        return path
+        payload.sensorId = 'scan'
+        payload.seq = 2
+        payload.startMs = 1757000002000
+        payload.endMs = 1757000002500
+        payload.frameId = 'base_scan'
+        block = payload.init('scans')
+        block.angleMin = -math.pi
+        block.angleMax = math.pi
+        block.angleIncrement = 2 * math.pi / 4
+        block.rangeMin = 0.1
+        block.rangeMax = 12.0
+        block.rays = 4
+        block.rangeUnit = 'millimetre'
+        block.encoding = encoding
+        entries = block.init('entries', 2)
+        for index in range(2):
+            entries[index].time = 1757000002000 + 500 * index
+            entries[index].seq = 5 + index
+            entries[index].pose.px = 0.25 * (index + 1)
+            entries[index].timeIncrement = 0.0001 * (index + 1)
+            entries[index].scanTime = 0.25 * (index + 1)
+        block.ranges = ranges
+        block.intensities = intensities
+        return self.write_capture(payload, name)
+
+    def cloud_capture(self, clouds, encoding='planarZstd', zstd_level=0, color='rgb565',
+                      intensity='uint8', name='000009-lidar.bin'):
+        """`clouds` is `(pointCount, block as stored)` per cloud, laid back to back in `data`."""
+        payload = self.lidar.LidarPayload.new_message()
+        self.write_header(payload)
+        payload.sensorId = 'depth'
+        payload.startMs = 1757000003000
+        payload.endMs = 1757000003000 + 1000 * (len(clouds) - 1)
+        payload.frameId = 'base_link'
+        block = payload.init('clouds')
+        block.position = 'int16_mm'
+        block.color = color
+        block.intensity = intensity
+        block.voxelLeafMm = 50
+        block.encoding = encoding
+        block.zstdLevel = zstd_level
+        entries = block.init('entries', len(clouds))
+        offset = 0
+        for index, (count, stored) in enumerate(clouds):
+            entries[index].time = 1757000003000 + 1000 * index
+            entries[index].seq = index
+            entries[index].pointCount = count
+            entries[index].byteOffset = offset
+            entries[index].byteLength = len(stored)
+            offset += len(stored)
+        block.data = b''.join(stored for _count, stored in clouds)
+        return self.write_capture(payload, name)
 
     def run_cli(self, arguments):
         stdout = io.StringIO()
@@ -407,112 +630,167 @@ class RoundTripThroughTheSchemas(unittest.TestCase):
             self.assertEqual(dump.main(arguments), 0)
         return json.loads(stdout.getvalue())
 
+    def assertDecodedScans(self, entries):
+        """The two scans' ranges and intensities, from the codes the fixtures carry."""
+        first, second = entries
+        self.assertEqual(first['ranges'][0], 1.0)
+        self.assertEqual(first['ranges'][1], math.inf)
+        self.assertTrue(math.isnan(first['ranges'][2]))
+        self.assertEqual(first['ranges'][3], 2.0)
+        self.assertEqual(second['ranges'][0], -math.inf)
+        for got, want in zip(second['ranges'][1:], (1.5, 1.501, 1.499)):
+            self.assertAlmostEqual(got, want, places=9)
+        self.assertEqual(first['intensities'], [7, 8, 9, 10])
+        self.assertEqual(second['intensities'], [100, 100, 100, 100])
+
     def test_both_captures_decode_into_one_document(self):
         camera_path = self.camera_capture()
-        lidar_path = self.lidar_capture()
-        document = self.run_cli([str(camera_path), str(lidar_path)])
+        scan_path = self.scan_capture('uint16', SCAN_RANGES_UINT16, SCAN_INTENSITIES_UINT16)
+        cloud_path = self.cloud_capture([(3, BLOCK_INT16)])
+        document = self.run_cli([str(camera_path), str(scan_path), str(cloud_path)])
 
-        self.assertEqual([entry['stream'] for entry in document['files']], ['camera', 'lidar'])
-        camera_entry, lidar_entry = document['files']
-        self.assertEqual(camera_entry['file'], str(camera_path))
-        self.assertEqual(camera_entry['bytes'], camera_path.stat().st_size)
-        self.assertEqual(camera_entry['header'], {
-            'userId': 'robot7',
-            'sessionId': '1757000000_robot7',
-            'sceneId': 'd3b07384-d9a0-4c9b-8f1e-000000000001',
-            'sceneVersion': 3,
-            'formatVersion': '1.0',
-            'sessionStartMs': 1757000000123,
-            'sdkVersion': '1.2.0',
-            'part': 4,
-        })
+        self.assertEqual([entry['stream'] for entry in document['files']],
+                         ['camera', 'lidar', 'lidar'])
+        chunk, scans, clouds = document['files']
+        self.assertEqual(chunk['file'], str(camera_path))
+        self.assertEqual(chunk['bytes'], camera_path.stat().st_size)
+        for entry in document['files']:
+            self.assertEqual(entry['header'], self.HEADER)
 
-        first, second = camera_entry['frames']
-        self.assertEqual(first['cameraId'], 'front')
-        self.assertEqual(first['seq'], 11)
-        self.assertEqual(first['frameId'], 'camera_link')
-        self.assertEqual((first['width'], first['height']), (320, 240))
-        self.assertEqual(first['format'], 'jpeg')
-        self.assertEqual(first['dataBytes'], len(b'\xff\xd8\xff\xe0 pretend jpeg'))
-        self.assertTrue(first['jpegSoi'])
+        self.assertEqual(
+            {key: chunk[key] for key in ('cameraId', 'seq', 'startMs', 'endMs', 'codec', 'width',
+                                         'height', 'nominalFps', 'frameId', 'hfovDegrees',
+                                         'vfovDegrees', 'dataBytes')},
+            {'cameraId': 'front', 'seq': 4, 'startMs': 1757000001000, 'endMs': 1757000001500,
+             'codec': 'h264', 'width': 160, 'height': 120, 'nominalFps': 2.0,
+             'frameId': 'camera_link', 'hfovDegrees': 61.0, 'vfovDegrees': 45.5,
+             'dataBytes': len(ACCESS_UNIT_IDR) + len(ACCESS_UNIT_P)})
+        self.assertTrue(chunk['offsetsTile'])
+        self.assertTrue(chunk['keyframesMatchNalTypes'])
+        first, second = chunk['frames']
+        self.assertEqual(
+            {key: first[key] for key in ('time', 'seq', 'byteOffset', 'byteLength', 'keyframe',
+                                         'nalTypes', 'startsWithAud')},
+            {'time': 1757000001000, 'seq': 11, 'byteOffset': 0,
+             'byteLength': len(ACCESS_UNIT_IDR), 'keyframe': True, 'nalTypes': [9, 7, 8, 5],
+             'startsWithAud': True})
+        self.assertEqual((second['byteOffset'], second['keyframe'], second['nalTypes']),
+                         (len(ACCESS_UNIT_IDR), False, [9, 1]))
         self.assertAlmostEqual(first['pose'][0], 1.5, places=6)
         self.assertAlmostEqual(first['pose'][2], -0.25, places=6)
         self.assertAlmostEqual(first['pose'][6], 0.8660254, places=6)
-        self.assertFalse(second['jpegSoi'])
-        # The field of view, and its absence: a frame that never set it reads 0 by 0.
-        self.assertEqual((first['hfovDegrees'], first['vfovDegrees']), (61.0, 45.5))
-        self.assertEqual((second['hfovDegrees'], second['vfovDegrees']), (0.0, 0.0))
         # qw defaults to 1, so a pose that was never written reads as the identity rotation at
         # the origin rather than as the zero quaternion, which is not a rotation at all.
         self.assertEqual(second['pose'], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+        # The chunk's fields on every frame, for a reader that walks frames.
+        for frame in chunk['frames']:
+            self.assertEqual(
+                {key: frame[key] for key in ('cameraId', 'frameId', 'width', 'height',
+                                             'hfovDegrees', 'vfovDegrees')},
+                {'cameraId': 'front', 'frameId': 'camera_link', 'width': 160, 'height': 120,
+                 'hfovDegrees': 61.0, 'vfovDegrees': 45.5})
 
-        scan, cloud = lidar_entry['scans']
-        self.assertEqual(scan['kind'], 'laserscan')
-        self.assertEqual(scan['sensorId'], 'scan')
-        self.assertEqual(scan['rangeCount'], 4)
-        self.assertEqual(scan['intensityCount'], 2)
-        self.assertEqual(scan['finiteRangeCount'], 2)
-        self.assertAlmostEqual(scan['rangeMax'], 12.0, places=6)
-        self.assertEqual(cloud['kind'], 'pointcloud')
-        self.assertEqual(cloud['pointCount'], 3)
-        self.assertEqual(cloud['voxelLeafMm'], 50)
-        self.assertEqual(cloud['dataBytes'], len(BLOCK_INT16))
+        self.assertEqual(
+            {key: scans[key] for key in ('sensorId', 'seq', 'startMs', 'endMs', 'frameId', 'kind',
+                                         'rays', 'rangeUnit', 'encoding', 'finiteRangeCount')},
+            {'sensorId': 'scan', 'seq': 2, 'startMs': 1757000002000, 'endMs': 1757000002500,
+             'frameId': 'base_scan', 'kind': 'scans', 'rays': 4, 'rangeUnit': 'millimetre',
+             'encoding': 'uint16', 'finiteRangeCount': 5})
+        self.assertAlmostEqual(scans['angleMin'], -math.pi, places=6)
+        self.assertAlmostEqual(scans['rangeMax'], 12.0, places=6)
+        self.assertEqual([entry['seq'] for entry in scans['entries']], [5, 6])
+        for index, entry in enumerate(scans['entries']):
+            self.assertEqual(entry['time'], 1757000002000 + 500 * index)
+            self.assertAlmostEqual(entry['pose'][0], 0.25 * (index + 1), places=6)
+            # Timing is the scan's own, not the block's.
+            self.assertAlmostEqual(entry['timeIncrement'], 0.0001 * (index + 1), places=9)
+            self.assertAlmostEqual(entry['scanTime'], 0.25 * (index + 1), places=6)
+            # The block's fields on every entry, for a reader that walks scans.
+            self.assertEqual((entry['sensorId'], entry['frameId'], entry['kind']),
+                             ('scan', 'base_scan', 'scans'))
+            self.assertAlmostEqual(entry['angleMin'], -math.pi, places=6)
+            self.assertAlmostEqual(entry['angleIncrement'], math.pi / 2, places=6)
+
+        self.assertEqual(
+            {key: clouds[key] for key in ('sensorId', 'kind', 'position', 'color', 'intensity',
+                                          'voxelLeafMm', 'encoding', 'zstdLevel')},
+            {'sensorId': 'depth', 'kind': 'clouds', 'position': 'int16_mm', 'color': 'rgb565',
+             'intensity': 'uint8', 'voxelLeafMm': 50, 'encoding': 'planarZstd', 'zstdLevel': 0})
+        (cloud,) = clouds['entries']
+        self.assertEqual((cloud['pointCount'], cloud['byteOffset'], cloud['byteLength']),
+                         (3, 0, len(BLOCK_INT16)))
         self.assertEqual(cloud['decoded']['points'], 3)
         self.assertTrue(cloud['decoded']['consistent'])
-        self.assertEqual(len(cloud['decoded']['first']), 3)
         self.assertEqual(cloud['decoded']['first'][0], [1.0, 0.0, 0.25, [0, 0, 0], 0])
 
-    def test_a_scans_ranges_are_absent_by_default_and_verbatim_with_the_flag(self):
-        path = self.lidar_capture()
-        scan, cloud = self.run_cli([str(path)])['files'][0]['scans']
-        # 640 floats per sweep is most of the document and almost no assertion needs them, so
-        # the flag is what a reader placing a ray asks for.
-        self.assertNotIn('ranges', scan)
-        self.assertNotIn('intensities', scan)
+    def test_a_keyframe_flag_the_bitstream_disagrees_with_is_reported(self):
+        # A P frame flagged keyframe, then an IDR frame left unflagged. In each chunk the other
+        # frame agrees, so a check of one frame, or of any frame, would call the chunk sound.
+        for flags in ((True, True), (False, False)):
+            with self.subTest(flags=flags):
+                chunk = self.run_cli([str(self.camera_capture(keyframes=flags))])['files'][0]
+                self.assertEqual([frame['keyframe'] for frame in chunk['frames']], list(flags))
+                self.assertFalse(chunk['keyframesMatchNalTypes'])
+                self.assertTrue(chunk['offsetsTile'])
 
-        scan, cloud = self.run_cli(['--scan-ranges', str(path)])['files'][0]['scans']
-        self.assertEqual(scan['ranges'][0], 1.0)
-        self.assertEqual(scan['ranges'][3], 2.0)
-        # As published: the two spellings of "nothing there" survive the round trip through JSON
-        # as the non-standard tokens Python writes and reads.
-        self.assertTrue(math.isinf(scan['ranges'][1]))
-        self.assertTrue(math.isnan(scan['ranges'][2]))
-        self.assertEqual(len(scan['ranges']), scan['rangeCount'])
-        self.assertEqual(scan['intensities'], [7.0, 8.0])
-        self.assertNotIn('ranges', cloud)
+    def test_a_byte_between_two_access_units_does_not_tile(self):
+        chunk = self.run_cli([str(self.camera_capture(gap=b'\xff'))])['files'][0]
+        self.assertFalse(chunk['offsetsTile'])
+        self.assertTrue(chunk['keyframesMatchNalTypes'])
+        # Each frame is still read at its own offset, so both access units decode as they are.
+        self.assertEqual([frame['nalTypes'] for frame in chunk['frames']], [[9, 7, 8, 5], [9, 1]])
+
+    def test_scan_ranges_are_absent_by_default_and_decoded_with_the_flag(self):
+        path = self.scan_capture('uint16', SCAN_RANGES_UINT16, SCAN_INTENSITIES_UINT16)
+        # Most of the document and almost no assertion needs them, so the flag is what a reader
+        # placing a ray asks for.
+        for entry in self.run_cli([str(path)])['files'][0]['entries']:
+            self.assertNotIn('ranges', entry)
+            self.assertNotIn('intensities', entry)
+        # The three sentinels come back as the non-finite values they stand for, and survive the
+        # trip through JSON as the non-standard tokens Python writes and reads.
+        self.assertDecodedScans(self.run_cli(['--scan-ranges', str(path)])['files'][0]['entries'])
+
+    @NEEDS_ZSTANDARD
+    def test_a_delta_shuffled_scan_block_decodes_through_the_cli(self):
+        compressor = zstandard.ZstdCompressor(level=1)
+        path = self.scan_capture('deltaShuffleZstd', compressor.compress(SCAN_RANGES_SHUFFLED),
+                                 compressor.compress(SCAN_INTENSITIES_SHUFFLED))
+        block = self.run_cli(['--scan-ranges', str(path)])['files'][0]
+        self.assertEqual(block['finiteRangeCount'], 5)
+        self.assertDecodedScans(block['entries'])
 
     def test_only_the_first_three_points_are_reported(self):
-        payload = self.lidar.LidarPayload.new_message()
-        self.write_header(payload)
-        scan = payload.init('scans', 1)[0]
-        cloud = scan.init('pointcloud')
-        cloud.pointCount = 8
-        cloud.position = 'int16_mm'
-        cloud.color = 'none'
-        cloud.intensity = 'none'
-        cloud.data = bytes(8 * 6)
-        path = self.directory / '000009-lidar.bin'
-        path.write_bytes(payload.to_bytes_packed())
-        decoded = self.run_cli([str(path)])['files'][0]['scans'][0]['decoded']
+        path = self.cloud_capture([(8, bytes(8 * 6))], color='none', intensity='none')
+        decoded = self.run_cli([str(path)])['files'][0]['entries'][0]['decoded']
         self.assertEqual(decoded['points'], 8)
         self.assertEqual(len(decoded['first']), 3)
         self.assertTrue(decoded['consistent'])
 
     def test_a_short_block_reaches_the_json_as_inconsistent(self):
-        payload = self.lidar.LidarPayload.new_message()
-        self.write_header(payload)
-        scan = payload.init('scans', 1)[0]
-        cloud = scan.init('pointcloud')
-        cloud.pointCount = 3
-        cloud.position = 'int16_mm'
-        cloud.color = 'rgb565'
-        cloud.intensity = 'uint8'
-        cloud.data = BLOCK_INT16[:-1]
-        path = self.directory / '000010-lidar.bin'
-        path.write_bytes(payload.to_bytes_packed())
-        decoded = self.run_cli([str(path)])['files'][0]['scans'][0]['decoded']
+        path = self.cloud_capture([(3, BLOCK_INT16[:-1])])
+        decoded = self.run_cli([str(path)])['files'][0]['entries'][0]['decoded']
         self.assertFalse(decoded['consistent'])
         self.assertEqual(decoded['points'], 2)
+
+    @NEEDS_ZSTANDARD
+    def test_each_compressed_delta_shuffled_cloud_decodes_from_its_own_slice(self):
+        compressor = zstandard.ZstdCompressor(level=1)
+        stored = [compressor.compress(BLOCK_INT16_DELTA), compressor.compress(BLOCK_ONE_POINT)]
+        path = self.cloud_capture([(3, stored[0]), (1, stored[1])],
+                                  encoding='planarDeltaShuffleZstd', zstd_level=1)
+        first, second = self.run_cli([str(path)])['files'][0]['entries']
+        # The slice is what was on the wire; the decode is of what came out of it.
+        self.assertEqual((first['byteOffset'], first['byteLength']), (0, len(stored[0])))
+        self.assertEqual((second['byteOffset'], second['byteLength']),
+                         (len(stored[0]), len(stored[1])))
+        self.assertTrue(first['decoded']['consistent'])
+        self.assertTrue(second['decoded']['consistent'])
+        self.assertEqual(first['decoded']['first'],
+                         [[1.0, 0.0, 0.25, [0, 0, 0], 0],
+                          [-2.5, 0.5, 0.0, [255, 255, 255], 128],
+                          [32.767, -0.001, -32.768, [132, 130, 132], 255]])
+        self.assertEqual(second['decoded']['first'], [[0.007, -0.007, 0.0, [132, 130, 132], 42]])
 
     def test_an_explicit_stream_decodes_a_file_named_anything(self):
         capture = self.camera_capture()
@@ -522,39 +800,15 @@ class RoundTripThroughTheSchemas(unittest.TestCase):
         self.assertEqual(document['files'][0]['stream'], 'camera')
         self.assertEqual(len(document['files'][0]['frames']), 2)
 
-    def test_extract_jpeg_writes_every_frame_and_counts_them(self):
+    def test_extract_h264_writes_each_chunk_as_its_own_stream(self):
         capture = self.camera_capture()
-        target = self.directory / 'jpegs'
-        entry = self.run_cli(['--extract-jpeg', str(target), str(capture)])['files'][0]
-        self.assertEqual(entry['extracted'], 2)
-        front = target / '1757000000_robot7-front-4-11.jpg'
-        rear = target / '1757000000_robot7-rear-4-12.jpg'
-        self.assertEqual(front.read_bytes(), b'\xff\xd8\xff\xe0 pretend jpeg')
-        self.assertEqual(rear.read_bytes(), b'no marker here')
-        self.assertEqual(sorted(p.name for p in target.iterdir()),
-                         [front.name, rear.name])
-
-    @NEEDS_ZSTANDARD
-    def test_a_compressed_cloud_decodes_through_the_cli(self):
-        payload = self.lidar.LidarPayload.new_message()
-        self.write_header(payload)
-        scan = payload.init('scans', 1)[0]
-        cloud = scan.init('pointcloud')
-        cloud.pointCount = 3
-        cloud.position = 'int16_mm'
-        cloud.color = 'rgb565'
-        cloud.intensity = 'uint8'
-        cloud.zstdLevel = 7
-        compressed = zstandard.ZstdCompressor(level=7).compress(BLOCK_INT16)
-        cloud.data = compressed
-        path = self.directory / '000011-lidar.bin'
-        path.write_bytes(payload.to_bytes_packed())
-        record = self.run_cli([str(path)])['files'][0]['scans'][0]
-        # dataBytes is what was on the wire; the decode is of what came out of it.
-        self.assertEqual(record['dataBytes'], len(compressed))
-        self.assertNotEqual(record['dataBytes'], len(BLOCK_INT16))
-        self.assertTrue(record['decoded']['consistent'])
-        self.assertEqual(record['decoded']['first'][2], [32.767, -0.001, -32.768, [132, 130, 132], 255])
+        target = self.directory / 'streams'
+        entry = self.run_cli(['--extract-h264', str(target), str(capture)])['files'][0]
+        written = target / '1757000000_robot7-front-4.h264'
+        self.assertEqual(entry['extracted'], str(written))
+        # The chunk's `data` exactly: a raw Annex-B stream that `ffmpeg -f h264` reads as it is.
+        self.assertEqual(written.read_bytes(), ACCESS_UNIT_IDR + ACCESS_UNIT_P)
+        self.assertEqual([path.name for path in target.iterdir()], [written.name])
 
 
 if __name__ == '__main__':

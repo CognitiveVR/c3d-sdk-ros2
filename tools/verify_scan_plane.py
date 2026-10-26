@@ -126,8 +126,8 @@ def finite_rays(scan, wanted):
     """Up to `wanted` (index, range, angle) triples spread across one sweep, non-finite skipped.
 
     A driver publishes inf for a ray that returned nothing and NaN for one whose measurement is
-    invalid, and the wire copies both as published, so a verifier that took ray 0 on faith would
-    be reconstructing an infinity.
+    invalid, and the wire keeps both, each as a code of its own, so a verifier that took ray 0 on
+    faith would be reconstructing an infinity.
     """
     ranges = scan.get('ranges')
     if not ranges:
@@ -185,12 +185,13 @@ def check_document(document, options, reported_convention=None):
     translation = options.mount_xyz
     scene_origin = POSITION_MAPS[convention](*translation)
 
+    # One record per scan and per frame, each carrying its block's or chunk's sensor, frame and
+    # geometry, so a scan is filtered and its rays placed from the record alone.
     entries = document['files']
     scans = [scan
-             for entry in entries if entry['stream'] == 'lidar'
-             for scan in entry['scans']
-             if scan['kind'] == 'laserscan' and scan['frameId'] == options.frame
-             and scan['sensorId'] == options.lidar]
+             for entry in entries if entry['stream'] == 'lidar' and entry['kind'] == 'scans'
+             for scan in entry['entries']
+             if scan['frameId'] == options.frame and scan['sensorId'] == options.lidar]
     frames = [frame
               for entry in entries if entry['stream'] == 'camera'
               for frame in entry['frames']

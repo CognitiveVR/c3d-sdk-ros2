@@ -54,6 +54,17 @@
     # Optional. Is there a forward camera whose viewpoint matters? Its body or optical frame.
     # gaze_frame: "<camera-frame>"
 
+    # Optional. Record a camera? It needs ffmpeg on the robot (sudo apt install ffmpeg), which
+    # doctor's camera encoder check confirms. Frames are encoded as H.264 in 3 second chunks;
+    # keep preset and crf unless the human needs more detail: crf is 24 to 32, lower for more
+    # quality and more bytes, and veryfast costs about three times the CPU of ultrafast.
+    # cameras: ["<camera-name>"]
+    # camera:
+    #   <camera-name>:
+    #     topic: "<color-image-topic>"
+    #     preset: "ultrafast"
+    #     crf: 28
+
     # Optional. Does a mission or task orchestrator own the session boundaries?
     # auto_start_session: false
 
