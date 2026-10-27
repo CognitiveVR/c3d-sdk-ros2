@@ -66,6 +66,28 @@ It checks every stored vector and the `generated/` recipes; each problem names i
 Linux host with the core dependencies installed, build the command natively and pass its path
 instead of the `docker run`.
 
+### The pose upload queue and the upload check. By hand
+
+A session uploads pose blocks through an upload queue whose rules are the platform's as well
+(the formatter's `docs/pose/spec.md` §10). Two checks come from the formatter. The queue
+vectors, `vectors/pose/queue/`, drive the queue class alone on a fake clock:
+`PoseQueueVectors.EveryQueueCasePasses` runs every case whenever `POSE_VECTORS` is set, as above.
+The upload check judges what a whole session posted. `PoseSessionTest.PoseEndToEnd` drives two
+objects through manifests, re-sends, timer sends, cap sends and `End`, and with `POSE_CAPTURE`
+writes every body it posted, as `part_<n>.bin`, and the send log, as `send_log.json`:
+
+```bash
+POSE_VECTORS=~/cvr/c3d-stream-formatter/vectors/pose POSE_CAPTURE=/tmp/c3d-pose-uploads \
+  tools/build_and_test.sh core
+uv run --no-project --with ~/cvr/c3d-stream-formatter --with pycapnp -- \
+  python -m c3d_stream_formatter.pose.uploads /tmp/c3d-pose-uploads \
+  --send-log /tmp/c3d-pose-uploads/send_log.json --interval-ms 1000
+```
+
+It ends `11 bodies, 0 problems, 0 warnings: PASS`. `--interval-ms` is the test session's
+`pose_block_interval_s`. The session writes its send log (`Config::pose_send_log_path`) one
+JSON line per block part; the test wraps the lines in the JSON list the checker reads.
+
 ## The Python suites. Every push, in CI
 
 ```bash

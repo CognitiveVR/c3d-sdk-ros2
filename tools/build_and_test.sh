@@ -39,6 +39,10 @@
 # core tests then run the pose encoder against them (tools/README.md). Without it
 # those tests skip: the vectors are not in this repository.
 #
+# POSE_CAPTURE=<dir> mounts a host directory, writable, into which the core tests' pose
+# end-to-end session writes every part it posted and its send log, for the formatter's
+# upload check (tools/README.md). Without it nothing is written.
+#
 # Superseded tags stay TAGGED, so `docker image prune` will not reclaim them.
 # Clear them out with:
 #   docker images 'c3d-sdk-ros2-test' --format '{{.Repository}}:{{.Tag}}' | xargs -r docker rmi
@@ -122,6 +126,10 @@ VECTOR_ARGS=()
 if [ -n "${POSE_VECTORS:-}" ]; then
   VECTOR_ARGS=(-v "$(cd "$POSE_VECTORS" && pwd)":/pose-vectors:ro -e C3D_POSE_VECTORS=/pose-vectors)
 fi
+if [ -n "${POSE_CAPTURE:-}" ]; then
+  mkdir -p "$POSE_CAPTURE"
+  VECTOR_ARGS+=(-v "$(cd "$POSE_CAPTURE" && pwd)":/pose-capture -e C3D_POSE_CAPTURE=/pose-capture)
+fi
 
 docker run --rm -v "$REPO":/src:ro ${VECTOR_ARGS[@]+"${VECTOR_ARGS[@]}"} -e WHAT="$WHAT" "$IMAGE" bash -lc '
 set -euo pipefail
@@ -136,7 +144,7 @@ set -euo pipefail
 # fails this one.
 ros_free() {
   env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
-    C3D_POSE_VECTORS="${C3D_POSE_VECTORS:-}" "$@"
+    C3D_POSE_VECTORS="${C3D_POSE_VECTORS:-}" C3D_POSE_CAPTURE="${C3D_POSE_CAPTURE:-}" "$@"
 }
 
 if [ "$WHAT" = all ] || [ "$WHAT" = core ] || [ "$WHAT" = humble ]; then
