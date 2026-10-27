@@ -1,13 +1,17 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "c3d/media.hpp"
+#include "c3d/pose_manifest.hpp"
 #include "c3d/session.hpp"
 #include "cognitive3d_ros/coordinate_transform.hpp"
 #include "cognitive3d_ros/event_rate_limiter.hpp"
+#include "cognitive3d_ros/pose_rig.hpp"
 
 namespace rclcpp {
 class Logger;
@@ -102,6 +106,14 @@ class SessionRunner {
   void RecordPointCloud(const std::string& sensor_id, std::uint64_t time_ms, std::uint32_t seq,
                         const std::string& frame_id, const c3d::Vec3& ros_position,
                         const c3d::Quat& ros_rotation, const c3d::EncodedPointCloud& cloud);
+
+  // The pose stream. A manifest carries no coordinates and goes to the session as it is; a
+  // sample's joints arrive in ROS axes and each takes RigJointScenePose here, the root and the
+  // parent-local joints alike. False, with the session's reason, for anything it refuses.
+  bool SendPoseManifest(const c3d::pose::Manifest& manifest, std::string* error = nullptr);
+  bool RecordPoseRigSample(const std::string& manifest_id, std::int64_t t_us,
+                           const std::vector<RosJointPose>& ros_joints,
+                           std::optional<bool> enabled, std::string* error = nullptr);
 
   // Whether this run registers the robot as a dynamic object and records a dynamics sample
   // per pose. OFF by default: the platform draws the robot from the pose timeline, so the

@@ -295,6 +295,12 @@ bool PoseSampler::RecordEvent(double wire_time, SessionRunner& runner, const std
                            position, position_known, std::move(properties));
 }
 
+std::string PoseSampler::reference_frame_in_force() const {
+  if (!active_reference_frame_.empty()) return active_reference_frame_;
+  if (!config_.preferred_reference_frame.empty()) return "";
+  return config_.fallback_reference_frame;
+}
+
 bool PoseSampler::LookupSensorPose(const std::string& frame, const rclcpp::Time& stamp,
                                    c3d::Vec3* position, c3d::Quat* rotation) const {
   if (!buffer_ || frame.empty()) return false;
@@ -307,11 +313,7 @@ bool PoseSampler::LookupSensorPose(const std::string& frame, const rclcpp::Time&
   // timeline in `map`, and the row carries nothing that says which one it is.
   // An empty preferred frame is the deliberate fallback-only run, which has
   // nothing to wait for.
-  std::string reference = active_reference_frame_;
-  if (reference.empty()) {
-    if (!config_.preferred_reference_frame.empty()) return false;
-    reference = config_.fallback_reference_frame;
-  }
+  const std::string reference = reference_frame_in_force();
   if (reference.empty()) return false;
 
   try {

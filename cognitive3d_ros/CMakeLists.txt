@@ -57,6 +57,8 @@ add_library(cognitive3d_ros_component SHARED
   src/doctor.cpp
   src/run_doctor.cpp
   src/pose_sampler.cpp
+  src/pose_rig.cpp
+  src/tf_rig_sampler.cpp
   src/translators/registry.cpp
   src/translators/battery_translator.cpp
   src/translators/joint_state_translator.cpp
@@ -197,6 +199,18 @@ if(BUILD_TESTING)
   ament_add_gtest(test_pose_sampler test/test_pose_sampler.cpp)
   target_link_libraries(test_pose_sampler cognitive3d_ros_component)
   ament_target_dependencies(test_pose_sampler rclcpp tf2_ros geometry_msgs)
+
+  ament_add_gtest(test_pose_rig test/test_pose_rig.cpp)
+  target_link_libraries(test_pose_rig cognitive3d_ros_component)
+  ament_target_dependencies(test_pose_rig rclcpp tf2_ros geometry_msgs)
+
+  # A real graph: a robot publishing tf, a listener, and the pose stream into a session. Its own
+  # ROS domain, so another suite's tf in the same workspace cannot reach its buffer.
+  ament_add_gtest(test_pose_stream test/test_pose_stream.cpp
+    TIMEOUT 120
+    ENV ROS_DOMAIN_ID=86 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST)
+  target_link_libraries(test_pose_stream cognitive3d_ros_component)
+  ament_target_dependencies(test_pose_stream rclcpp tf2_ros geometry_msgs)
 
   # A node-level test: it builds a real Cognitive3DNode, drives its lifecycle and
   # calls its services over a real executor, because session control IS the

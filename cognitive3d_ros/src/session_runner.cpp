@@ -121,6 +121,31 @@ void SessionRunner::RecordPointCloud(const std::string& sensor_id, std::uint64_t
                              ScenePose(ros_position, ros_rotation, convention_), cloud);
 }
 
+bool SessionRunner::SendPoseManifest(const c3d::pose::Manifest& manifest, std::string* error) {
+  if (!session_) {
+    if (error) *error = "no session";
+    return false;
+  }
+  return session_->SetPoseManifest(manifest, error);
+}
+
+bool SessionRunner::RecordPoseRigSample(const std::string& manifest_id, std::int64_t t_us,
+                                        const std::vector<RosJointPose>& ros_joints,
+                                        std::optional<bool> enabled, std::string* error) {
+  if (!session_) {
+    if (error) *error = "no session";
+    return false;
+  }
+  c3d::pose::PoseSample sample;
+  sample.t_us = t_us;
+  sample.enabled = enabled;
+  sample.joints.reserve(ros_joints.size());
+  for (const RosJointPose& joint : ros_joints) {
+    sample.joints.push_back(RigJointScenePose(joint, convention_));
+  }
+  return session_->RecordPoseSample(manifest_id, sample, error);
+}
+
 void SessionRunner::RecordRobotDynamic(double t, const c3d::Vec3& p, const c3d::Quat& r) {
   // REGISTRATION is the gate, and it carries `robot_dynamic_object` for this channel too: with the
   // switch off nothing is registered, and a snapshot against an id no manifest names is a row the
