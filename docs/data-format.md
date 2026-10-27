@@ -1,8 +1,8 @@
 # Data format
 
 This page describes what a session recorded by the node stores on the Cognitive3D platform: the
-session itself, the pose timeline, events, sensor series, session properties, and the camera and
-lidar records. It is a reference for people who read stored sessions or build tools on them. The
+session itself, the pose timeline, events, sensor series, session properties, the camera and
+lidar records, and the provisional pose stream. It is a reference for people who read stored sessions or build tools on them. The
 node writes all of it; nothing here has to be built by hand.
 
 ## Sessions
@@ -164,6 +164,7 @@ Some properties are present only when a feature is on:
 | `c3d.ros.gaze_frame_convention` | `gaze_frame` is set | `body_forward_x` or `optical_forward_z`, as resolved |
 | `c3d.ros.cameras`, `c3d.ros.camera.<name>.*`, `c3d.ros.lidars`, `c3d.ros.lidar.<name>.*` | cameras or lidars are configured | See [Camera and lidar](camera-and-lidar.md#what-the-session-records) |
 | `c3d.ros.sensors`, `c3d.ros.sensor.<name>.*` | `sensors` is set | See [Described sensors](#described-sensors) |
+| `c3d.ros.pose.rate_hertz`, `c3d.ros.pose.frame_count`, `c3d.stream.pose.*` | `pose.enabled` is `true` | See [The pose stream](#the-pose-stream) |
 | `c3d.remote_variable.<name>` | remote variables are fetched | See [Remote variables](remote-variables.md) |
 
 Your own `session_properties` and the `properties_json` of `~/start_session` are stored beside
@@ -290,6 +291,35 @@ b = ((v & 0x03) << 6) | ((v & 0x03) << 4) | ((v & 0x03) << 2) | (v & 0x03);
 multiplied by 255 when the sensor published it as a float whose values are all 1.0 or less, and
 otherwise the sensor's value clamped to 0 to 255.
 
+## The pose stream
+
+**Provisional.** With `pose.enabled: true`, the session also carries the robot's tf tree as one
+rigged object on the platform's pose stream; [Pose stream](pose.md) describes it in full. Its
+uploads are packed Cap'n Proto messages, `core/capnp/pose_payload.capnp`, each holding either
+manifests or blocks, never both:
+
+- **A manifest** describes the rig: `manifestId`, `name` (`device_id`), `mesh` and `fileType` (both
+  empty when no model is configured), `riggingMappingType` `meshName`, and one joint per tf frame,
+  `j = 0` being `robot_frame`. Its properties follow the `ros2/1` profile: `c3d.profile` and
+  `ros.robotName` on the rig, `ros.parent` on every joint but the first, and `c3d.kind` on a
+  configured sensor's frame. A manifest is sent again whenever the frame set changes, and its
+  `firstSeq` names the first block it describes.
+- **A block** holds `pose.block_interval_s` seconds of samples of every joint, compressed, in the
+  platform's pose block format. A sample's time is wall-clock epoch microseconds. Joint 0 is
+  `robot_frame` in the session's reference frame, and every other joint is its frame's transform in
+  its tf parent. Positions are meters and rotations quaternions, converted by the session's pose
+  convention, rotations by the Dynamic Object rule. No joint carries a scale.
+
+| record | name | value |
+| -- | -- | -- |
+| session property | `c3d.ros.pose.rate_hertz` | `pose.rate_hz` |
+| session property | `c3d.ros.pose.frame_count` | The joint count of the last manifest sent |
+| session property | `c3d.stream.pose.blockIntervalMs` | `pose.block_interval_s` in whole milliseconds |
+| session property | `c3d.stream.pose.heldFrames` | Joint values sent again because their frame could not be looked up, set at the session's end |
+| session property | `c3d.stream.pose.repairedRotations` | Rotations replaced because they could not be encoded, set at the session's end |
+| sensor series | `c3d.pose.samples`, `c3d.pose.held_frames` | The same counts, every 5 seconds |
+| event | `robot.frame_lost` | A frame left the rig. `frame`, `parent` and `last_seen_epoch_seconds`: the joint's values after that time were held, not measured |
+
 ## Reading a sensor pose
 
 A camera or lidar record's `pose` is a position `(px, py, pz)` and a quaternion `(qx, qy, qz, qw)`:
@@ -323,6 +353,7 @@ reader that applies the point cloud rule to a laser scan draws the scan turned o
 The camera and lidar records are defined by Cap'n Proto schemas, and the node uploads them as
 packed Cap'n Proto messages. The schemas are in the repository, in
 `core/capnp/camera_payload.capnp`, `core/capnp/lidar_payload.capnp` and
-`core/capnp/common_payload.capnp`, which holds the `Pose` both use. A `Pose` that was never written
+`core/capnp/common_payload.capnp`, which holds the `Pose` both use. The pose stream's envelope is
+`core/capnp/pose_payload.capnp`. A `Pose` that was never written
 reads as the identity rotation at the origin, because `qw` defaults to 1; a pose the node stores is
 always a real tf lookup.

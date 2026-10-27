@@ -92,6 +92,7 @@ misplaced or filed under another project. `doctor` finds most of them before you
 | [Coordinates](docs/coordinates.md) | The pose convention, reference frames, the gaze channel |
 | [Recording](docs/recording.md) | The allowlist, sensor series, events, objectives, Nav2, health series |
 | [Camera and lidar](docs/camera-and-lidar.md) | Camera frames, laser scans and point clouds, and what they cost |
+| [Pose stream](docs/pose.md) | Provisional: the robot's tf tree as a rig, off by default |
 | [Remote variables](docs/remote-variables.md) | Remote variables and A/B tests |
 | [Doctor and verification](docs/doctor-and-verification.md) | Every `doctor` check, and checking a stored session |
 | [Troubleshooting](docs/troubleshooting.md) | What goes wrong, by symptom |

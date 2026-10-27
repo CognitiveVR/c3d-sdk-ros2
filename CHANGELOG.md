@@ -8,6 +8,21 @@ marks as provisional may change in a minor release, and its entry here says how 
 
 ## [Unreleased]
 
+### Added
+
+- The pose stream, **provisional** and off by default: `pose.enabled: true` sends the robot's tf
+  tree as one rig per robot, every frame under `robot_frame` sampled together at `pose.rate_hz`
+  (10 by default), with a manifest naming each frame's tf parent and tagging configured camera,
+  lidar and described sensor frames. It requires a Cognitive3D platform that accepts the pose
+  stream; an older one answers every pose upload with HTTP 400, and the node discards it. Session
+  Replay still draws the robot from the pose timeline, so turning it on changes nothing a replay
+  shows. New parameters `pose.enabled`, `pose.rate_hz`, `pose.block_interval_s`,
+  `pose.exclude_frames`, `pose.manifest_id`, `pose.mesh` and `pose.mesh_file_type`, and
+  `pose.send_log_path` for development. With it on, sessions also carry the
+  `c3d.ros.pose.rate_hertz`, `c3d.ros.pose.frame_count` and `c3d.stream.pose.*` properties, the
+  `c3d.pose.samples` and `c3d.pose.held_frames` series, and a `robot.frame_lost` event when a frame
+  leaves the rig. `doctor` has a `pose stream` check. See [Pose stream](docs/pose.md).
+
 ## [1.1.0] - 2026-10-13
 
 ### Changed
