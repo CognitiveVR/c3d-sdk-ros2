@@ -103,6 +103,7 @@ add_library(c3d_core STATIC
   src/camera_fov.cpp
   src/capnp_payloads.cpp
   src/pose_block.cpp
+  src/pose_queue.cpp
   ${C3D_CAPNP_SOURCES}
 )
 add_library(c3d::core ALIAS c3d_core)

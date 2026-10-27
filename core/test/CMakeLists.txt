@@ -22,6 +22,7 @@ add_executable(c3d_core_tests
   test_session_lifecycle.cpp
   test_pose_block.cpp
   test_pose_vectors.cpp
+  test_pose_queue.cpp
 )
 # capnp and zstd directly, not only through c3d_core: these tests decode what the
 # encoder wrote rather than asking the encoder to decode it, which is the only
