@@ -79,6 +79,7 @@ std::uint64_t PartBase(Stream stream) {
       return 1;
     case Stream::kCamera:
     case Stream::kLidar:
+    case Stream::kPose:
       return 1;
   }
   return 1;

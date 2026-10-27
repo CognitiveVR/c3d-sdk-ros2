@@ -234,15 +234,19 @@ TEST_F(SpoolTest, ABinaryChunkSurvivesAProcessRestart) {
   {
     DiskSpool spool(dir_.string(), 10 * 1024 * 1024, std::make_shared<NullLogger>());
     ASSERT_TRUE(spool.Write(MakeChunk(Stream::kLidar, body)));
+    ASSERT_TRUE(spool.Write(MakeChunk(Stream::kPose, body)));
   }
   DiskSpool reopened(dir_.string(), 10 * 1024 * 1024, std::make_shared<NullLogger>());
-  EXPECT_EQ(reopened.Count(), 1u);
-  Chunk out;
-  ASSERT_TRUE(reopened.PeekOldest(&out));
-  EXPECT_EQ(out.body, body);
+  EXPECT_EQ(reopened.Count(), 2u);
   // The stream is read back from the id suffix, which recovery and eviction both
   // key on, so a new stream name that Rescan does not know reads as `events`.
-  EXPECT_EQ(out.stream, Stream::kLidar);
+  for (Stream s : {Stream::kLidar, Stream::kPose}) {
+    Chunk out;
+    ASSERT_TRUE(reopened.PeekOldest(&out));
+    EXPECT_EQ(out.body, body);
+    EXPECT_EQ(out.stream, s);
+    reopened.Remove(out.id);
+  }
 }
 
 TEST_F(SpoolTest, TextBodiesStayReadableInTheChunkFile) {

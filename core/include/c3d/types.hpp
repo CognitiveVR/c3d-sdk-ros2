@@ -53,15 +53,16 @@ class PropertyValue {
 // Ordered rather than a map, so serialization is deterministic and diffable.
 using Properties = std::vector<std::pair<std::string, PropertyValue>>;
 
-// The four JSON streams, then the two binary ones. kCamera and kLidar share the
-// spool, the pump and the retry rules with the rest and differ in three places
+// The four JSON streams, then the three binary ones. kCamera, kLidar and kPose share
+// the spool, the pump and the retry rules with the rest and differ in three places
 // only: a Cap'n Proto body instead of JSON, `application/octet-stream` instead of
-// `application/json`, and a session-keyed URL that carries no scene id.
-enum class Stream { kGaze, kEvents, kSensors, kDynamics, kCamera, kLidar };
+// `application/json`, and a session-keyed URL that carries no scene id. kPose's parts
+// are also cut differently, by its own upload queue (Session's pose stream).
+enum class Stream { kGaze, kEvents, kSensors, kDynamics, kCamera, kLidar, kPose };
 
 const char* StreamName(Stream s);
 
-// True for the two streams whose body is packed Cap'n Proto rather than JSON.
+// True for the three streams whose body is packed Cap'n Proto rather than JSON.
 bool IsBinaryStream(Stream s);
 
 // Eviction priority when the spool hits its cap. Lower tier is discarded first.

@@ -6,6 +6,7 @@
 
 #include "camera_payload.capnp.h"
 #include "lidar_payload.capnp.h"
+#include "pose_payload.capnp.h"
 
 namespace c3d {
 namespace {
@@ -46,6 +47,23 @@ void WriteHeader(Builder payload, const BinaryEnvelope& envelope) {
   payload.setSessionStartMs(envelope.session_start_ms);
   payload.setSdkVersion(Str(envelope.sdk_version));
   payload.setPart(envelope.part);
+}
+
+// Every value is set explicitly, the empty string included: the union's tag defaults to str,
+// so a property whose value was never written reads as a string with none set, which the
+// gateway refuses.
+void WriteProperties(capnp::List<cvr::capnp::Property>::Builder list, const Properties& properties) {
+  for (unsigned int i = 0; i < properties.size(); ++i) {
+    auto out = list[i];
+    out.setKey(Str(properties[i].first));
+    const PropertyValue& value = properties[i].second;
+    switch (value.kind()) {
+      case PropertyValue::Kind::kString: out.setStr(Str(value.as_string())); break;
+      case PropertyValue::Kind::kDouble: out.setNum(value.as_double()); break;
+      case PropertyValue::Kind::kInt: out.setNum(static_cast<double>(value.as_int())); break;
+      case PropertyValue::Kind::kBool: out.setBool(value.as_bool()); break;
+    }
+  }
 }
 
 std::string Pack(capnp::MessageBuilder& message) {
@@ -127,6 +145,53 @@ std::string SerializeLidarPayload(const BinaryEnvelope& envelope,
     for (unsigned int r = 0; r < record.scan.intensities.size(); ++r) {
       intensities.set(r, record.scan.intensities[r]);
     }
+  }
+  return Pack(message);
+}
+
+std::string SerializePosePayload(const BinaryEnvelope& envelope,
+                                 const std::vector<PoseManifestRecord>& manifests,
+                                 const std::vector<pose::QueuedBlock>& blocks,
+                                 std::int64_t start_us, std::int64_t end_us) {
+  capnp::MallocMessageBuilder message;
+  auto payload = message.initRoot<cvr::capnp::PosePayload>();
+  WriteHeader(payload, envelope);
+  payload.setStartUs(start_us);
+  payload.setEndUs(end_us);
+
+  auto entries = payload.initManifests(static_cast<unsigned int>(manifests.size()));
+  for (unsigned int i = 0; i < manifests.size(); ++i) {
+    const PoseManifestRecord& record = manifests[i];
+    auto entry = entries[i];
+    entry.setManifestId(Str(record.manifest_id));
+    entry.setName(Str(record.name));
+    entry.setMesh(Str(record.mesh));
+    entry.setFileType(Str(record.file_type));
+    entry.setRiggingMappingType(Str(record.rigging_mapping_type));
+    entry.setRoot(Str(record.root));
+    entry.setFirstSeq(record.first_seq);
+    WriteProperties(entry.initProperties(static_cast<unsigned int>(record.properties.size())),
+                    record.properties);
+    auto joints = entry.initJoints(static_cast<unsigned int>(record.joints.size()));
+    for (unsigned int j = 0; j < record.joints.size(); ++j) {
+      joints[j].setJ(record.joints[j].j);
+      joints[j].setMeshName(Str(record.joints[j].mesh_name));
+      WriteProperties(
+          joints[j].initProperties(static_cast<unsigned int>(record.joints[j].properties.size())),
+          record.joints[j].properties);
+    }
+  }
+
+  auto list = payload.initBlocks(static_cast<unsigned int>(blocks.size()));
+  for (unsigned int i = 0; i < blocks.size(); ++i) {
+    const pose::QueuedBlock& block = blocks[i];
+    auto out = list[i];
+    out.setManifestId(Str(block.manifest_id));
+    out.setStartUs(block.start_us);
+    out.setSampleCount(static_cast<std::uint32_t>(block.sample_count));
+    out.setResetBefore(block.reset_before);
+    out.setData(Bytes(block.data));
+    out.setSeq(static_cast<std::uint32_t>(block.seq));
   }
   return Pack(message);
 }

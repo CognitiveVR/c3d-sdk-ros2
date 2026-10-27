@@ -42,6 +42,7 @@ Stream StreamFromName(const std::string& n) {
   if (n == "dynamics") return Stream::kDynamics;
   if (n == "camera") return Stream::kCamera;
   if (n == "lidar") return Stream::kLidar;
+  if (n == "pose") return Stream::kPose;
   return Stream::kEvents;
 }
 
@@ -50,7 +51,7 @@ Stream StreamFromName(const std::string& n) {
 // events chunk, evicted and sent as one.
 bool IsSentStream(const std::string& n) {
   for (Stream s : {Stream::kGaze, Stream::kEvents, Stream::kSensors, Stream::kDynamics,
-                   Stream::kCamera, Stream::kLidar}) {
+                   Stream::kCamera, Stream::kLidar, Stream::kPose}) {
     if (n == StreamName(s)) return true;
   }
   return false;

@@ -21,11 +21,14 @@ const char* StreamName(Stream s) {
     case Stream::kDynamics: return "dynamics";
     case Stream::kCamera: return "camera";
     case Stream::kLidar: return "lidar";
+    case Stream::kPose: return "pose";
   }
   return "events";
 }
 
-bool IsBinaryStream(Stream s) { return s == Stream::kCamera || s == Stream::kLidar; }
+bool IsBinaryStream(Stream s) {
+  return s == Stream::kCamera || s == Stream::kLidar || s == Stream::kPose;
+}
 
 int StreamPriority(Stream s) {
   // Events carry objectives, failures and session boundaries. If the spool has
@@ -42,6 +45,8 @@ int StreamPriority(Stream s) {
     // hole in the thing every other stream is indexed by.
     case Stream::kCamera: return 0;
     case Stream::kLidar: return 0;
+    // A rig's pose is the spatial timeline gaze is, joint by joint: gaze's tier.
+    case Stream::kPose: return 1;
   }
   return 1;
 }
