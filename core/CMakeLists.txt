@@ -61,7 +61,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
 
 # Relative to this directory, and SRC_PREFIX points at the same place, so the generated headers
-# land flat in the build dir as `camera_payload.capnp.h`. java.capnp is an import of all three and
+# land flat in the build dir as `camera_payload.capnp.h`. java.capnp is an import of all four and
 # is compiled as part of them; it declares annotations only and needs no output of its own.
 set(CAPNPC_SRC_PREFIX "${CMAKE_CURRENT_SOURCE_DIR}/capnp")
 set(CAPNPC_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}")
@@ -72,7 +72,8 @@ set(C3D_CAPNP_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}")
 capnp_generate_cpp(C3D_CAPNP_SOURCES C3D_CAPNP_HEADERS
   capnp/common_payload.capnp
   capnp/camera_payload.capnp
-  capnp/lidar_payload.capnp)
+  capnp/lidar_payload.capnp
+  capnp/pose_payload.capnp)
 
 find_package(nlohmann_json 3.9 QUIET)
 if(NOT nlohmann_json_FOUND)

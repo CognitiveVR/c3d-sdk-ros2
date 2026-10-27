@@ -62,7 +62,7 @@ class VendoredSchemasArePinned(unittest.TestCase):
 
     def test_the_schemas_the_streams_need_are_all_here(self):
         # Named rather than counted: a resync that dropped one would still be self-consistent.
-        for name in ('camera_payload.capnp', 'lidar_payload.capnp',
+        for name in ('camera_payload.capnp', 'lidar_payload.capnp', 'pose_payload.capnp',
                      'common_payload.capnp', 'java.capnp'):
             with self.subTest(name):
                 self.assertIn(name, self.recorded)
