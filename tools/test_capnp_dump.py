@@ -84,9 +84,10 @@ BLOCK_RGB332 = bytes.fromhex(
 
 
 class StreamFromFilename(unittest.TestCase):
-    def test_the_two_capture_suffixes(self):
+    def test_the_three_capture_suffixes(self):
         self.assertEqual(dump.stream_for_filename('000001-camera.bin'), 'camera')
         self.assertEqual(dump.stream_for_filename('000042-lidar.bin'), 'lidar')
+        self.assertEqual(dump.stream_for_filename('000043-pose.bin'), 'pose')
         self.assertEqual(dump.resolve_stream('000001-camera.bin'), 'camera')
         self.assertEqual(dump.resolve_stream('000042-lidar.bin'), 'lidar')
 
@@ -288,6 +289,68 @@ class Decompression(unittest.TestCase):
         writer = zstandard.ZstdCompressor(level=3, write_content_size=False)
         compressed = writer.stream_reader(io.BytesIO(BLOCK_INT16)).read()
         self.assertEqual(dump.decompress_block(compressed, 3), BLOCK_INT16)
+
+
+# One pose block body, 2 samples of 2 joints: joint 0 writes position and rotation, joint 1
+# position only, one event. Each channel is its first value, then deltas.
+POSE_BODY = bytes.fromhex(
+    '02000000 02000000'                   # N = 2, J = 2
+    '00d0de70fb3d0600'                    # startUs = 1757000000000000
+    'a0860100 a0860100 a0860100'          # steps: 1e-4 m, 1e-4, 1e-4
+    '00000000 f4010000'                   # times: +0, +500 us
+    '03 01'                               # masks: joint 0 p|r, joint 1 p
+    '0a000000 05000000'                   # j0 p.x: 10, +5
+    '00000000 fdffffff'                   # j0 p.y: 0, -3
+    'd0070000 00000000'                   # j0 p.z: 2000, +0
+    '00000000 00000000 00000000 00000000 00000000 00000000'  # j0 r.x, r.y, r.z
+    '10270000 00000000'                   # j0 r.w: 10000, +0
+    'd0070000 00000000 00000000 00000000 00000000 00000000'  # j1 p
+    '01000000 00000000 01000000'          # 1 event: sample 0, enabled
+    .replace(' ', ''))
+
+
+class PoseBlock(unittest.TestCase):
+    def test_a_body_decodes_to_absolute_times_and_values_in_meters(self):
+        decoded = dump.parse_pose_body(POSE_BODY)
+        self.assertTrue(decoded['consistent'])
+        self.assertEqual(decoded['sampleCount'], 2)
+        self.assertEqual(decoded['jointCount'], 2)
+        self.assertEqual(decoded['times'], [1757000000000000, 1757000000000500])
+        self.assertEqual(decoded['masks'], [3, 1])
+        self.assertEqual(sorted(decoded['joints']), ['0', '1'])
+        self.assertEqual(sorted(decoded['joints']['0']), ['p', 'r'])
+        self.assertEqual(sorted(decoded['joints']['1']), ['p'])
+        for got, want in zip(decoded['joints']['0']['p'], [[0.001, 0.0, 0.2],
+                                                           [0.0015, -0.0003, 0.2]]):
+            for a, b in zip(got, want):
+                self.assertAlmostEqual(a, b, places=12)
+        for got in decoded['joints']['0']['r']:
+            for a, b in zip(got, [0.0, 0.0, 0.0, 1.0]):
+                self.assertAlmostEqual(a, b, places=12)
+        self.assertAlmostEqual(decoded['joints']['1']['p'][1][0], 0.2, places=12)
+        self.assertEqual(decoded['events'], [[0, 1]])
+
+    def test_a_body_with_bytes_past_its_counts_is_not_consistent(self):
+        self.assertFalse(dump.parse_pose_body(POSE_BODY + b'\0')['consistent'])
+
+    def test_an_uncompressed_block_reads_its_prefix(self):
+        decoded = dump.decode_pose_block(bytes([0xC3, 1, 0, 1]) + POSE_BODY)
+        self.assertTrue(decoded['keyframe'])
+        self.assertEqual(decoded['codec'], 0)
+        self.assertEqual(decoded['sampleCount'], 2)
+        self.assertFalse(dump.decode_pose_block(bytes([0xC3, 1, 0, 0]) + POSE_BODY)['keyframe'])
+
+    def test_a_prefix_that_is_not_a_pose_block_is_refused(self):
+        for prefix in (bytes([0xC4, 1, 0, 0]), bytes([0xC3, 2, 0, 0]), bytes([0xC3, 1, 9, 0])):
+            with self.subTest(prefix.hex()):
+                with self.assertRaises(ValueError):
+                    dump.decode_pose_block(prefix + POSE_BODY)
+
+    @NEEDS_ZSTANDARD
+    def test_a_zstd_block_decompresses_to_the_same_body(self):
+        compressed = zstandard.ZstdCompressor(write_checksum=True).compress(POSE_BODY)
+        decoded = dump.decode_pose_block(bytes([0xC3, 1, 1, 0]) + compressed)
+        self.assertEqual(decoded['times'], [1757000000000000, 1757000000000500])
 
 
 class JpegFilename(unittest.TestCase):

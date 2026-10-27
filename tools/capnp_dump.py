@@ -3,10 +3,11 @@
 # requires-python = ">=3.10"
 # dependencies = ["pycapnp", "zstandard"]
 # ///
-"""Decode camera and lidar payload captures into one JSON document.
+"""Decode camera, lidar and pose payload captures into one JSON document.
 
-The two binary streams are packed Cap'n Proto bodies (docs/data-format.md), so a capture of
-one is the only captured stream that `json.load` cannot read.
+The three binary streams are packed Cap'n Proto bodies (docs/data-format.md), so a capture of
+one is the only captured stream that `json.load` cannot read. A pose capture's blocks are decoded
+too, from the platform's pose block format, into times, joint values and events.
 This turns any number of them into a single document on stdout, `{"files": [...]}` with one
 entry per input, so a shell assertion reads the lot in one `json.load` rather than per file.
 
@@ -27,6 +28,7 @@ it worth running on a machine with no pycapnp.
 """
 import argparse
 import io
+import itertools
 import json
 import math
 import os
@@ -37,9 +39,21 @@ from pathlib import Path
 
 SCHEMA_DIR = Path(__file__).resolve().parent.parent / 'core' / 'capnp'
 
-# A capture's NAME is the only thing that says which schema decodes it: the two payload structs
+# A capture's NAME is the only thing that says which schema decodes it: the payload structs
 # share their first eight field ordinals, so a body gives no discriminator to sniff.
-STREAM_SUFFIXES = (('-camera.bin', 'camera'), ('-lidar.bin', 'lidar'))
+STREAM_SUFFIXES = (('-camera.bin', 'camera'), ('-lidar.bin', 'lidar'), ('-pose.bin', 'pose'))
+STREAMS = tuple(stream for _, stream in STREAM_SUFFIXES)
+
+# A pose block: a 4-byte prefix (magic, format version, codec, flags), then the body, whose header
+# is N, J, startUs and the three quantisation steps in 1e-9 units, little-endian.
+POSE_MAGIC = 0xC3
+POSE_FORMAT_VERSION = 1
+POSE_CODEC_NONE = 0
+POSE_CODEC_ZSTD = 1
+POSE_HEADER = '<iiqiii'
+POSE_HEADER_BYTES = 28
+# Each joint's mask byte names the groups the block writes for it, in this order.
+POSE_GROUPS = (('p', 0x01, 3), ('r', 0x02, 4), ('s', 0x04, 3))
 
 # The three enum-like PointCloud fields, and what each value costs per point. They are Text on
 # the wire and the gateway answers 400 to anything not spelled exactly like this.
@@ -78,8 +92,9 @@ def resolve_stream(name, override=None):
     stream = stream_for_filename(name)
     if stream is None:
         raise ValueError(
-            f'{name}: cannot tell whether this is a camera or a lidar capture. A capture is '
-            f'named "...-camera.bin" or "...-lidar.bin"; pass --stream to decode anything else.')
+            f'{name}: cannot tell whether this is a camera, lidar or pose capture. A capture is '
+            f'named "...-camera.bin", "...-lidar.bin" or "...-pose.bin"; pass --stream to decode '
+            f'anything else.')
     return stream
 
 
@@ -191,6 +206,73 @@ def _decode_intensity_plane(data, offset, count, intensity):
     return list(struct.unpack_from(f'<{count}B', data, offset))
 
 
+def parse_pose_body(body):
+    """One decompressed pose block body: its header, sample times, masks, groups and events.
+
+    Times are absolute epoch microseconds. A group the block writes comes back per sample in
+    meters (`p`), as a quaternion `[x, y, z, w]` (`r`) or as a scale (`s`), keyed by joint and then
+    group; a group the mask leaves out is carried over from an earlier block and is absent here.
+    `consistent` is whether the body ended exactly where its own counts say it does.
+    """
+    if len(body) < POSE_HEADER_BYTES:
+        raise ValueError(f'a pose block body of {len(body)} bytes has no 28-byte header')
+    n, j, start_us, pos_step, rot_step, scale_step = struct.unpack_from(POSE_HEADER, body, 0)
+    if n < 1 or j < 1:
+        raise ValueError(f'a pose block of {n} samples and {j} joints')
+    steps = {'p': pos_step * 1e-9, 'r': rot_step * 1e-9, 's': scale_step * 1e-9}
+    offset = POSE_HEADER_BYTES
+    deltas = struct.unpack_from(f'<{n}i', body, offset)
+    offset += 4 * n
+    times = [start_us + total for total in itertools.accumulate(deltas)]
+    masks = list(body[offset:offset + j])
+    offset += j
+    joints = {}
+    for joint in range(j):
+        for group, bit, channels in POSE_GROUPS:
+            if not masks[joint] & bit:
+                continue
+            columns = []
+            for _ in range(channels):
+                # The first value is absolute and every later one a delta from the one before.
+                raw = struct.unpack_from(f'<{n}i', body, offset)
+                offset += 4 * n
+                columns.append(list(itertools.accumulate(raw)))
+            joints.setdefault(str(joint), {})[group] = [
+                [columns[c][i] * steps[group] for c in range(channels)] for i in range(n)]
+    (event_count,) = struct.unpack_from('<i', body, offset)
+    offset += 4
+    events = [list(struct.unpack_from('<ii', body, offset + 8 * e)) for e in range(event_count)]
+    offset += 8 * event_count
+    return {
+        'sampleCount': n,
+        'jointCount': j,
+        'startUs': start_us,
+        'steps': {'pos': pos_step, 'rot': rot_step, 'scale': scale_step},
+        'times': times,
+        'masks': masks,
+        'joints': joints,
+        'events': events,
+        'consistent': offset == len(body),
+    }
+
+
+def decode_pose_block(data):
+    """One block as the envelope carries it: the prefix read, the body decompressed and parsed."""
+    if len(data) < 4 or data[0] != POSE_MAGIC or data[1] != POSE_FORMAT_VERSION:
+        raise ValueError(f'not a version {POSE_FORMAT_VERSION} pose block: {bytes(data[:4]).hex()}')
+    codec, flags = data[2], data[3]
+    if codec == POSE_CODEC_NONE:
+        body = bytes(data[4:])
+    elif codec == POSE_CODEC_ZSTD:
+        body = decompress_block(bytes(data[4:]), 1)
+    else:
+        raise ValueError(f'pose block codec {codec} is not one this tool reads')
+    decoded = parse_pose_body(body)
+    decoded['keyframe'] = bool(flags & 0x01)
+    decoded['codec'] = codec
+    return decoded
+
+
 def point_json(point):
     """`[x, y, z]`, then the (r, g, b) triple if there is colour, then intensity if there is."""
     x, y, z, rgb, intensity = point
@@ -213,6 +295,15 @@ def jpeg_filename(session_id, camera_id, part, seq):
                      str(part), str(seq))) + '.jpg'
 
 
+def load_pose_schema(schema_dir):
+    """The pose envelope's schema module. Needs pycapnp, like load_schemas."""
+    import capnp
+    capnp.remove_import_hook()
+    bundled = os.path.dirname(os.path.dirname(os.path.abspath(capnp.__file__)))
+    schema_dir = Path(schema_dir)
+    return capnp.load(str(schema_dir / 'pose_payload.capnp'), imports=[str(schema_dir), bundled])
+
+
 def load_schemas(schema_dir):
     """The camera and lidar schema modules. The only function here that needs pycapnp."""
     import capnp
@@ -230,7 +321,7 @@ def load_schemas(schema_dir):
 
 
 def header_json(payload):
-    """The eight header fields, which CameraPayload and LidarPayload share at the same ordinals."""
+    """The eight header fields, which the three payload structs share at the same ordinals."""
     return {
         'userId': payload.userId,
         'sessionId': payload.sessionId,
@@ -347,11 +438,56 @@ def pointcloud_json(cloud):
     }
 
 
-def decode_file(path, stream, schemas, extract_dir=None, scan_ranges=False):
+def properties_json(properties):
+    """A manifest's property list as a dict: each value as its union arm holds it."""
+    out = {}
+    for prop in properties:
+        arm = str(prop.which())
+        out[prop.key] = getattr(prop, arm)
+    return out
+
+
+def describe_pose(payload):
+    manifests = []
+    for manifest in payload.manifests:
+        manifests.append({
+            'manifestId': manifest.manifestId,
+            'name': manifest.name,
+            'mesh': manifest.mesh,
+            'fileType': manifest.fileType,
+            'riggingMappingType': manifest.riggingMappingType,
+            'root': manifest.root,
+            'firstSeq': manifest.firstSeq,
+            'properties': properties_json(manifest.properties),
+            'joints': [{'j': joint.j, 'meshName': joint.meshName,
+                        'properties': properties_json(joint.properties)}
+                       for joint in manifest.joints],
+        })
+    blocks = []
+    for block in payload.blocks:
+        data = bytes(block.data)
+        blocks.append({
+            'manifestId': block.manifestId,
+            'startUs': block.startUs,
+            'sampleCount': block.sampleCount,
+            'resetBefore': block.resetBefore,
+            'seq': block.seq,
+            'dataBytes': len(data),
+            'decoded': decode_pose_block(data),
+        })
+    return {'header': header_json(payload), 'startUs': payload.startUs, 'endUs': payload.endUs,
+            'manifests': manifests, 'blocks': blocks}
+
+
+def decode_file(path, stream, schemas, extract_dir=None, scan_ranges=False, pose_schema=None):
     camera, lidar = schemas
     raw = Path(path).read_bytes()
     entry = {'file': str(path), 'stream': stream, 'bytes': len(raw)}
-    if stream == 'camera':
+    if stream == 'pose':
+        payload = pose_schema.PosePayload.from_bytes_packed(
+            raw, traversal_limit_in_words=TRAVERSAL_LIMIT_WORDS)
+        entry.update(describe_pose(payload))
+    elif stream == 'camera':
         payload = camera.CameraPayload.from_bytes_packed(
             raw, traversal_limit_in_words=TRAVERSAL_LIMIT_WORDS)
         entry.update(describe_camera(payload, extract_dir))
@@ -364,8 +500,8 @@ def decode_file(path, stream, schemas, extract_dir=None, scan_ranges=False):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description='Decode camera and lidar payload captures into one JSON document.')
-    parser.add_argument('--stream', choices=('camera', 'lidar'),
+        description='Decode camera, lidar and pose payload captures into one JSON document.')
+    parser.add_argument('--stream', choices=STREAMS,
                         help='decode every file as this stream instead of reading its name')
     parser.add_argument('--schema-dir', default=str(SCHEMA_DIR),
                         help='where the vendored .capnp schemas live (default: %(default)s)')
@@ -387,7 +523,8 @@ def main(argv=None):
     if args.extract_jpeg:
         os.makedirs(args.extract_jpeg, exist_ok=True)
     schemas = load_schemas(args.schema_dir)
-    decoded = [decode_file(name, stream, schemas, args.extract_jpeg, args.scan_ranges)
+    pose_schema = load_pose_schema(args.schema_dir) if 'pose' in streams else None
+    decoded = [decode_file(name, stream, schemas, args.extract_jpeg, args.scan_ranges, pose_schema)
                for name, stream in zip(args.files, streams)]
     json.dump({'files': decoded}, sys.stdout, indent=args.indent)
     sys.stdout.write('\n')
