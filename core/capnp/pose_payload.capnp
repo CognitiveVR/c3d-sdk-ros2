@@ -7,7 +7,7 @@ $Cxx.namespace("cvr::capnp");
 
 # Envelope for the pose stream (POST /v0/pose). Cap'n Proto carries only the envelope: each block's
 # bytes are the pose block format of c3d-stream-formatter docs/pose/spec.md, which nothing on the
-# ingest path decodes. Generated Java ships to se-upload and to the Unity SDK's Android plugin, so a
+# ingest path decodes. Generated Java ships to the ingest gateway and to the Unity SDK's Android plugin, so a
 # change adds fields with the next number only -- never renumber, retype or delete a field. A field
 # added after SDK builds have shipped reads as 0 / "" / false on uploads from those builds, so its
 # zero value must mean "not sent" and must never be rejected. (The fields below were all present in
@@ -18,7 +18,7 @@ struct PosePayload {
   userId         @0 :Text;      # deviceId, same as the JSON streams' "userid"
   sessionId      @1 :Text;      # "<epochSeconds>_<deviceId>"
   sceneId        @2 :Text;      # the scene UUID the session runs in
-  sceneVersion   @3 :UInt32;    # the version NUMBER (?version=N); se-upload resolves the id
+  sceneVersion   @3 :UInt32;    # the version NUMBER (?version=N); the gateway resolves the id
   formatVersion  @4 :Text;      # "1.0"; the envelope's version, not the block's (that is byte 1 of each block)
   sessionStartMs @5 :UInt64;    # wall clock, epoch ms
   sdkVersion     @6 :Text;      # the value that reaches the JSON streams as c3d.version
