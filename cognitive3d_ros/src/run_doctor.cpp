@@ -823,6 +823,26 @@ int RunDoctor(int argc, char** argv, const NodeFactory& make, const std::string&
     return cognitive3d_ros::doctor::ExitCode(checks);
   }
   checks.push_back(cognitive3d_ros::doctor::CheckPoseChannel(channel));
+  {
+    // The node's own rule over the buffer doctor has been filling, not a second copy of it.
+    const cognitive3d_ros::TfRigSamplerConfig& rig = node->resolved_rig_config();
+    cognitive3d_ros::doctor::PoseStreamFacts pose_stream;
+    pose_stream.enabled = node->resolved_pose_enabled();
+    pose_stream.rate_hz = node->resolved_pose_rate_hz();
+    pose_stream.robot_frame = rig.robot_frame;
+    pose_stream.manifest_id = rig.manifest.manifest_id;
+    pose_stream.mesh_set = !rig.manifest.mesh.empty();
+    pose_stream.excluded = rig.excluded.size();
+    if (pose_stream.enabled) {
+      const cognitive3d_ros::Tf2RigTransforms source(buffer);
+      for (const auto& frame :
+           cognitive3d_ros::RigFramesUnder(source.Frames(), rig.robot_frame, rig.excluded)) {
+        pose_stream.frames.push_back(frame.name);
+      }
+      pose_stream.robot_frame_known = !pose_stream.frames.empty();
+    }
+    checks.push_back(cognitive3d_ros::doctor::CheckPoseStream(pose_stream));
+  }
   checks.push_back(cognitive3d_ros::doctor::CheckSimTime(
       node->get_parameter("use_sim_time").as_bool(),
       node->count_publishers("/clock") > 0, node->get_parameter("sim_time_on_wire").as_bool()));

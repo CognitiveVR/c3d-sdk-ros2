@@ -134,7 +134,8 @@ std::set<std::string> ReadConfigurationPage() {
 }
 
 // Every key path below `ros__parameters`. With `commented`, a comment whose text after "# " is a
-// YAML key counts too, at the indentation it would have uncommented.
+// YAML key counts too, at the indentation it would have uncommented; without it, only a key that
+// sets a value on its own line.
 std::set<std::string> ReferenceFileKeys(bool commented) {
   static const std::regex kKey(R"(^([A-Za-z0-9_/*.<>~-]+):(\s.*)?$)");
   static const std::string kRoot = "/**.ros__parameters.";
@@ -160,7 +161,14 @@ std::set<std::string> ReferenceFileKeys(bool commented) {
     path.emplace_back(indent, key[1].str());
     std::string joined;
     for (const auto& segment : path) joined += (joined.empty() ? "" : ".") + segment.second;
-    if (joined.rfind(kRoot, 0) == 0) keys.insert(WithPlaceholder(joined.substr(kRoot.size())));
+    // A key with nothing after it on its line only opens a nested block (`pose:`), and sets
+    // nothing. Counted where documentation is asked for, where a list's key opens its items too.
+    const std::string rest = key[2].str();
+    const std::size_t value = rest.find_first_not_of(" \t");
+    const bool sets_a_value = value != std::string::npos && rest[value] != '#';
+    if (joined.rfind(kRoot, 0) == 0 && (commented || sets_a_value)) {
+      keys.insert(WithPlaceholder(joined.substr(kRoot.size())));
+    }
   }
   return keys;
 }

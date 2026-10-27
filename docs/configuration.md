@@ -326,6 +326,26 @@ Replay draws the cone of a `cone_rangefinder` named `ultrasonic`, and the state 
 | `sensor.<name>.meaning_0` | string | `""` | — | `binary_array` only. What an element's `0` means, recorded verbatim. Empty records none. |
 | `sensor.<name>.meaning_1` | string | `""` | — | `binary_array` only. What an element's `1` means. |
 
+## The pose stream
+
+**Provisional, and off by default.** `pose.enabled: true` sends the robot's tf tree as a rig on the
+pose stream: every frame under `robot_frame`, sampled together. It needs a version of the
+Cognitive3D platform that accepts the pose stream; an older one answers every pose upload with HTTP
+400, and the node discards it. Session Replay still draws the robot from the pose timeline. [Pose
+stream](pose.md) describes what is sent. Every value below is checked at configure whether or not
+the stream is on, and an override under `pose.` that is not one of these refuses configure, naming
+the fields.
+
+| parameter | type | default | unit | what it does |
+| -- | -- | -- | -- | -- |
+| `pose.enabled` | bool | `false` | — | Send the pose stream. `false` sends nothing on it and records none of its session properties, series or events. |
+| `pose.rate_hz` | double | `10.0` | Hz | Rig samples per second, on a timer of its own apart from `sample_rate_hz`. Up to 100, and at least one sample every 30 seconds less `pose.block_interval_s` (every 25 seconds at the default), the slowest a replay can still seek in. |
+| `pose.block_interval_s` | double | `5.0` | seconds | How many seconds of samples one encoded block holds, from 0.1 to 10. |
+| `pose.exclude_frames` | string[] | `[]` | — | tf frames left out of the rig, each with every frame below it, such as a base's wheels. Naming `robot_frame`, or an empty name, refuses configure. |
+| `pose.manifest_id` | string | `""` | — | The rig's id. Empty is `ros2-` and a hash of `device_id`, the same in every session. Set it to keep one id when `device_id` changes. |
+| `pose.mesh` | string | `""` | — | An uploaded model of the robot, one glTF node per tf frame, that a viewer may draw the rig with. Empty sends none. Set it with `pose.mesh_file_type` or not at all; one without the other refuses configure. |
+| `pose.mesh_file_type` | string | `""` | — | The model's file type, such as `gltf`. |
+
 ## Remote variables
 
 [Remote variables](remote-variables.md) covers setting up a test on the dashboard and keeping each
@@ -346,10 +366,11 @@ run's draw independent.
 
 ## Development parameters
 
-These exist for capturing uploads locally while developing the SDK. Leave both at their defaults on
-a robot.
+These exist for capturing uploads locally while developing the SDK. Leave them at their defaults
+on a robot.
 
 | parameter | type | default | unit | what it does |
 | -- | -- | -- | -- | -- |
 | `gateway` | string | `""` | — | Sends telemetry to this host instead of the data host the environment names, for a local capture stub. It moves only the data host; metadata always comes from the environment. A value naming another Cognitive3D environment's data host refuses configure. |
 | `protocol` | string | `"https"` | — | `https`, or `http` for a capture stub. `http` sends the application key unencrypted, so configure refuses it unless `gateway` names a host that is not a Cognitive3D host. |
+| `pose.send_log_path` | string | `""` | — | A file the pose stream appends one JSON line to for every block upload it decides, for checking the upload rules against a capture. Empty writes none. |

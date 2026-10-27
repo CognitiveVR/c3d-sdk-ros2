@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
+#include <map>
+#include <set>
 #include <memory>
 #include <string>
 #include <utility>
@@ -542,6 +544,89 @@ TEST_F(ConfigureRefusals, ASessionPropertySetIsJudgedAgainstTheRemoteVariablesSe
   EXPECT_NE(on_with_arms.reason.find("c3d.remote_variable.speed"), std::string::npos)
       << on_with_arms.reason;
   ASSERT_TRUE(node_->set_parameter({"remote_variables", true}).successful);
+}
+
+// The pose stream's values are checked whether or not it is on, each refusal naming the
+// parameter: a rate outside what a replay can seek in, a block interval outside the format's, a
+// model named by half, an exclude list that would remove the rig's root.
+TEST_F(ConfigureRefusals, ThePoseStreamsValuesAreRefusedByNameWhetherOrNotItIsOn) {
+  const std::vector<rclcpp::Parameter> refused = {
+      {"pose.rate_hz", 0.0},           {"pose.rate_hz", -10.0},
+      {"pose.rate_hz", kNaN},          {"pose.rate_hz", 100.5},
+      // One sample every 26 s: slower than 30 s less the 5 s block interval.
+      {"pose.rate_hz", 1.0 / 26.0},
+      {"pose.block_interval_s", 0.05}, {"pose.block_interval_s", 10.5},
+      {"pose.block_interval_s", kNaN},
+      {"pose.mesh", std::string("raspbot")},
+      {"pose.mesh_file_type", std::string("gltf")},
+      {"pose.exclude_frames", std::vector<std::string>{"wheel_left_link", "base_link"}},
+      {"pose.exclude_frames", std::vector<std::string>{""}},
+  };
+  for (bool enabled : {false, true}) {
+    ASSERT_TRUE(node_->set_parameter({"pose.enabled", enabled}).successful);
+    for (const auto& bad : refused) {
+      const std::string refusal = RefusalWith(bad);
+      EXPECT_NE(refusal.find(bad.get_name()), std::string::npos)
+          << "pose.enabled " << enabled << ", " << bad.get_name() << " = "
+          << bad.value_to_string() << ": " << refusal;
+    }
+    EXPECT_EQ(RefusalWith({"pose.rate_hz", 1.0 / 25.0}), "")
+        << "one sample every 25 s is the slowest a 5 s block interval allows";
+    EXPECT_EQ(RefusalWith({"pose.rate_hz", 100.0}), "");
+  }
+  ASSERT_TRUE(node_->set_parameter({"pose.enabled", false}).successful);
+}
+
+TEST_F(ConfigureRefusals, ThePoseStreamResolvesItsRigFromTheOtherSensorsAndDeviceId) {
+  auto parameters = SharedNodeParameters();
+  parameters.push_back({"device_id", std::string("raspbot-01")});
+  parameters.push_back({"camera.front.frame", std::string("camera_link")});
+  parameters.push_back({"sensor.sonar.frame", std::string("sonar_link")});
+  parameters.push_back({"pose.enabled", true});
+  parameters.push_back({"pose.rate_hz", 20});
+  parameters.push_back({"pose.block_interval_s", 2});
+  parameters.push_back({"pose.exclude_frames", std::vector<std::string>{"wheel_left_link"}});
+  parameters.push_back({"pose.mesh", std::string("raspbot")});
+  parameters.push_back({"pose.mesh_file_type", std::string("gltf")});
+  parameters.push_back({"pose.send_log_path", std::string("/tmp/send_log.jsonl")});
+  const auto node = MakeNode(parameters);
+  ASSERT_EQ(node->configure().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE)
+      << node->configure_error();
+  EXPECT_TRUE(node->resolved_pose_enabled());
+  EXPECT_DOUBLE_EQ(node->resolved_pose_rate_hz(), 20.0);
+  EXPECT_DOUBLE_EQ(node->resolved_config().pose_block_interval_s, 2.0);
+  EXPECT_EQ(node->resolved_config().pose_send_log_path, "/tmp/send_log.jsonl");
+  const auto& rig = node->resolved_rig_config();
+  EXPECT_EQ(rig.robot_frame, "base_link");
+  EXPECT_EQ(rig.excluded, (std::set<std::string>{"wheel_left_link"}));
+  EXPECT_EQ(rig.manifest.manifest_id, "ros2-64a722d4f3a20f48") << "hashed from device_id";
+  EXPECT_EQ(rig.manifest.robot_name, "raspbot-01");
+  EXPECT_EQ(rig.manifest.mesh, "raspbot");
+  EXPECT_EQ(rig.manifest.file_type, "gltf");
+  EXPECT_EQ(rig.manifest.kinds, (std::map<std::string, std::string>{
+                                    {"camera_link", "camera"},
+                                    {"sonar_link", "cone_rangefinder"}}));
+  // The tf cache window, read from the buffer at configure.
+  EXPECT_DOUBLE_EQ(rig.frame_lost_after_s, 10.0);
+  node->cleanup();
+
+  parameters.push_back({"pose.manifest_id", std::string("raspbot-chassis-7")});
+  const auto named = MakeNode(parameters);
+  ASSERT_EQ(Configure(*named), "");
+  EXPECT_EQ(named->resolved_rig_config().manifest.manifest_id, "raspbot-chassis-7");
+
+  const auto off = MakeNode(SharedNodeParameters());
+  ASSERT_EQ(Configure(*off), "");
+  EXPECT_FALSE(off->resolved_pose_enabled()) << "off unless asked for";
+}
+
+TEST_F(ConfigureRefusals, APoseKeyNothingReadsIsRefusedByName) {
+  auto parameters = SharedNodeParameters();
+  parameters.push_back({"pose.rate_hertz", 20.0});
+  const auto node = MakeNode(parameters);
+  const std::string refusal = Configure(*node);
+  EXPECT_EQ(refusal.rfind("pose.rate_hertz is not a parameter", 0), 0u) << refusal;
+  EXPECT_NE(refusal.find("rate_hz"), std::string::npos) << refusal;
 }
 
 TEST(DefaultDeviceId, IsTheNamespaceWithoutItsSlashes) {

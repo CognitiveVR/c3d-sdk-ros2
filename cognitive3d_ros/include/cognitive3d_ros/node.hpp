@@ -36,6 +36,7 @@
 #include "cognitive3d_ros/pose_sampler.hpp"
 #include "cognitive3d_ros/qos_resolver.hpp"
 #include "cognitive3d_ros/sensor_config.hpp"
+#include "cognitive3d_ros/tf_rig_sampler.hpp"
 #include "cognitive3d_ros/session_runner.hpp"
 #include "cognitive3d_ros/topic_plan.hpp"
 #include "cognitive3d_ros/translators.hpp"
@@ -157,6 +158,11 @@ class Cognitive3DNode : public rclcpp_lifecycle::LifecycleNode {
   const std::vector<LidarConfig>& resolved_lidars() const { return lidar_configs_; }
   // The described sensors, series included, as the node RESOLVED them.
   const std::vector<SensorConfig>& resolved_sensors() const { return sensor_configs_; }
+  // The pose stream as the node RESOLVED it: whether it is on, its rate, and the rig sampler's
+  // configuration -- the frame set's rules and the manifest's id, mesh and kinds.
+  bool resolved_pose_enabled() const { return pose_enabled_; }
+  double resolved_pose_rate_hz() const { return pose_rate_hz_; }
+  const TfRigSamplerConfig& resolved_rig_config() const { return rig_config_; }
 
   // Types taken without an allowlist entry. Both carry a robot's most useful
   // events and neither has a topic name this SDK could guess -- `/battery_state`,
@@ -215,6 +221,9 @@ class Cognitive3DNode : public rclcpp_lifecycle::LifecycleNode {
   // The `sensors` group, declared lazily as the camera group is. Runs after the allowlist is
   // read, because a sensor's series is the one its topic's rule names.
   bool LoadSensorConfig(std::string* error);
+  // The `pose.*` group. Runs after the cameras, lidars and described sensors, whose frames the
+  // rig tags with `c3d.kind`, and after `device_id`, which names the rig.
+  bool LoadPoseConfig(std::string* error);
   // The refusal for the first `<block>.<name>.<field>` override nothing reads, or empty: a name
   // `list` leaves out, or a field `<block>.<name>` does not declare. Asked once every listed
   // name's block is declared, so the declarations are the one list of a block's fields. For
@@ -245,6 +254,11 @@ class Cognitive3DNode : public rclcpp_lifecycle::LifecycleNode {
   // no topic at all.
   void WarnOnSuppressedSources();
   void OnSampleTimer();
+  // The pose stream's own tick, at `pose.rate_hz`, apart from the gaze timeline's.
+  void OnPoseTimer();
+  // The pose stream's session totals, into the session about to end: every path to
+  // `SessionRunner::End` comes through here first.
+  void RecordPoseStreamTotals();
   // `participant_id` is the identity the platform draws A/B arms for and the session's
   // participant; empty means the node's device_id. A refusal this node can explain goes to
   // `refusal`.
@@ -319,6 +333,12 @@ class Cognitive3DNode : public rclcpp_lifecycle::LifecycleNode {
   std::thread tf_thread_;
   std::atomic<bool> tf_stop_{false};
   std::unique_ptr<PoseSampler> pose_sampler_;
+  // The pose stream. Built at configure when `pose.enabled`, over the same buffer, and null
+  // otherwise, which is the whole of "off": no timer, no manifest, no property.
+  bool pose_enabled_ = false;
+  double pose_rate_hz_ = 10.0;
+  TfRigSamplerConfig rig_config_;
+  std::unique_ptr<TfRigSampler> rig_sampler_;
 
   std::map<std::string, rclcpp::GenericSubscription::SharedPtr> subscriptions_;
   // The first topic subscribed for each message type, for SharedSeriesWarning.
@@ -358,6 +378,7 @@ class Cognitive3DNode : public rclcpp_lifecycle::LifecycleNode {
   rclcpp::TimerBase::SharedPtr discovery_timer_;
   rclcpp::TimerBase::SharedPtr report_timer_;
   rclcpp::TimerBase::SharedPtr sample_timer_;
+  rclcpp::TimerBase::SharedPtr pose_timer_;
   // Retries camera frames and lidar scans held for their pose. Only while a sensor is configured.
   rclcpp::TimerBase::SharedPtr media_hold_timer_;
 
@@ -437,6 +458,8 @@ class Cognitive3DNode : public rclcpp_lifecycle::LifecycleNode {
   double last_self_telemetry_ = 0.0;
   // The wire time the next pose sample is due at under `sim_time_on_wire`; 0 is "now".
   double next_sample_wire_ = 0.0;
+  // The same, for the pose stream's tick.
+  double next_pose_wire_ = 0.0;
 };
 
 }  // namespace cognitive3d_ros
