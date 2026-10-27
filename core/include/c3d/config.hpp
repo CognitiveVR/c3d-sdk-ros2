@@ -6,6 +6,7 @@
 #include "c3d/wall_clock.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -69,6 +70,20 @@ struct Config {
   std::uint64_t camera_flush_bytes = 4ull * 1024 * 1024;
   double lidar_flush_s = 2.0;
   std::uint64_t lidar_flush_bytes = 4ull * 1024 * 1024;
+
+  // The pose stream's block interval: a rigged object's samples are encoded in blocks this
+  // long. Fixed for the session, 0.1 to 10 s, and sent once as the session property
+  // `c3d.stream.pose.blockIntervalMs`. The upload queue's 11 s and 5 MiB are the platform's
+  // and not configurable.
+  double pose_block_interval_s = 5.0;
+  // For test builds: a file the pose upload queue appends one JSON line to per block part as
+  // it decides the send (spec §10.4's send log: part, queueStartUs, sentUs, reason and, on a
+  // flush part, flush), for c3d-stream-formatter's upload check. "" writes none.
+  std::string pose_send_log_path;
+  // For tests: the pose stream's monotonic clock, in microseconds. Unset, it is
+  // std::chrono::steady_clock. It times the upload queue and the host-clock block close, and
+  // nothing else.
+  std::function<std::int64_t()> pose_clock_us;
 
   // ---- Transport -----------------------------------------------------------
   // An upload is judged by whether it is MOVING, not by how long it takes. A part

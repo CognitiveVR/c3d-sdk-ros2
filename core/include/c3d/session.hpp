@@ -10,6 +10,8 @@
 #include "c3d/config.hpp"
 #include "c3d/logger.hpp"
 #include "c3d/media.hpp"
+#include "c3d/pose.hpp"
+#include "c3d/pose_manifest.hpp"
 #include "c3d/spool.hpp"
 #include "c3d/transport.hpp"
 #include "c3d/types.hpp"
@@ -73,6 +75,27 @@ struct Stats {
   std::uint64_t camera_bytes = 0;
   std::uint64_t lidar_scans = 0;
   std::uint64_t lidar_bytes = 0;
+
+  // The pose stream. Samples an object's encoder took, and those it refused (a time before
+  // the previous sample's, a value outside int32 at its step: said once per object).
+  std::uint64_t pose_samples = 0;
+  std::uint64_t pose_samples_refused = 0;
+  // Blocks encoded and queued, and their bytes as sent.
+  std::uint64_t pose_blocks = 0;
+  std::uint64_t pose_block_bytes = 0;
+  // Parts handed to the spool, block and manifest parts alike, and the manifest entries sent.
+  std::uint64_t pose_parts = 0;
+  std::uint64_t pose_manifest_sends = 0;
+  // Pose parts the gateway refused (400 and the other payload rejections), each discarded and
+  // never retried: a bug in what this SDK sent.
+  std::uint64_t pose_rejections = 0;
+  // Rotations that quantised to all zeros and were repaired, and blocks an encoder dropped.
+  std::uint64_t pose_repaired_rotations = 0;
+  std::uint64_t pose_encode_failures = 0;
+  // The longest any block took from closing to entering the upload queue, encoding included,
+  // in microseconds on the steady clock. The platform requires every closed block encoded and
+  // queued within 1 s on the target device.
+  std::int64_t pose_encode_lag_max_us = 0;
 };
 
 // A Cognitive3D session.
@@ -191,8 +214,57 @@ class Session {
                         const std::string& frame_id, const Pose& pose,
                         const EncodedPointCloud& cloud);
 
+  // ---- The pose stream ------------------------------------------------------
+  // Rigged objects, each a manifest of joints and samples of every joint, encoded into blocks
+  // of Config::pose_block_interval_s (c3d/pose.hpp) and uploaded to /v0/pose by an upload
+  // queue of the session's own. The platform's rules are c3d-stream-formatter's
+  // docs/pose/spec.md, §10 for everything this class does with a block once it is encoded.
+  //
+  // Memory-only like every Record*: both calls only hand their argument to the worker
+  // thread, which encodes, one object's blocks at a time and in close order, and queues. A
+  // block closes when a sample is at or past its interval, when its interval has passed on
+  // the steady clock since its first sample was recorded (so a robot clock that lags the host
+  // cannot shrink it), before it would pass the format's sample count, on a manifest send and
+  // at End.
+  //
+  // Parts are cut by the queue alone: when the earliest queued block entered it 11 s ago, or
+  // first when the next block would take the blocks' bytes past 5 MiB. Flush() and the
+  // auto-send interval never cut one. End() sends the queue as it is, then closes every open
+  // block and sends those as another part. A manifest goes out at once in a part of its own.
+  // Parts are spooled and retried like the camera's.
+
+  // Sends `manifests`, or sends them again: once per object at the start, and again whenever
+  // what one says changes (a joint added or gone, a property changed). The entries of one
+  // call are made at one moment and share a part, which carries nothing else and goes out at
+  // once; entries of different calls never share one. Each send closes its object's open
+  // block, which stays under the previous send, and restarts the object's encoding from a
+  // keyframe; the send's `firstSeq` is the seq the object's next block will get. A new joint
+  // count or new groups make a new encoder, whose blocks carry on the object's seq.
+  //
+  // Refused whole, with the reason in *error_out and nothing sent, while no session is open,
+  // when ManifestProblem names a problem with an entry, for an id listed twice, for a
+  // follower whose root is neither sent earlier in this session nor earlier in this call,
+  // and for an id that changes between follower and not.
+  bool SetPoseManifests(const std::vector<pose::Manifest>& manifests,
+                        std::string* error_out = nullptr);
+  bool SetPoseManifest(const pose::Manifest& manifest, std::string* error_out = nullptr);
+
+  // Records one sample of object `manifest_id`: every joint of its latest manifest, in that
+  // manifest's order, at `sample.t_us` (epoch microseconds, the caller's clock and the
+  // caller's conversion; never ROS time). Refused while no session is open, for an id with no
+  // manifest or a follower, and for a joint count other than the manifest's. The encoder's own
+  // refusals come later, on the worker, and are counted in Stats::pose_samples_refused.
+  bool RecordPoseSample(const std::string& manifest_id, const pose::PoseSample& sample,
+                        std::string* error_out = nullptr);
+
+  // One pass of the pose worker on the calling thread: encode what was recorded, close blocks
+  // whose interval has passed, check the queue's timer, spool any part it sends. Returns once
+  // every pose part decided before it is in the spool. Intended for tests, with
+  // Config::pose_clock_us; the worker does this every worker_tick_s otherwise.
+  void PumpPose();
+
   // Serialize whatever is batched and hand it to the spool, on the calling thread.
-  // Does not wait for upload.
+  // Does not wait for upload. The pose stream's parts are its queue's: see above.
   void Flush();
 
   // One upload pass on the calling thread, up to 64 chunks. Intended for tests; the

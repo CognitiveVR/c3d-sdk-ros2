@@ -115,6 +115,9 @@ std::string Config::Validate() const {
     return "camera_flush_bytes and lidar_flush_bytes cannot exceed 32 MiB; a part above the "
            "gateway's body cap is rejected whole and discarded, taking every record in it";
   if (spool_max_bytes < 1024) return "spool_max_bytes is implausibly small";
+  // The block format's range, and NaN fails both comparisons.
+  if (!(pose_block_interval_s >= 0.1 && pose_block_interval_s <= 10.0))
+    return "pose_block_interval_s must be between 0.1 and 10 seconds";
   if (!std::isfinite(retry_min_s) || !std::isfinite(retry_max_s))
     return "retry_min_s and retry_max_s must be finite numbers";
   if (retry_min_s <= 0 || retry_max_s < retry_min_s)
