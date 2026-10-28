@@ -60,7 +60,8 @@ every other stream: written to the spool first, and retried while the network is
 ### The manifest
 
 The manifest says what the rig is made of. It is sent when a session starts and again whenever the
-frame set changes. Everything in it comes from tf and from the node's own configuration:
+frame set changes. It comes from tf and from the node's own configuration, and from the robot's
+description when the robot publishes one ([below](#the-robot-description)):
 
 | field | value |
 | -- | -- |
@@ -75,7 +76,7 @@ It carries these keys, the `ros2/1` profile:
 | scope | key | value |
 | -- | -- | -- |
 | rig | `c3d.profile` | `ros2/1` |
-| rig | `ros.robotName` | `device_id` |
+| rig | `ros.robotName` | `device_id`, or the description's robot name |
 | joint | `ros.parent` | the frame's tf parent; on every joint but joint 0 |
 | joint | `c3d.kind` | `camera`, `lidar`, or a described sensor's `kind`, on a frame named by `camera.<name>.frame`, `lidar.<name>.frame` or `sensor.<name>.frame` |
 
@@ -83,8 +84,57 @@ A frame two sensors name keeps the first kind, in the order cameras, lidars, des
 camera or lidar whose `frame` is left empty takes its frame from each message, and its frame carries
 no `c3d.kind`; set the parameter to tag it.
 
-The node does not read the robot's URDF. A later release may add keys from `/robot_description`
-when the robot publishes one, beside these.
+### The robot description
+
+When something publishes the robot's description (URDF) on `/robot_description`, as
+`robot_state_publisher` does, the node reads it and adds keys to the manifest. tf still decides
+which frames are joints: the description only adds keys to the frames that are its links, and a
+link tf does not publish is not in the rig.
+
+| scope | key | value |
+| -- | -- | -- |
+| rig | `ros.robotName` | the description's `<robot name>`, in place of `device_id` |
+| rig | `ros.urdfSha256` | the lowercase hex SHA-256 of the description exactly as received |
+| rig | `c3d.model.format` | `urdf` |
+| rig | `c3d.model.formatVersion` | the description's URDF version: `1.0`, `1.1` or `1.2`, and `1.0` when it names none |
+| joint | `ros.jointName` | the URDF joint whose child is the frame's link: the name `/joint_states` uses for it |
+| joint | `ros.jointType` | `fixed`, `revolute`, `continuous`, `prismatic`, `floating` or `planar` |
+| joint | `ros.limit.lower`, `ros.limit.upper`, `ros.limit.effort`, `ros.limit.velocity`, `ros.limit.acceleration`, `ros.limit.deceleration`, `ros.limit.jerk` | the joint's limits, each only when it is bounded |
+
+- **Joint 0 carries no joint keys,** since it is posed in the reference frame rather than in a parent
+  link, and neither does a frame that is not a link of the description, such as a sensor frame
+  another node publishes.
+- **Limits are as the description's URDF version resolves them.** In URDF 1.0 and 1.1 a revolute or
+  prismatic joint's unset `lower` or `upper` is 0; in 1.2 every limit that is not given is unbounded,
+  and an unset `deceleration` is the `acceleration`. Only revolute and prismatic joints have
+  position limits: a continuous joint has none, whatever its `<limit>` says. An unbounded limit is
+  left out, so an absent key means unbounded in every version. A value too large for the platform to
+  store is left out too.
+- **A new description is sent at once.** When a different description is published, during a
+  session too, the manifest is sent again with its keys. The same description published again
+  changes nothing. One the node cannot read, such as XML that is not well formed or a description
+  the URDF format refuses, leaves the rig on tf alone, and the node logs why.
+- **The topic is `/robot_description`,** subscribed while the node is active, with the latched
+  (`transient_local`) profile `robot_state_publisher` publishes with, so a description published
+  before the node started is read. For a robot in a namespace, remap it as you remap tf:
+  `-r /robot_description:=robot_description`.
+- **`pose.read_robot_description: false`** sends the rig from tf alone and subscribes to nothing.
+
+#### What is read, and what is never sent
+
+A robot description can be your CAD and your kinematics, and its `<ros2_control>`, `<transmission>`
+and `<gazebo>` blocks can hold IP addresses, serial ports and other hardware settings. **The node
+never uploads or logs the description.** It reads only the robot's name and URDF version, each
+link's name, and each joint's name, type, parent and child links, limits, and whether it mimics
+another joint, all from the top level of `<robot>`. Nothing else is read or kept: no geometry,
+meshes or mesh paths, inertia, origins or axes, and nothing nested inside another block, such as a
+`<joint>` inside `<ros2_control>`.
+
+What reaches Cognitive3D is the keys in the table above. Link and joint names are sent, as frame
+names already are. The hash lets the platform tell that two sessions ran the same description
+without having the description itself. The node logs the robot's name, the URDF version, the link
+and joint counts and the start of the hash; a description it cannot read is logged with the reason,
+which names a joint or a link at most.
 
 ### An example
 
@@ -104,6 +154,11 @@ j=3    laser                 ros.parent base_link     c3d.kind lidar
 
 Joints are ordered parents first, and siblings by name. Each sample carries `base_link` in `map`,
 and the other three in their parents: the gimbal's movement is `camera_link`'s rotation.
+
+Were the robot to publish its manufacturer's stock description, which names `base_link` but none of
+the four other frames, the joints would stay the same: `base_link` is joint 0, which carries no
+joint keys. The rig would gain `ros.urdfSha256`, `c3d.model.format urdf` and
+`c3d.model.formatVersion 1.0`, and its `ros.robotName` would become the description's robot name.
 
 ## When a frame comes, goes or fails
 

@@ -302,8 +302,12 @@ manifests or blocks, never both:
   empty when no model is configured), `riggingMappingType` `meshName`, and one joint per tf frame,
   `j = 0` being `robot_frame`. Its properties follow the `ros2/1` profile: `c3d.profile` and
   `ros.robotName` on the rig, `ros.parent` on every joint but the first, and `c3d.kind` on a
-  configured sensor's frame. A manifest is sent again whenever the frame set changes, and its
-  `firstSeq` names the first block it describes.
+  configured sensor's frame. When the robot publishes a description on `/robot_description`, the
+  rig also carries `ros.urdfSha256`, `c3d.model.format` and `c3d.model.formatVersion`, and each
+  frame that is one of its links carries `ros.jointName`, `ros.jointType` and its bounded
+  `ros.limit.*` ([The robot description](pose.md#the-robot-description)). A manifest is sent again
+  whenever the frame set or the description changes, and its `firstSeq` names the first block it
+  describes.
 - **A block** holds `pose.block_interval_s` seconds of samples of every joint, compressed, in the
   platform's pose block format. A sample's time is wall-clock epoch microseconds. Joint 0 is
   `robot_frame` in the session's reference frame, and every other joint is its frame's transform in
