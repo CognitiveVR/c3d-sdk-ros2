@@ -62,9 +62,14 @@ bool IsSentStream(const std::string& n) {
 // evicts it with the events, which is where it belongs.
 constexpr const char* kPropertiesSuffix = "-properties";
 
-// The tier a chunk is evicted at. See Chunk::carries_properties.
-int EvictionTier(Stream stream, bool carries_properties) {
-  return carries_properties ? StreamPriority(Stream::kEvents) : StreamPriority(stream);
+// The id suffix of a pose part that carries manifests: `<seq>-pose-manifest`, after the
+// properties suffix when a chunk has both.
+constexpr const char* kPoseManifestSuffix = "-manifest";
+
+// The tier a chunk is evicted at. See Chunk::carries_properties and Chunk::carries_pose_manifest.
+int EvictionTier(Stream stream, bool carries_properties, bool carries_pose_manifest) {
+  return carries_properties || carries_pose_manifest ? StreamPriority(Stream::kEvents)
+                                                     : StreamPriority(stream);
 }
 
 std::string ErrnoText() { return std::strerror(errno); }
@@ -177,7 +182,8 @@ struct DiskSpool::Impl {
     std::uint64_t size = 0;
     Stream stream = Stream::kEvents;
     bool carries_properties = false;
-    int tier() const { return EvictionTier(stream, carries_properties); }
+    bool carries_pose_manifest = false;
+    int tier() const { return EvictionTier(stream, carries_properties, carries_pose_manifest); }
   };
   // Ordered by chunk id, which is zero-padded and monotonic, so map order is
   // FIFO by construction.
@@ -396,11 +402,15 @@ struct DiskSpool::Impl {
       const std::uintmax_t file_size = fs::file_size(path, ec);
       Entry entry;
       entry.size = ec ? 0 : static_cast<std::uint64_t>(file_size);
-      // The stream and the properties flag are encoded in the id so eviction can
+      // The stream and the tier flags are encoded in the id so eviction can
       // pick by priority without opening every file.
       const auto dash = id.find('-');
       if (dash != std::string::npos) {
         std::string suffix = id.substr(dash + 1);
+        entry.carries_pose_manifest = EndsWith(suffix, kPoseManifestSuffix);
+        if (entry.carries_pose_manifest) {
+          suffix.resize(suffix.size() - std::strlen(kPoseManifestSuffix));
+        }
         entry.carries_properties = EndsWith(suffix, kPropertiesSuffix);
         if (entry.carries_properties) {
           suffix.resize(suffix.size() - std::strlen(kPropertiesSuffix));
@@ -508,7 +518,8 @@ bool DiskSpool::WriteNamed(const Chunk& chunk, std::string* id_out) {
     // fills a robot's disk. Whether the chunk fits at all is decided first, against
     // what may be evicted for it -- its own tier and below -- so a chunk refused
     // anyway never costs the chunks that would have made room for it.
-    const int incoming_tier = EvictionTier(chunk.stream, chunk.carries_properties);
+    const int incoming_tier =
+        EvictionTier(chunk.stream, chunk.carries_properties, chunk.carries_pose_manifest);
     if (impl_->total_bytes + impl_->reserved_bytes + incoming > impl_->max_bytes) {
       std::uint64_t evictable = 0;
       for (const auto& kv : impl_->index) {
@@ -543,7 +554,8 @@ bool DiskSpool::WriteNamed(const Chunk& chunk, std::string* id_out) {
     evicted_after = impl_->evicted.load();
     if (!refused) {
       id = PadNumber(impl_->seq++, 12) + "-" + StreamName(chunk.stream) +
-           (chunk.carries_properties ? kPropertiesSuffix : "");
+           (chunk.carries_properties ? kPropertiesSuffix : "") +
+           (chunk.carries_pose_manifest ? kPoseManifestSuffix : "");
       impl_->reserved_bytes += incoming;
     }
   }
@@ -577,6 +589,7 @@ bool DiskSpool::WriteNamed(const Chunk& chunk, std::string* id_out) {
   entry.size = incoming;
   entry.stream = chunk.stream;
   entry.carries_properties = chunk.carries_properties;
+  entry.carries_pose_manifest = chunk.carries_pose_manifest;
   impl_->index[id] = entry;
   impl_->total_bytes += incoming;
   ++impl_->count;
@@ -657,6 +670,7 @@ bool DiskSpool::PeekOldest(Chunk* out, const std::set<std::string>& skip) {
     }
     out->stream = StreamFromName(stream);
     out->carries_properties = entry.carries_properties;
+    out->carries_pose_manifest = entry.carries_pose_manifest;
     out->created_at = envelope.value("created_at", 0.0);
     out->size_bytes = entry.size;
     return true;

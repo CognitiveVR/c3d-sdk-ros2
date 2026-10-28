@@ -49,6 +49,10 @@ struct Chunk {
   // carries `c3d.app.version`, so evicting this one small chunk loses the whole session.
   // DiskSpool records it in the chunk's id, where eviction reads it without opening a file.
   bool carries_properties = false;
+  // A pose part that carries manifests, which is evicted at the events tier for the same reason:
+  // no block of an object can be decoded without the manifest sent before it, so evicting this one
+  // small chunk loses every block that follows it. Recorded in the chunk's id like the above.
+  bool carries_pose_manifest = false;
   double created_at = 0.0;
   std::uint64_t size_bytes = 0;
 };

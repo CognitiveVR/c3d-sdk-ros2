@@ -463,6 +463,7 @@ struct Session::Impl {
     std::string session_id;
     bool carries_end = false;
     bool carries_properties = false;
+    bool carries_pose_manifest = false;
     std::function<std::string()> serialize;
   };
   struct PendingBatch {
@@ -622,6 +623,7 @@ struct Session::Impl {
         chunk.session_id = part.session_id;
         chunk.stream = part.stream;
         chunk.carries_properties = part.carries_properties;
+        chunk.carries_pose_manifest = part.carries_pose_manifest;
         chunk.created_at = EpochSeconds();
         spooled = spool->WriteNamed(chunk, &chunk_id);
       } catch (const std::exception& e) {
@@ -1768,6 +1770,7 @@ struct Session::Impl {
       part.records =
           send.kind == pose::Send::Kind::kBlocks ? send.blocks.size() : entry.second.size();
       part.session_id = session_id;
+      part.carries_pose_manifest = send.kind == pose::Send::Kind::kManifests;
       BinaryEnvelope envelope = header;
       envelope.part = send.part;
       part.serialize = [envelope, manifests = std::move(entry.second),

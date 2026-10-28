@@ -846,6 +846,34 @@ TEST_F(PoseSessionTest, AServerErrorIsRetriedWithTheSameBody) {
   EXPECT_EQ(session_->stats().pose_rejections, 0u);
 }
 
+// A manifest part is spooled as one, so a full spool evicts it with the events rather than with
+// the blocks that cannot be read without it; a block part is spooled at the pose stream's tier.
+TEST_F(PoseSessionTest, AManifestPartIsSpooledAtTheEventsTier) {
+  cfg_.uploads_paused = true;
+  Build();
+  ASSERT_TRUE(session_->SetPoseManifest(Rig("r", 2)));
+  Run("r", 2, 10.0, Now() + 2500 * 1000);
+  session_->End();
+  int manifests = 0;
+  int blocks = 0;
+  std::set<std::string> seen;
+  Chunk chunk;
+  while (spool_->PeekOldest(&chunk, seen)) {
+    seen.insert(chunk.id);
+    if (chunk.stream != Stream::kPose) continue;
+    const Part p = Read(chunk.body);
+    if (p.blocks.empty()) {
+      ++manifests;
+      EXPECT_TRUE(chunk.carries_pose_manifest) << chunk.id;
+    } else {
+      ++blocks;
+      EXPECT_FALSE(chunk.carries_pose_manifest) << chunk.id;
+    }
+  }
+  EXPECT_EQ(manifests, 1);
+  EXPECT_GT(blocks, 0);
+}
+
 // Parts are spooled like the camera's: a process that stops before they upload leaves them
 // for the next, which sends them as they were.
 TEST_F(PoseSessionTest, PartsSurviveARestart) {

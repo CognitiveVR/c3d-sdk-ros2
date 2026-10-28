@@ -55,7 +55,9 @@ and then sampled `pose.rate_hz` times a second (10 by default):
   and Session Replay's own mirror turns it back. See [Coordinates](coordinates.md#how-a-pose-is-converted).
 
 Samples are encoded in blocks of `pose.block_interval_s` seconds and uploaded in the background like
-every other stream: written to the spool first, and retried while the network is down.
+every other stream: written to the spool first, and retried while the network is down. At the
+spool's [size cap](sessions.md#the-size-cap), a manifest is evicted with the events rather than with
+the samples, because no sample sent after it can be read without it.
 
 ### The manifest
 

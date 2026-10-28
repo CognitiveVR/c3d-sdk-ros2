@@ -146,6 +146,45 @@ TEST_F(SpoolTest, AGazePartCarryingPropertiesIsEvictedWithTheEvents) {
   EXPECT_EQ(oldest.body, properties.body);
 }
 
+// A pose part carrying manifests is evicted with the events, not with the pose blocks it makes
+// readable: a block whose object has no manifest sent before it can never be decoded.
+TEST_F(SpoolTest, APoseManifestPartOutlivesThePoseBlocksAroundIt) {
+  const std::string big(2048, 'x');
+  DiskSpool spool(dir_.string(), 24 * 1024, std::make_shared<NullLogger>());
+  while (spool.evicted() == 0) ASSERT_TRUE(spool.Write(MakeChunk(Stream::kPose, big)));
+  Chunk manifest = MakeChunk(Stream::kPose, std::string(512, 'm'));
+  manifest.carries_pose_manifest = true;
+  ASSERT_TRUE(spool.Write(manifest));
+  const std::uint64_t evicted = spool.evicted();
+  for (int i = 0; i < 40; ++i) ASSERT_TRUE(spool.Write(MakeChunk(Stream::kPose, big)));
+  ASSERT_GT(spool.evicted(), evicted + 10) << "every block written before the manifest is gone";
+  Chunk oldest;
+  ASSERT_TRUE(spool.PeekOldest(&oldest));
+  EXPECT_TRUE(oldest.carries_pose_manifest) << "the manifest part was evicted with its blocks";
+  EXPECT_EQ(oldest.stream, Stream::kPose) << oldest.id;
+  EXPECT_EQ(oldest.body, manifest.body);
+}
+
+// The tier is in the chunk's id, so a restart keeps it without a file being opened.
+TEST_F(SpoolTest, APoseManifestPartKeepsItsTierAcrossARestart) {
+  const std::string big(2048, 'x');
+  Chunk manifest = MakeChunk(Stream::kPose, std::string(512, 'm'));
+  manifest.carries_pose_manifest = true;
+  {
+    DiskSpool spool(dir_.string(), 24 * 1024, std::make_shared<NullLogger>());
+    while (spool.evicted() == 0) ASSERT_TRUE(spool.Write(MakeChunk(Stream::kPose, big)));
+    ASSERT_TRUE(spool.Write(manifest));
+  }
+  DiskSpool reopened(dir_.string(), 24 * 1024, std::make_shared<NullLogger>());
+  for (int i = 0; i < 40; ++i) ASSERT_TRUE(reopened.Write(MakeChunk(Stream::kPose, big)));
+  ASSERT_GT(reopened.evicted(), 10u);
+  Chunk oldest;
+  ASSERT_TRUE(reopened.PeekOldest(&oldest));
+  EXPECT_TRUE(oldest.carries_pose_manifest) << "the restart forgot the tier: " << oldest.id;
+  EXPECT_EQ(oldest.stream, Stream::kPose) << oldest.id;
+  EXPECT_EQ(oldest.body, manifest.body);
+}
+
 // A spool holding nothing but events refuses a plain gaze part, which may evict only gaze and
 // below. A part carrying properties is not refused: it evicts the oldest event, as an event would.
 TEST_F(SpoolTest, APropertyPartIsNotRefusedWhereOnlyEventsAreLeft) {

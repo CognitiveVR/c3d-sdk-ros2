@@ -290,8 +290,8 @@ the lowest tier are evicted to make room. From the first evicted to the last:
 1. camera and lidar
 2. poses and sensor series
 3. the robot's Dynamic Object samples
-4. events, which carry objectives and session boundaries, and the pose parts that carry session
-   properties
+4. events, which carry objectives and session boundaries, the pose parts that carry session
+   properties, and the [pose stream](pose.md)'s manifests
 
 The pose parts that carry a session's properties are kept with the events because the platform
 discards a session whose properties never arrive, `c3d.app.version` among them. A session's last
