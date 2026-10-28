@@ -4,6 +4,9 @@
 own Z at 20 Hz, and a static `camera_optical_frame` under it. The pose stream's capture pass reads
 it as a moving joint of the rig.
 
+`--robot-description <file>` publishes that file on `/robot_description` once, latched
+(transient-local), as robot_state_publisher does, so the pose stream's rig is decorated from it.
+
 `--mount-frame` adds a STATIC sensor mount under `map` as well. Its parent is the reference
 frame itself rather than `base_link` on purpose: a sensor hanging off the robot moves, so its
 world pose is only knowable at a record's own stamp, while this one is the transform that was
@@ -16,9 +19,11 @@ import sys
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from tf2_ros import TransformBroadcaster, StaticTransformBroadcaster
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
+from std_msgs.msg import String
 
 
 # The gimbal's mount on the body and how far it pans either way.
@@ -83,6 +88,14 @@ class TfPub(Node):
             m.transform.rotation.w = qw
             statics.append(m)
         self.static_br.sendTransform(statics)
+        if args.robot_description:
+            # Exactly the file's text, line ends included: the rig carries its hash.
+            with open(args.robot_description, encoding='utf-8', newline='') as f:
+                description = String(data=f.read())
+            latched = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                                 durability=DurabilityPolicy.TRANSIENT_LOCAL)
+            self.description_pub = self.create_publisher(String, '/robot_description', latched)
+            self.description_pub.publish(description)
         self.create_timer(0.05, self.tick)
 
     def tick(self):
@@ -128,6 +141,8 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--gimbal', action='store_true',
                         help='also publish camera_link panning under base_link, and its optical frame')
+    parser.add_argument('--robot-description', default='',
+                        help='also publish this URDF file on /robot_description, latched')
     parser.add_argument('--mount-frame', default='',
                         help='also publish a static sensor mount by this name (default: none)')
     parser.add_argument('--mount-parent', default='map',

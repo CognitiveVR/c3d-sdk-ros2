@@ -113,8 +113,10 @@ MOUNT_RPY_DEG=20,35,55
 
 echo "=== starting the stub gateway and the fakes ==="
 start stub_gateway python3 /src/tools/stub_gateway.py 8931 "$CAPTURE"
-# With a camera on a panning gimbal: a moving joint for the pose stream's rig.
-start tf_publisher python3 /src/tools/fake_tf_publisher.py --gimbal
+# With a camera on a panning gimbal: a moving joint for the pose stream's rig. And a robot
+# description, latched before the node starts, which decorates the rig.
+start tf_publisher python3 /src/tools/fake_tf_publisher.py --gimbal \
+  --robot-description /src/tools/synthetic_robot_description.urdf
 start nav_server python3 /src/tools/fake_nav_server.py
 # The three the binary streams need. Rates above what the node is configured to
 # take, so the rate gate is exercised rather than merely satisfied.
@@ -159,6 +161,7 @@ echo
 echo "=== assertions ==="
 RUN_START="$RUN_START" RUN_END="$RUN_END" CAPTURE="$CAPTURE" LOGS="$LOGS" python3 - <<'PY'
 import glob
+import hashlib
 import json
 import math
 import os
@@ -341,8 +344,20 @@ if pose_files:
     check(first['mesh'] == '' and first['fileType'] == '' and
           first['riggingMappingType'] == 'meshName' and first['root'] == '',
           'no model, meshName mapping, no root')
-    check(first['properties'] == {'c3d.profile': 'ros2/1', 'ros.robotName': 'sim-robot-01'},
-          f'the rig carries the ros2/1 object keys: {first["properties"]}')
+    # The description is latched before the node starts, but it and the first tick race, so the
+    # first manifest may be tf's alone; the last one is decorated from it.
+    tier1 = {'c3d.profile': 'ros2/1', 'ros.robotName': 'sim-robot-01'}
+    with open('/src/tools/synthetic_robot_description.urdf', 'rb') as f:
+        description_sha = hashlib.sha256(f.read()).hexdigest()
+    tier2 = {'c3d.profile': 'ros2/1', 'ros.robotName': 'synthetic_bot',
+             'ros.urdfSha256': description_sha, 'c3d.model.format': 'urdf',
+             'c3d.model.formatVersion': '1.2'}
+    check(all(m['properties'] in (tier1, tier2) for m in manifests),
+          f'every manifest carries the ros2/1 object keys, tf\'s alone or with the robot '
+          f'description\'s: {[m["properties"] for m in manifests]}')
+    check(manifests[-1]['properties'] == tier2,
+          f'the last manifest carries the robot description\'s name, hash and version: '
+          f'{manifests[-1]["properties"]}')
     last = manifests[-1]
     names = [j['meshName'] for j in last['joints']]
     check(names == ['base_link', 'base_scan', 'camera_link', 'camera_optical_frame'],
@@ -356,6 +371,34 @@ if pose_files:
           f'every other joint names its tf parent: {by_name}')
     check(by_name.get('base_scan', {}).get('c3d.kind') == 'lidar',
           'base_scan, the depth lidar\'s configured frame, is tagged lidar')
+    check(by_name.get('base_link') == {},
+          f'the root carries no joint keys: {by_name.get("base_link")}')
+    check(by_name.get('camera_link') == {'ros.parent': 'base_link', 'ros.jointName': 'gimbal_pan',
+                                         'ros.jointType': 'revolute', 'ros.limit.lower': -0.8,
+                                         'ros.limit.upper': 0.8, 'ros.limit.velocity': 3.0},
+          f'camera_link carries its URDF joint and only its bounded limits: '
+          f'{by_name.get("camera_link")}')
+    check(by_name.get('base_scan', {}).get('ros.jointName') == 'scan_mount' and
+          by_name.get('base_scan', {}).get('ros.jointType') == 'fixed' and
+          by_name.get('camera_optical_frame', {}).get('ros.jointName') == 'camera_optical_joint',
+          'the fixed joints are named and typed')
+    check('wheel_left_link' not in by_name, 'a URDF link tf does not publish is no joint')
+    # The description's <ros2_control> holds an address and a serial port. Nothing that left the
+    # node, and nothing it logged, may carry them: every capture's bytes and every log are searched.
+    leaked = []
+    for path in sorted(glob.glob(os.path.join(capture, '*')) +
+                       glob.glob(os.path.join(os.environ['LOGS'], '*.log'))):
+        if os.path.isfile(path) and not path.endswith(('tf_publisher.log', 'build.log')):
+            with open(path, 'rb') as f:
+                body = f.read()
+            if b'192.0.2.55' in body or b'SECRET' in body:
+                leaked.append(os.path.basename(path))
+    check(not leaked, f'nothing of the description\'s <ros2_control> reached a capture or a log: '
+                      f'{leaked}')
+    with open(os.path.join(os.environ['LOGS'], 'node.log')) as f:
+        node_log = f.read()
+    check("robot description read: robot 'synthetic_bot', URDF 1.2" in node_log,
+          'the node logs the description it read by name and version')
 
     blocks = [b for e in block_parts for b in e['blocks']]
     check(bool(blocks), f'pose blocks captured: {len(blocks)}')

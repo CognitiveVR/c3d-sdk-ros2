@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<!-- The capture tier's robot description, published by fake_tf_publisher.py on
+     /robot_description. Its links are the fake robot's tf frames under base_link, plus a wheel tf
+     never publishes; its <ros2_control> block carries a made-up address and serial port
+     (192.0.2.0/24 is the documentation range) that must reach no capture and no log. -->
+<robot name="synthetic_bot" version="1.2">
+  <link name="base_link"/>
+  <link name="base_scan"/>
+  <link name="camera_link"/>
+  <link name="camera_optical_frame"/>
+  <link name="wheel_left_link"/>
+  <joint name="scan_mount" type="fixed">
+    <parent link="base_link"/>
+    <child link="base_scan"/>
+    <origin xyz="0 0 0.2"/>
+  </joint>
+  <joint name="gimbal_pan" type="revolute">
+    <parent link="base_link"/>
+    <child link="camera_link"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.8" upper="0.8" velocity="3.0"/>
+  </joint>
+  <joint name="camera_optical_joint" type="fixed">
+    <parent link="camera_link"/>
+    <child link="camera_optical_frame"/>
+  </joint>
+  <joint name="wheel_left_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="wheel_left_link"/>
+  </joint>
+  <ros2_control name="SyntheticSystem" type="system">
+    <hardware>
+      <plugin>synthetic_SECRET_driver/Hardware</plugin>
+      <param name="robot_ip">192.0.2.55</param>
+      <param name="serial_port">/dev/ttySECRET0</param>
+    </hardware>
+  </ros2_control>
+</robot>
