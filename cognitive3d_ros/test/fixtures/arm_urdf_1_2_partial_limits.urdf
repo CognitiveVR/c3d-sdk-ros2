@@ -1,0 +1,51 @@
+<?xml version="1.0"?>
+<!-- A URDF 1.2 arm with every joint type and limits given in part: what each unset limit
+     resolves to is what the tests pin. quat_xyzw is a 1.1 addition, here so a reader of an older
+     version would trip on it if it read origins, which this one does not. -->
+<robot name="arm_v12" version="1.2">
+  <link name="base_link"/>
+  <link name="shoulder_link"/>
+  <link name="elbow_link"/>
+  <link name="slider_link"/>
+  <link name="wheel_link"/>
+  <link name="tool_link"/>
+  <link name="float_link"/>
+  <link name="plane_link"/>
+  <joint name="shoulder_joint" type="revolute">
+    <origin xyz="0 0 0.1" quat_xyzw="0 0 0 1"/>
+    <parent link="base_link"/>
+    <child link="shoulder_link"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.5" upper="1.5" velocity="2.0" acceleration="4.0"/>
+  </joint>
+  <joint name="elbow_joint" type="revolute">
+    <parent link="shoulder_link"/>
+    <child link="elbow_link"/>
+    <limit lower="-2.0" upper="2.0" effort="30" velocity="1.5" acceleration="3.0"
+           deceleration="6.0" jerk="50"/>
+    <mimic joint="shoulder_joint" multiplier="-1" offset="0"/>
+  </joint>
+  <joint name="slider_joint" type="prismatic">
+    <parent link="elbow_link"/>
+    <child link="slider_link"/>
+    <limit lower="0" upper="0.3"/>
+  </joint>
+  <joint name="wheel_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="wheel_link"/>
+    <limit velocity="10" effort="inf"/>
+  </joint>
+  <joint name="tool_joint" type="fixed">
+    <parent link="slider_link"/>
+    <child link="tool_link"/>
+  </joint>
+  <joint name="float_joint" type="floating">
+    <parent link="base_link"/>
+    <child link="float_link"/>
+  </joint>
+  <joint name="plane_joint" type="planar">
+    <parent link="base_link"/>
+    <child link="plane_link"/>
+    <limit lower="-1" upper="1" effort="5"/>
+  </joint>
+</robot>

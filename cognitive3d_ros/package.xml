@@ -45,6 +45,8 @@
   <depend>tf2</depend>
   <depend>tf2_ros</depend>
   <depend>cognitive3d_ros_msgs</depend>
+  <!-- The robot description parser. Already on every ROS 2 install: Fast DDS and urdfdom link it. -->
+  <depend>tinyxml2_vendor</depend>
 
   <!-- Camera frames are decoded, resized and JPEG-encoded here. -->
   <depend>cv_bridge</depend>
