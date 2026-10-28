@@ -7,7 +7,7 @@
 #include <sstream>
 
 #include "json_dump.hpp"
-#include "sha256.hpp"
+#include "c3d/sha256.hpp"
 #include "util.hpp"
 
 namespace c3d {

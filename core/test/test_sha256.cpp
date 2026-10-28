@@ -5,7 +5,7 @@
 
 #include <string>
 
-#include "sha256.hpp"
+#include "c3d/sha256.hpp"
 
 using c3d::Sha256Hex;
 
