@@ -3,6 +3,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <std_msgs/msg/string.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -163,6 +164,12 @@ class Cognitive3DNode : public rclcpp_lifecycle::LifecycleNode {
   bool resolved_pose_enabled() const { return pose_enabled_; }
   double resolved_pose_rate_hz() const { return pose_rate_hz_; }
   const TfRigSamplerConfig& resolved_rig_config() const { return rig_config_; }
+  bool resolved_pose_read_robot_description() const { return pose_read_robot_description_; }
+  // The robot description the rig is decorated from, or null: none read, the stream off, or the
+  // node not active.
+  std::shared_ptr<const UrdfDescription> robot_description() const {
+    return rig_sampler_ ? rig_sampler_->description() : nullptr;
+  }
 
   // Types taken without an allowlist entry. Both carry a robot's most useful
   // events and neither has a topic name this SDK could guess -- `/battery_state`,
@@ -256,6 +263,9 @@ class Cognitive3DNode : public rclcpp_lifecycle::LifecycleNode {
   void OnSampleTimer();
   // The pose stream's own tick, at `pose.rate_hz`, apart from the gaze timeline's.
   void OnPoseTimer();
+  // One message on `/robot_description`: parsed, and the rig decorated from it, or from nothing
+  // when it cannot be read.
+  void OnRobotDescription(const std::string& xml);
   // The pose stream's session totals, into the session about to end: every path to
   // `SessionRunner::End` comes through here first.
   void RecordPoseStreamTotals();
@@ -339,6 +349,8 @@ class Cognitive3DNode : public rclcpp_lifecycle::LifecycleNode {
   double pose_rate_hz_ = 10.0;
   TfRigSamplerConfig rig_config_;
   std::unique_ptr<TfRigSampler> rig_sampler_;
+  // `pose.read_robot_description`: whether the rig is decorated from `/robot_description`.
+  bool pose_read_robot_description_ = true;
 
   std::map<std::string, rclcpp::GenericSubscription::SharedPtr> subscriptions_;
   // The first topic subscribed for each message type, for SharedSeriesWarning.
@@ -385,6 +397,8 @@ class Cognitive3DNode : public rclcpp_lifecycle::LifecycleNode {
   rclcpp::Service<cognitive3d_ros_msgs::srv::StartSession>::SharedPtr start_session_srv_;
   rclcpp::Service<cognitive3d_ros_msgs::srv::EndSession>::SharedPtr end_session_srv_;
   rclcpp::Subscription<cognitive3d_ros_msgs::msg::Event>::SharedPtr event_sub_;
+  // Only while active, and only with the pose stream on and `pose.read_robot_description`.
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr robot_description_sub_;
   double last_event_warn_ = 0.0;
   // Per session: a stamp from before the session is said once, not once per event.
   bool warned_event_before_session_ = false;

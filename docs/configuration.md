@@ -345,6 +345,7 @@ the fields.
 | `pose.manifest_id` | string | `""` | — | The rig's id. Empty is `ros2-` and a hash of `device_id`, the same in every session. Set it to keep one id when `device_id` changes. |
 | `pose.mesh` | string | `""` | — | An uploaded model of the robot, one glTF node per tf frame, that a viewer may draw the rig with. Empty sends none. Set it with `pose.mesh_file_type` or not at all; one without the other refuses configure. |
 | `pose.mesh_file_type` | string | `""` | — | The model's file type, such as `gltf`. |
+| `pose.read_robot_description` | bool | `true` | — | Decorate the rig from the robot description on `/robot_description`, when something publishes one: the robot's name, the description's SHA-256, and each frame that is a link of it carries its joint's name, type and finite limits. Only those fields are read; the description itself is never sent or logged ([what is read](pose.md#the-robot-description)). `false` sends the rig from tf alone and subscribes to nothing. |
 
 ## Remote variables
 

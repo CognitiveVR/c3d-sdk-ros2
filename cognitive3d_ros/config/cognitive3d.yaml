@@ -204,6 +204,7 @@
       manifest_id: ""                   # empty: ros2- and a hash of device_id
       mesh: ""                          # an uploaded per-frame model; both or neither
       mesh_file_type: ""
+      read_robot_description: true      # joint names, types, limits from it; never sent itself
       send_log_path: ""                 # development only: the upload decisions, one JSON line each
 
     # ---- Remote variables --------------------------------------------------------

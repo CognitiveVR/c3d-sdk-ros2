@@ -537,6 +537,9 @@ void Cognitive3DNode::DeclareParameters() {
   declare_parameter<std::string>("pose.mesh", "");
   declare_parameter<std::string>("pose.mesh_file_type", "");
   declare_parameter<std::string>("pose.send_log_path", c3d_config_.pose_send_log_path);
+  // On with the stream: a robot description adds the joints' names, types and limits to the rig.
+  // Only whitelisted fields are read and the XML never leaves the node, so it is the default.
+  declare_parameter<bool>("pose.read_robot_description", true);
 
   // Actions and the two standard event types are enrolled without an allowlist
   // entry, because their topic names are a deployment detail the SDK cannot guess
@@ -1358,6 +1361,7 @@ bool Cognitive3DNode::LoadPoseConfig(std::string* error) {
     return false;
   }
   c3d_config_.pose_send_log_path = get_parameter("pose.send_log_path").as_string();
+  pose_read_robot_description_ = get_parameter("pose.read_robot_description").as_bool();
 
   rig_config_ = TfRigSamplerConfig();
   rig_config_.robot_frame = sampler_config_.robot_frame;
@@ -1547,14 +1551,17 @@ LifecycleNodeInterface::CallbackReturn Cognitive3DNode::on_configure(
         std::make_shared<Tf2RigTransforms>(tf_buffer_), rig_config_);
     RCLCPP_INFO(get_logger(),
                 "pose stream on (provisional): the tf tree under '%s' at %.2f Hz as rig '%s', in "
-                "blocks of %.1fs; %zu frame(s) excluded; model %s. Only a platform that accepts "
-                "the pose stream takes it, and an older one refuses every part.",
+                "blocks of %.1fs; %zu frame(s) excluded; model %s; %s. Only a platform that "
+                "accepts the pose stream takes it, and an older one refuses every part.",
                 rig_config_.robot_frame.c_str(), pose_rate_hz_,
                 rig_config_.manifest.manifest_id.c_str(), c3d_config_.pose_block_interval_s,
                 rig_config_.excluded.size(),
                 rig_config_.manifest.mesh.empty() ? "none, so Session Replay draws the robot from "
                                                     "the gaze stream"
-                                                  : rig_config_.manifest.mesh.c_str());
+                                                  : rig_config_.manifest.mesh.c_str(),
+                pose_read_robot_description_
+                    ? "joint names, types and limits from /robot_description when it has one"
+                    : "/robot_description not read (pose.read_robot_description is false)");
   }
 
   if (!sampler_config_.gaze_frame.empty()) {
@@ -1777,6 +1784,17 @@ bool Cognitive3DNode::BringUp() {
   // receives no topic traffic at all. On a thread of its own, so tf ingestion cannot be starved by
   // this node's callbacks.
   StartTransformListener();
+  if (rig_sampler_ && pose_read_robot_description_) {
+    // What robot_state_publisher offers: reliable and transient-local, so the description it
+    // published before this node subscribed is delivered now. Absolute, as tf's topics are: a
+    // robot in a namespace remaps it with the node's tf remaps.
+    robot_description_sub_ = create_subscription<std_msgs::msg::String>(
+        "/robot_description", rclcpp::QoS(1).reliable().transient_local(),
+        [this](const std_msgs::msg::String::SharedPtr message) {
+          OnRobotDescription(message->data);
+        },
+        SubscriptionOptionsInGroup());
+  }
   // Reliable with a deep queue: a mission's events are low-rate and each one is a fact nothing
   // else records, so losing one to a full queue is not a trade-off worth making.
   event_sub_ = create_subscription<cognitive3d_ros_msgs::msg::Event>(
@@ -2459,6 +2477,9 @@ void Cognitive3DNode::TearDownSubscriptions() {
   media_subscriptions_.clear();
   for (auto& kv : stats_) kv.second.subscribed = false;
   event_sub_.reset();
+  robot_description_sub_.reset();
+  // Read again at the next activation, from whatever publishes it then.
+  if (rig_sampler_) rig_sampler_->SetDescription(nullptr);
   StopTransformListener();
   // Its dynamic transforms go too, so a later activation never samples a pose from before this
   // one. tf2 keeps static transforms through a clear, which is what they are.
@@ -3040,6 +3061,28 @@ void Cognitive3DNode::OnPoseTimer() {
   for (const std::string& warning : rig_sampler_->TakeWarnings()) {
     RCLCPP_WARN(get_logger(), "%s", warning.c_str());
   }
+}
+
+void Cognitive3DNode::OnRobotDescription(const std::string& xml) {
+  if (rig_sampler_ == nullptr) return;
+  auto description = std::make_shared<UrdfDescription>();
+  std::string error;
+  if (!ParseUrdfDescription(xml, description.get(), &error)) {
+    // The parser's refusal names a joint or link at most, never the XML around it.
+    RCLCPP_WARN(get_logger(),
+                "pose stream: the robot description on /robot_description cannot be read (%s); "
+                "the rig is sent from tf alone",
+                error.c_str());
+    rig_sampler_->SetDescription(nullptr);
+    return;
+  }
+  const auto& current = rig_sampler_->description();
+  if (current && current->sha256 == description->sha256) return;
+  RCLCPP_INFO(get_logger(),
+              "pose stream: robot description read: %s. The rig's frames that are its links carry "
+              "their joints' names, types and limits; nothing else in it is kept or sent",
+              DescribeUrdf(*description).c_str());
+  rig_sampler_->SetDescription(std::move(description));
 }
 
 void Cognitive3DNode::RecordPoseStreamTotals() {
