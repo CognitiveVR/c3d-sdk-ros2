@@ -3,6 +3,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <std_msgs/msg/string.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -36,6 +37,7 @@
 #include "cognitive3d_ros/pose_sampler.hpp"
 #include "cognitive3d_ros/qos_resolver.hpp"
 #include "cognitive3d_ros/sensor_config.hpp"
+#include "cognitive3d_ros/tf_rig_sampler.hpp"
 #include "cognitive3d_ros/session_runner.hpp"
 #include "cognitive3d_ros/topic_plan.hpp"
 #include "cognitive3d_ros/translators.hpp"
@@ -157,6 +159,17 @@ class Cognitive3DNode : public rclcpp_lifecycle::LifecycleNode {
   const std::vector<LidarConfig>& resolved_lidars() const { return lidar_configs_; }
   // The described sensors, series included, as the node RESOLVED them.
   const std::vector<SensorConfig>& resolved_sensors() const { return sensor_configs_; }
+  // The pose stream as the node RESOLVED it: whether it is on, its rate, and the rig sampler's
+  // configuration -- the frame set's rules and the manifest's id, mesh and kinds.
+  bool resolved_pose_enabled() const { return pose_enabled_; }
+  double resolved_pose_rate_hz() const { return pose_rate_hz_; }
+  const TfRigSamplerConfig& resolved_rig_config() const { return rig_config_; }
+  bool resolved_pose_read_robot_description() const { return pose_read_robot_description_; }
+  // The robot description the rig is decorated from, or null: none read, the stream off, or the
+  // node not active.
+  std::shared_ptr<const UrdfDescription> robot_description() const {
+    return rig_sampler_ ? rig_sampler_->description() : nullptr;
+  }
 
   // Types taken without an allowlist entry. Both carry a robot's most useful
   // events and neither has a topic name this SDK could guess -- `/battery_state`,
@@ -215,6 +228,9 @@ class Cognitive3DNode : public rclcpp_lifecycle::LifecycleNode {
   // The `sensors` group, declared lazily as the camera group is. Runs after the allowlist is
   // read, because a sensor's series is the one its topic's rule names.
   bool LoadSensorConfig(std::string* error);
+  // The `pose.*` group. Runs after the cameras, lidars and described sensors, whose frames the
+  // rig tags with `c3d.kind`, and after `device_id`, which names the rig.
+  bool LoadPoseConfig(std::string* error);
   // The refusal for the first `<block>.<name>.<field>` override nothing reads, or empty: a name
   // `list` leaves out, or a field `<block>.<name>` does not declare. Asked once every listed
   // name's block is declared, so the declarations are the one list of a block's fields. For
@@ -245,6 +261,14 @@ class Cognitive3DNode : public rclcpp_lifecycle::LifecycleNode {
   // no topic at all.
   void WarnOnSuppressedSources();
   void OnSampleTimer();
+  // The pose stream's own tick, at `pose.rate_hz`, apart from the gaze timeline's.
+  void OnPoseTimer();
+  // One message on `/robot_description`: parsed, and the rig decorated from it, or from nothing
+  // when it cannot be read.
+  void OnRobotDescription(const std::string& xml);
+  // The pose stream's session totals, into the session about to end: every path to
+  // `SessionRunner::End` comes through here first.
+  void RecordPoseStreamTotals();
   // `participant_id` is the identity the platform draws A/B arms for and the session's
   // participant; empty means the node's device_id. A refusal this node can explain goes to
   // `refusal`.
@@ -319,6 +343,14 @@ class Cognitive3DNode : public rclcpp_lifecycle::LifecycleNode {
   std::thread tf_thread_;
   std::atomic<bool> tf_stop_{false};
   std::unique_ptr<PoseSampler> pose_sampler_;
+  // The pose stream. Built at configure when `pose.enabled`, over the same buffer, and null
+  // otherwise, which is the whole of "off": no timer, no manifest, no property.
+  bool pose_enabled_ = false;
+  double pose_rate_hz_ = 10.0;
+  TfRigSamplerConfig rig_config_;
+  std::unique_ptr<TfRigSampler> rig_sampler_;
+  // `pose.read_robot_description`: whether the rig is decorated from `/robot_description`.
+  bool pose_read_robot_description_ = true;
 
   std::map<std::string, rclcpp::GenericSubscription::SharedPtr> subscriptions_;
   // The first topic subscribed for each message type, for SharedSeriesWarning.
@@ -358,12 +390,15 @@ class Cognitive3DNode : public rclcpp_lifecycle::LifecycleNode {
   rclcpp::TimerBase::SharedPtr discovery_timer_;
   rclcpp::TimerBase::SharedPtr report_timer_;
   rclcpp::TimerBase::SharedPtr sample_timer_;
+  rclcpp::TimerBase::SharedPtr pose_timer_;
   // Retries camera frames and lidar scans held for their pose. Only while a sensor is configured.
   rclcpp::TimerBase::SharedPtr media_hold_timer_;
 
   rclcpp::Service<cognitive3d_ros_msgs::srv::StartSession>::SharedPtr start_session_srv_;
   rclcpp::Service<cognitive3d_ros_msgs::srv::EndSession>::SharedPtr end_session_srv_;
   rclcpp::Subscription<cognitive3d_ros_msgs::msg::Event>::SharedPtr event_sub_;
+  // Only while active, and only with the pose stream on and `pose.read_robot_description`.
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr robot_description_sub_;
   double last_event_warn_ = 0.0;
   // Per session: a stamp from before the session is said once, not once per event.
   bool warned_event_before_session_ = false;
@@ -437,6 +472,8 @@ class Cognitive3DNode : public rclcpp_lifecycle::LifecycleNode {
   double last_self_telemetry_ = 0.0;
   // The wire time the next pose sample is due at under `sim_time_on_wire`; 0 is "now".
   double next_sample_wire_ = 0.0;
+  // The same, for the pose stream's tick.
+  double next_pose_wire_ = 0.0;
 };
 
 }  // namespace cognitive3d_ros

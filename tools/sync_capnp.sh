@@ -15,7 +15,7 @@ set -euo pipefail
 # list is explicit: a schema joins it in the change that starts writing it, and
 # test_capnp_vendored.py names the same files. Alphabetical, so CHECKSUMS is
 # byte-stable across machines and shells.
-SCHEMAS=(camera_payload.capnp common_payload.capnp java.capnp lidar_payload.capnp)
+SCHEMAS=(camera_payload.capnp common_payload.capnp java.capnp lidar_payload.capnp pose_payload.capnp)
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENDOR_DIR="$REPO_ROOT/core/capnp"

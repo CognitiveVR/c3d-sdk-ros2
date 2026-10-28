@@ -290,8 +290,8 @@ the lowest tier are evicted to make room. From the first evicted to the last:
 1. camera and lidar
 2. poses and sensor series
 3. the robot's Dynamic Object samples
-4. events, which carry objectives and session boundaries, and the pose parts that carry session
-   properties
+4. events, which carry objectives and session boundaries, the pose parts that carry session
+   properties, and the [pose stream](pose.md)'s manifests
 
 The pose parts that carry a session's properties are kept with the events because the platform
 discards a session whose properties never arrive, `c3d.app.version` among them. A session's last
@@ -402,6 +402,7 @@ actions. `, refusing <n>` follows when it refuses some. The session line:
 | `session` | The open session's id. Empty between sessions. |
 | `poses=` | Pose samples recorded in this session. It rises at `sample_rate_hz` while the pose resolves. |
 | `frame=` | The reference frame the poses are in: `reference_frame`, or `fallback_reference_frame` after a fallback (see [Reference frames](coordinates.md#reference-frames)). Empty until the first pose. |
+| `rig=`, `rig_held=`, `rig_lost=` | With `pose.enabled` only: the [pose stream](pose.md)'s joints and samples in this session as `<joints>/<samples>`, the values held for a frame tf could not look up, and the frames that left the rig. |
 | `recorded=` | Records taken into sessions since configure: poses, sensor samples, events and Dynamic Object samples. Camera frames and lidar scans are not counted here. |
 | `dropped=` | Records lost before they reached the spool, since configure, as `c3d.records_dropped`. Anything above 0 is lost data; see [The size cap](#the-size-cap). |
 | `uploaded=` | Chunks the platform accepted, since configure. |

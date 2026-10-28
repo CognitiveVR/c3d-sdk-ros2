@@ -1,5 +1,12 @@
 """Publishes a moving map->odom->base_link chain, with a deliberate relocalisation jump.
 
+`--gimbal` adds a camera on a panning gimbal under `base_link`: `camera_link`, turning about its
+own Z at 20 Hz, and a static `camera_optical_frame` under it. The pose stream's capture pass reads
+it as a moving joint of the rig.
+
+`--robot-description <file>` publishes that file on `/robot_description` once, latched
+(transient-local), as robot_state_publisher does, so the pose stream's rig is decorated from it.
+
 `--mount-frame` adds a STATIC sensor mount under `map` as well. Its parent is the reference
 frame itself rather than `base_link` on purpose: a sensor hanging off the robot moves, so its
 world pose is only knowable at a record's own stamp, while this one is the transform that was
@@ -12,9 +19,17 @@ import sys
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from tf2_ros import TransformBroadcaster, StaticTransformBroadcaster
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
+from std_msgs.msg import String
+
+
+# The gimbal's mount on the body and how far it pans either way.
+GIMBAL_X_METERS = 0.08
+GIMBAL_Z_METERS = 0.1
+GIMBAL_PAN_RADIANS = 0.6
 
 
 def quaternion_from_rpy(roll, pitch, yaw):
@@ -50,6 +65,14 @@ class TfPub(Node):
         s.transform.translation.z = 0.2; s.transform.rotation.w = 1.0
         s.header.stamp = now
         statics.append(s)
+        self.gimbal = args.gimbal
+        if self.gimbal:
+            o = TransformStamped()
+            o.header.stamp = now
+            o.header.frame_id = "camera_link"; o.child_frame_id = "camera_optical_frame"
+            o.transform.rotation.x = -0.5; o.transform.rotation.y = 0.5
+            o.transform.rotation.z = -0.5; o.transform.rotation.w = 0.5
+            statics.append(o)
         if args.mount_frame:
             x, y, z = args.mount_xyz
             qx, qy, qz, qw = quaternion_from_rpy(*(math.radians(a) for a in args.mount_rpy_deg))
@@ -65,6 +88,14 @@ class TfPub(Node):
             m.transform.rotation.w = qw
             statics.append(m)
         self.static_br.sendTransform(statics)
+        if args.robot_description:
+            # Exactly the file's text, line ends included: the rig carries its hash.
+            with open(args.robot_description, encoding='utf-8', newline='') as f:
+                description = String(data=f.read())
+            latched = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                                 durability=DurabilityPolicy.TRANSIENT_LOCAL)
+            self.description_pub = self.create_publisher(String, '/robot_description', latched)
+            self.description_pub.publish(description)
         self.create_timer(0.05, self.tick)
 
     def tick(self):
@@ -87,6 +118,16 @@ class TfPub(Node):
         ob.transform.rotation.w = math.cos(yaw / 2.0)
         self.br.sendTransform(ob)
 
+        if self.gimbal:
+            pan = GIMBAL_PAN_RADIANS * math.sin(self.t)
+            g = TransformStamped()
+            g.header.stamp = now; g.header.frame_id = "base_link"; g.child_frame_id = "camera_link"
+            g.transform.translation.x = GIMBAL_X_METERS
+            g.transform.translation.z = GIMBAL_Z_METERS
+            g.transform.rotation.z = math.sin(pan / 2.0)
+            g.transform.rotation.w = math.cos(pan / 2.0)
+            self.br.sendTransform(g)
+
         o = Odometry()
         o.header.stamp = now; o.header.frame_id = "odom"; o.child_frame_id = "base_link"
         o.pose.pose.position.x = self.t * 0.5
@@ -98,6 +139,10 @@ class TfPub(Node):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument('--gimbal', action='store_true',
+                        help='also publish camera_link panning under base_link, and its optical frame')
+    parser.add_argument('--robot-description', default='',
+                        help='also publish this URDF file on /robot_description, latched')
     parser.add_argument('--mount-frame', default='',
                         help='also publish a static sensor mount by this name (default: none)')
     parser.add_argument('--mount-parent', default='map',

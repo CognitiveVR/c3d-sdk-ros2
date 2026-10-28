@@ -5,9 +5,12 @@
 #include <cmath>
 #include <cctype>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <fstream>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -18,6 +21,7 @@
 #include "c3d/version.hpp"
 #include "c3d/wall_clock.hpp"
 #include "capnp_payloads.hpp"
+#include "pose_queue.hpp"
 #include "serialize.hpp"
 #include "util.hpp"
 
@@ -110,6 +114,7 @@ struct Session::Impl {
   //   lifecycle_mu -> write turn -> marker_mu -> mu -> the spool's own
   //   pump_mu -> marker_mu -> mu
   //   recovery_mu -> marker_mu -> mu
+  //   lifecycle_mu -> pose_mu -> mu      (pose_mu released before the write turn)
   //
   // `mu` guards the batches, the properties, the part counters and the stats, and
   // is never held across file or network I/O. That is the whole of the "Record*
@@ -238,6 +243,55 @@ struct Session::Impl {
   // when the session started.
   std::uint64_t session_start_ms = 0;
 
+  // ---- The pose stream ------------------------------------------------------
+  // SetPoseManifest and RecordPoseSample hand their arguments to the worker through
+  // `pose_inbox`, in call order, under `mu`. Everything else is the worker's (or End's),
+  // under `pose_mu`: the encoders, which are CPU work a Record* caller must never wait
+  // behind, and the upload queue. pose_mu is taken before `mu` and released before a part is
+  // spooled, so it is never held while waiting for the write turn.
+  struct PoseOp {
+    // A sample of `manifest_id`, or (empty id) the entries of one SetPoseManifests call.
+    std::string manifest_id;
+    // The pose clock when the call was made: a block's host-clock close counts from its
+    // first sample's.
+    std::int64_t taken_us = 0;
+    pose::PoseSample sample;
+    std::vector<pose::Manifest> manifests;
+  };
+  std::vector<PoseOp> pose_inbox;
+  // Per id, as of the latest SetPoseManifest call, so a sample is refused at the door.
+  struct PoseShape {
+    std::size_t joints = 0;
+    bool follower = false;
+  };
+  std::map<std::string, PoseShape> pose_shapes;
+
+  std::mutex pose_mu;
+  struct PoseObject {
+    std::unique_ptr<pose::BlockEncoder> encoder;  // null for a follower
+    std::vector<std::uint8_t> groups;
+    // An object's seq never restarts, and a new joint set takes a new encoder: its seq 0 is
+    // the object's seq_base.
+    std::int64_t seq_base = 0;
+    std::int64_t next_seq = 0;
+    std::int64_t opened_us = 0;  // the pose clock at the open block's first sample
+    // Counted by encoders this object no longer has, and how much of the total Stats has.
+    std::uint64_t repairs_retired = 0;
+    std::uint64_t failures_retired = 0;
+    std::uint64_t repairs_counted = 0;
+    std::uint64_t failures_counted = 0;
+    bool refusal_said = false;
+    bool repair_said = false;
+  };
+  std::map<std::string, PoseObject> pose_objects;
+  std::unique_ptr<pose::UploadQueue> pose_queue;
+  // Between Begin and the start of End's flush.
+  bool pose_open = false;
+  // Flushes started this session, and the one End is running (0 when none).
+  int pose_flushes = 0;
+  int pose_flushing = 0;
+  bool pose_send_log_said = false;
+
   // Session properties. `pending` is the delta that has not yet ridden a gaze
   // payload; `known` is everything set so far, kept for a future scene change.
   Properties pending_properties;
@@ -357,6 +411,18 @@ struct Session::Impl {
   }
 
   BinaryEnvelope MakeBinaryEnvelope(Stream s) {
+    BinaryEnvelope envelope = BinaryEnvelopeHeader(s);
+    auto it = part.find(s);
+    if (it == part.end()) {
+      part[s] = PartBase(s);
+      it = part.find(s);
+    }
+    envelope.part = static_cast<std::uint32_t>(it->second++);
+    return envelope;
+  }
+
+  // Every field but the part number, which the pose stream's queue assigns itself.
+  BinaryEnvelope BinaryEnvelopeHeader(Stream s) {
     BinaryEnvelope envelope;
     envelope.user_id = cfg.device_id;
     envelope.session_id = session_id;
@@ -368,12 +434,6 @@ struct Session::Impl {
     envelope.format_version = FormatVersion(s);
     envelope.session_start_ms = session_start_ms;
     envelope.sdk_version = kSdkVersion;
-    auto it = part.find(s);
-    if (it == part.end()) {
-      part[s] = PartBase(s);
-      it = part.find(s);
-    }
-    envelope.part = static_cast<std::uint32_t>(it->second++);
     return envelope;
   }
 
@@ -403,6 +463,7 @@ struct Session::Impl {
     std::string session_id;
     bool carries_end = false;
     bool carries_properties = false;
+    bool carries_pose_manifest = false;
     std::function<std::string()> serialize;
   };
   struct PendingBatch {
@@ -562,6 +623,7 @@ struct Session::Impl {
         chunk.session_id = part.session_id;
         chunk.stream = part.stream;
         chunk.carries_properties = part.carries_properties;
+        chunk.carries_pose_manifest = part.carries_pose_manifest;
         chunk.created_at = EpochSeconds();
         spooled = spool->WriteNamed(chunk, &chunk_id);
       } catch (const std::exception& e) {
@@ -933,6 +995,7 @@ struct Session::Impl {
         {
           std::lock_guard<std::mutex> lock(mu);
           ++stats.chunks_discarded;
+          if (chunk.stream == Stream::kPose) ++stats.pose_rejections;
           stats.chunks_deferred = CountDeferred();
         }
         std::string message = "upload rejected with status " + std::to_string(response.status) +
@@ -1512,6 +1575,314 @@ struct Session::Impl {
     return recovered;
   }
 
+  // ---- The pose stream ------------------------------------------------------
+
+  std::int64_t PoseNowUs() const {
+    if (cfg.pose_clock_us) return cfg.pose_clock_us();
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+  std::int64_t PoseIntervalUs() const { return std::llround(cfg.pose_block_interval_s * 1e6); }
+
+  // What one pass decided, for the spool and the stats. Built under pose_mu alone.
+  using PoseSendList = std::vector<std::pair<pose::Send, std::vector<PoseManifestRecord>>>;
+  struct PosePass {
+    int flush = 0;  // the flush whose blocks these are, 0 outside one
+    PoseSendList sends;
+    std::vector<std::string> warnings;
+    std::uint64_t samples = 0;
+    std::uint64_t refused = 0;
+    std::uint64_t blocks = 0;
+    std::uint64_t block_bytes = 0;
+    std::uint64_t manifest_sends = 0;
+    std::int64_t lag_max_us = 0;
+  };
+
+  static void PoseTake(PosePass* pass, std::vector<pose::Send>&& sends) {
+    for (pose::Send& s : sends) pass->sends.emplace_back(std::move(s), std::vector<PoseManifestRecord>{});
+  }
+
+  // Each block enters the queue as it leaves its encoder, so its entry time is the clock read
+  // as it is added (rule 3), never a time carried from its close. `due_us` is when it could
+  // first have closed, for the encode lag.
+  void PoseQueueBlocks(const std::string& id, PoseObject& object,
+                       std::vector<pose::EncodedBlock>&& blocks, std::int64_t due_us,
+                       PosePass* pass) {
+    for (pose::EncodedBlock& b : blocks) {
+      pose::QueuedBlock q;
+      q.manifest_id = id;
+      q.seq = object.seq_base + b.seq;
+      q.start_us = b.start_us;
+      q.last_us = b.last_us;
+      q.sample_count = b.sample_count;
+      q.reset_before = b.reset_before;
+      q.bytes = b.data.size();
+      q.data = std::move(b.data);
+      object.next_seq = q.seq + 1;
+      ++pass->blocks;
+      pass->block_bytes += q.bytes;
+      const std::int64_t t = PoseNowUs();
+      pass->lag_max_us = std::max(pass->lag_max_us, t - due_us);
+      PoseTake(pass, pose_queue->Arrive(t, std::move(q), pass->flush));
+    }
+  }
+
+  // Rule 6: the entries of one call share a part of their own, sent as soon as every entry's
+  // firstSeq is known. One call lists an id once, so two sends of one object never share a
+  // part: the gateway keys a send on (manifestId, firstSeq), and the later of two would hide
+  // the earlier.
+  void PoseSendManifests(const PoseOp& op, PosePass* pass) {
+    std::vector<PoseManifestRecord> records;
+    for (const pose::Manifest& m : op.manifests) {
+      PoseManifestRecord record;
+      if (PoseApplyManifest(m, op.taken_us, &record, pass)) records.push_back(std::move(record));
+    }
+    if (records.empty()) return;
+    pass->manifest_sends += records.size();
+    pass->sends.emplace_back(pose_queue->ManifestPart(PoseNowUs()), std::move(records));
+  }
+
+  bool PoseApplyManifest(const pose::Manifest& m, std::int64_t taken_us,
+                         PoseManifestRecord* out, PosePass* pass) {
+    PoseManifestRecord& record = *out;
+    record.manifest_id = m.manifest_id;
+    record.name = m.name;
+    record.mesh = m.mesh;
+    record.file_type = m.file_type;
+    record.rigging_mapping_type = m.rigging_mapping_type;
+    record.root = m.root;
+    record.properties = m.properties;
+    for (std::size_t j = 0; j < m.joints.size(); ++j) {
+      record.joints.push_back(PoseJointRecord{static_cast<std::uint32_t>(j), m.joints[j].mesh_name,
+                                              m.joints[j].properties});
+    }
+    if (!m.root.empty()) {
+      // A follower's firstSeq counts in its root's seq: the root's next block is the first
+      // that draws it. Its send leaves the root's blocks alone.
+      pose_objects[m.manifest_id];
+      const auto root = pose_objects.find(m.root);
+      record.first_seq =
+          root == pose_objects.end() ? 0 : static_cast<std::uint32_t>(root->second.next_seq);
+      return true;
+    }
+    PoseObject& object = pose_objects[m.manifest_id];
+    std::vector<std::uint8_t> groups;
+    for (const pose::ManifestJoint& joint : m.joints) groups.push_back(joint.groups);
+    if (object.encoder && groups == object.groups) {
+      // Rule 1: the send's firstSeq only once every block closed before it has its seq.
+      PoseQueueBlocks(m.manifest_id, object, object.encoder->ManifestSent(), taken_us, pass);
+      record.first_seq = static_cast<std::uint32_t>(object.seq_base + object.encoder->first_seq());
+    } else {
+      if (object.encoder) {
+        PoseQueueBlocks(m.manifest_id, object, object.encoder->Close(), taken_us, pass);
+        object.repairs_retired += object.encoder->repaired_rotations();
+        object.failures_retired += object.encoder->encode_failures();
+      }
+      pose::EncoderOptions options;
+      options.joint_groups = groups;
+      options.block_interval_us = PoseIntervalUs();
+      std::string error;
+      object.encoder = pose::BlockEncoder::Create(options, &error);
+      object.groups = groups;
+      object.seq_base = object.next_seq;
+      if (!object.encoder) {
+        // Not reachable: SetPoseManifest refused what the encoder would.
+        pass->warnings.push_back("pose object '" + m.manifest_id + "' has no encoder (" + error +
+                                 "); its manifest is not sent and its samples are dropped");
+        return false;
+      }
+      record.first_seq = static_cast<std::uint32_t>(object.seq_base);
+    }
+    return true;
+  }
+
+  void PoseFeedSample(PoseOp& op, PosePass* pass) {
+    const auto it = pose_objects.find(op.manifest_id);
+    if (it == pose_objects.end() || !it->second.encoder) return;  // refused at the door
+    PoseObject& object = it->second;
+    const std::int64_t interval = PoseIntervalUs();
+    // Rule 1: a block closes once its interval has passed on the host clock since its first
+    // sample was taken, so a sample taken after that starts the next block whatever its time.
+    if (object.encoder->has_open_block() && op.taken_us - object.opened_us >= interval) {
+      PoseQueueBlocks(op.manifest_id, object, object.encoder->Close(), object.opened_us + interval,
+                      pass);
+    }
+    const bool had_open = object.encoder->has_open_block();
+    std::vector<pose::EncodedBlock> closed;
+    std::string error;
+    if (!object.encoder->AddSample(op.sample, &closed, &error)) {
+      ++pass->refused;
+      if (!object.refusal_said) {
+        object.refusal_said = true;
+        pass->warnings.push_back("pose object '" + op.manifest_id + "': a sample was refused (" +
+                                 error + "); refusals are counted in Stats::pose_samples_refused "
+                                 "and this is said once per object");
+      }
+      return;
+    }
+    ++pass->samples;
+    if (!had_open || !closed.empty()) object.opened_us = op.taken_us;
+    PoseQueueBlocks(op.manifest_id, object, std::move(closed), op.taken_us, pass);
+    if (!object.repair_said && object.encoder->repaired_rotations() > 0) {
+      object.repair_said = true;
+      pass->warnings.push_back("pose object '" + op.manifest_id + "' was given a rotation of all "
+                               "zeros, which is no rotation; it is sent as the joint's previous "
+                               "one, counted in c3d.stream.pose.repairedRotations, and said once "
+                               "per object");
+    }
+  }
+
+  // The spec's send log (§10.4): one line per block part, written as the queue decides it.
+  void PoseWriteSendLog(PosePass* pass) {
+    if (cfg.pose_send_log_path.empty()) return;
+    std::string lines;
+    for (const auto& entry : pass->sends) {
+      const pose::Send& s = entry.first;
+      if (s.kind != pose::Send::Kind::kBlocks) continue;
+      lines += "{\"part\": " + std::to_string(s.part) + ", \"queueStartUs\": " +
+               std::to_string(s.queue_start_us) + ", \"sentUs\": " + std::to_string(s.sent_us) +
+               ", \"reason\": \"" + s.reason + "\"";
+      if (s.flush > 0) lines += ", \"flush\": " + std::to_string(s.flush);
+      lines += "}\n";
+    }
+    if (lines.empty()) return;
+    std::ofstream out(cfg.pose_send_log_path, std::ios::app | std::ios::binary);
+    out << lines;
+    out.flush();
+    if (!out && !pose_send_log_said) {
+      pose_send_log_said = true;
+      pass->warnings.push_back("could not write the pose send log to " + cfg.pose_send_log_path +
+                               "; said once");
+    }
+  }
+
+  // Caller holds `mu`. The parts in send order, each with the number its queue gave it, and one
+  // ticket for all of them, so they reach the spool in that order.
+  PendingBatch PoseBatchLocked(PoseSendList* sends) {
+    PendingBatch batch;
+    if (sends->empty() || session_id.empty()) return batch;
+    const BinaryEnvelope header = BinaryEnvelopeHeader(Stream::kPose);
+    for (auto& entry : *sends) {
+      pose::Send& send = entry.first;
+      PendingPart part;
+      part.stream = Stream::kPose;
+      part.records =
+          send.kind == pose::Send::Kind::kBlocks ? send.blocks.size() : entry.second.size();
+      part.session_id = session_id;
+      part.carries_pose_manifest = send.kind == pose::Send::Kind::kManifests;
+      BinaryEnvelope envelope = header;
+      envelope.part = send.part;
+      part.serialize = [envelope, manifests = std::move(entry.second),
+                        blocks = std::move(send.blocks), start = send.start_us,
+                        end = send.end_us] {
+        return SerializePosePayload(envelope, manifests, blocks, start, end);
+      };
+      batch.parts.push_back(std::move(part));
+    }
+    stats.pose_parts += batch.parts.size();
+    batch.ticket = next_ticket++;
+    batch.ticketed = true;
+    return batch;
+  }
+
+  enum class PoseStage {
+    kPass,        // the worker's: encode what was recorded, the host-clock closes, the timer
+    kFlushStart,  // End's first step: the queue as it is (rule 5)
+    kFlushRest,   // End's second: what was recorded, every open block, the flush's last part
+  };
+
+  // Caller holds no lock. With `wait_for_spool`, returns only once every part decided before it,
+  // the worker's included, is in the spool.
+  void PoseWork(PoseStage stage, bool wait_for_spool = false) {
+    PendingBatch batch;
+    std::vector<std::string> warnings;
+    {
+      std::lock_guard<std::mutex> pose_lock(pose_mu);
+      if (stage == PoseStage::kFlushRest ? pose_flushing == 0 : !pose_open) return;
+      PosePass pass;
+      if (stage == PoseStage::kFlushStart) {
+        // From here the worker leaves the stream alone: the blocks this flush closes are its
+        // own, and none may slip into the queue behind its first part.
+        pose_open = false;
+        pose_flushing = ++pose_flushes;
+        std::vector<pose::Send> sends;
+        pose_queue->StartFlush(PoseNowUs(), pose::FlushTrigger::kEnd, pose_flushing, &sends);
+        PoseTake(&pass, std::move(sends));
+      } else {
+        pass.flush = stage == PoseStage::kFlushRest ? pose_flushing : 0;
+        std::vector<PoseOp> ops;
+        {
+          std::lock_guard<std::mutex> lock(mu);
+          ops.swap(pose_inbox);
+        }
+        for (PoseOp& op : ops) {
+          if (op.manifest_id.empty()) {
+            PoseSendManifests(op, &pass);
+          } else {
+            PoseFeedSample(op, &pass);
+          }
+        }
+        const std::int64_t now = PoseNowUs();
+        const std::int64_t interval = PoseIntervalUs();
+        for (auto& [id, object] : pose_objects) {
+          if (!object.encoder || !object.encoder->has_open_block()) continue;
+          if (stage == PoseStage::kFlushRest) {
+            PoseQueueBlocks(id, object, object.encoder->Close(), now, &pass);
+          } else if (now - object.opened_us >= interval) {
+            PoseQueueBlocks(id, object, object.encoder->Close(), object.opened_us + interval,
+                            &pass);
+          }
+        }
+        if (stage == PoseStage::kFlushRest) {
+          PoseTake(&pass, pose_queue->FinishFlush(PoseNowUs(), pose_flushing));
+          pose_flushing = 0;
+        } else {
+          PoseTake(&pass, pose_queue->Tick(PoseNowUs()));
+        }
+      }
+      PoseWriteSendLog(&pass);
+
+      std::uint64_t repairs = 0;
+      std::uint64_t failures = 0;
+      for (auto& [id, object] : pose_objects) {
+        const std::uint64_t r =
+            object.repairs_retired + (object.encoder ? object.encoder->repaired_rotations() : 0);
+        const std::uint64_t f =
+            object.failures_retired + (object.encoder ? object.encoder->encode_failures() : 0);
+        repairs += r - object.repairs_counted;
+        failures += f - object.failures_counted;
+        object.repairs_counted = r;
+        object.failures_counted = f;
+      }
+      std::lock_guard<std::mutex> lock(mu);
+      stats.pose_samples += pass.samples;
+      stats.pose_samples_refused += pass.refused;
+      stats.pose_blocks += pass.blocks;
+      stats.pose_block_bytes += pass.block_bytes;
+      stats.pose_manifest_sends += pass.manifest_sends;
+      stats.pose_repaired_rotations += repairs;
+      stats.pose_encode_failures += failures;
+      stats.pose_encode_lag_max_us = std::max(stats.pose_encode_lag_max_us, pass.lag_max_us);
+      if (stage == PoseStage::kFlushRest && !pose_objects.empty()) {
+        // The session's total, on the session's last gaze part (End sends every property).
+        std::uint64_t total = 0;
+        for (const auto& [id, object] : pose_objects) total += object.repairs_counted;
+        SetPropertyLocked("c3d.stream.pose.repairedRotations", static_cast<std::int64_t>(total));
+      }
+      // The ticket is the last thing taken: from here nothing may throw before SpoolBatch
+      // serves it, or every later batch waits behind it for ever.
+      batch = PoseBatchLocked(&pass.sends);
+      if (wait_for_spool && !batch.ticketed) {
+        batch.ticket = next_ticket++;
+        batch.ticketed = true;
+      }
+      warnings = std::move(pass.warnings);
+    }
+    SpoolBatch(batch);
+    for (const std::string& w : warnings) log->Warn(w);
+  }
+
   // Idempotent. Called by Create() so deferred-recovery rechecks happen even when
   // Begin() never does, and still by Begin() so a session restarted after a
   // destructor-less stop gets a worker back.
@@ -1577,6 +1948,11 @@ struct Session::Impl {
         std::lock_guard<std::mutex> lock(mu);
         recovery_recheck_steady = SteadySeconds() + cfg.orphan_stale_after_s;
       }
+
+      // The pose stream: encoding, its host-clock closes and its queue's timer, at least once a
+      // second as rule 3 requires. After the batch above is spooled, since its parts take a
+      // ticket of their own; and never through TakeDue, whose timer must not cut a pose part.
+      Guarded(Thrown::kWorkerPass, [this] { PoseWork(PoseStage::kPass); });
 
       // No upload here, ever. See UploaderLoop.
     }
@@ -1778,6 +2154,8 @@ bool Session::Begin() {
     impl_->camera_fov_warned.clear();
     impl_->lidar_scans.clear();
     impl_->lidar_buffered_bytes = 0;
+    impl_->pose_inbox.clear();
+    impl_->pose_shapes.clear();
 
     // Do not clear known_properties: anything the caller set before Begin is
     // legitimate session metadata. Re-mark the whole set as pending so a new
@@ -1811,6 +2189,16 @@ bool Session::Begin() {
 
     impl_->StartWorker();
   }
+  {
+    // A queue per session, and every object starts over: its first manifest send in this
+    // session is its first block's keyframe and seq 0.
+    std::lock_guard<std::mutex> pose_lock(impl_->pose_mu);
+    impl_->pose_objects.clear();
+    impl_->pose_queue = std::make_unique<pose::UploadQueue>();
+    impl_->pose_flushes = 0;
+    impl_->pose_flushing = 0;
+    impl_->pose_open = true;
+  }
   impl_->log->Info("session " + id + " begun");
   Flush();
   return true;
@@ -1818,6 +2206,11 @@ bool Session::Begin() {
 
 void Session::End(const std::string& reason, std::optional<double> end_time) {
   std::lock_guard<std::mutex> lifecycle(impl_->lifecycle_mu);
+  // The pose stream's flush, while the session is open (spec §10.1 rule 5): the queue as it
+  // is goes to the spool first, so blocks already encoded never wait behind the encoding of
+  // open ones, then everything recorded and every open block, as the flush's own parts.
+  impl_->PoseWork(Impl::PoseStage::kFlushStart);
+  impl_->PoseWork(Impl::PoseStage::kFlushRest);
   Impl::PendingBatch batch;
   std::string id;
   {
@@ -2176,6 +2569,101 @@ void Session::RecordPointCloud(const std::string& sensor_id, std::uint64_t time_
   ++impl_->stats.lidar_scans;
   impl_->stats.lidar_bytes += size;
 }
+
+bool Session::SetPoseManifests(const std::vector<pose::Manifest>& manifests,
+                               std::string* error_out) {
+  std::string problem;
+  std::set<std::string> ids;
+  for (std::size_t i = 0; i < manifests.size() && problem.empty(); ++i) {
+    const std::string entry = pose::ManifestProblem(manifests[i]);
+    if (!entry.empty()) {
+      problem = "manifests[" + std::to_string(i) + "]." + entry;
+    } else if (!ids.insert(manifests[i].manifest_id).second) {
+      problem = "manifests[" + std::to_string(i) + "].manifest_id: '" +
+                manifests[i].manifest_id + "' is listed twice; two sends of one object never "
+                "share a part";
+    }
+  }
+  if (manifests.empty()) problem = "no manifests";
+  const std::int64_t now = impl_->PoseNowUs();
+  if (problem.empty()) {
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    if (!impl_->active) problem = "no session is open";
+    // Checked against the session's shapes and the call's own entries before it, all or
+    // nothing: a call is one part.
+    std::map<std::string, Impl::PoseShape> shapes = impl_->pose_shapes;
+    for (std::size_t i = 0; i < manifests.size() && problem.empty(); ++i) {
+      const pose::Manifest& m = manifests[i];
+      const bool follower = !m.root.empty();
+      const auto known = shapes.find(m.manifest_id);
+      const std::string at = "manifests[" + std::to_string(i) + "].";
+      if (known != shapes.end() && known->second.follower != follower) {
+        problem = at + "root: '" + m.manifest_id + "' was sent as " +
+                  (follower ? "an object with joints" : "a follower") +
+                  " in this session, and an id is one or the other for the whole session";
+      } else if (follower) {
+        const auto root = shapes.find(m.root);
+        if (root == shapes.end() || root->second.follower) {
+          problem = at + "root: '" + m.root +
+                    "' has not been sent in this session as an object with joints";
+        }
+      }
+      shapes[m.manifest_id] = Impl::PoseShape{m.joints.size(), follower};
+    }
+    if (problem.empty()) {
+      impl_->pose_shapes = std::move(shapes);
+      Impl::PoseOp op;
+      op.taken_us = now;
+      op.manifests = manifests;
+      impl_->pose_inbox.push_back(std::move(op));
+      // Once per session (R9): setting the same value again is a no-op.
+      impl_->SetPropertyLocked(
+          "c3d.stream.pose.blockIntervalMs",
+          static_cast<std::int64_t>(std::llround(impl_->cfg.pose_block_interval_s * 1000.0)));
+    }
+  }
+  if (!problem.empty() && error_out) *error_out = problem;
+  return problem.empty();
+}
+
+bool Session::SetPoseManifest(const pose::Manifest& manifest, std::string* error_out) {
+  return SetPoseManifests({manifest}, error_out);
+}
+
+bool Session::RecordPoseSample(const std::string& manifest_id, const pose::PoseSample& sample,
+                               std::string* error_out) {
+  const std::int64_t now = impl_->PoseNowUs();
+  std::string problem;
+  {
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    const auto shape = impl_->pose_shapes.find(manifest_id);
+    if (!impl_->active) {
+      problem = "no session is open";
+    } else if (shape == impl_->pose_shapes.end()) {
+      problem = "no manifest has been sent for '" + manifest_id + "' in this session";
+    } else if (shape->second.follower) {
+      problem = "'" + manifest_id + "' is a follower: it is drawn from its root's samples";
+    } else if (sample.joints.size() != shape->second.joints) {
+      problem = "a sample of " + std::to_string(sample.joints.size()) + " joints for '" +
+                manifest_id + "', whose manifest has " + std::to_string(shape->second.joints);
+    } else if (impl_->pose_inbox.size() >= impl_->cfg.max_records_per_batch) {
+      // The worker empties it every tick; full means it has stopped, and this is bounded.
+      ++impl_->stats.records_dropped;
+      problem = "the pose stream is " + std::to_string(impl_->pose_inbox.size()) +
+                " samples behind; this one is dropped";
+    } else {
+      Impl::PoseOp op;
+      op.manifest_id = manifest_id;
+      op.taken_us = now;
+      op.sample = sample;
+      impl_->pose_inbox.push_back(std::move(op));
+    }
+  }
+  if (!problem.empty() && error_out) *error_out = problem;
+  return problem.empty();
+}
+
+void Session::PumpPose() { impl_->PoseWork(Impl::PoseStage::kPass, true); }
 
 void Session::Flush() {
   Impl::PendingBatch batch;

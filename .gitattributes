@@ -4,3 +4,6 @@
 # Copies of the platform's canonical schemas (core/capnp/README.md explains), pinned by
 # core/capnp/CHECKSUMS. Excluded from language statistics; diffs stay visible for review.
 core/capnp/* linguist-vendored
+
+# Robot descriptions the URDF tests hash byte for byte, CRLF line ends included.
+cognitive3d_ros/test/fixtures/*.urdf -text

@@ -256,6 +256,7 @@ ros2 topic pub --once /cognitive3d/events cognitive3d_ros_msgs/msg/Event \
 | `robot.topology` | once per session: the tf frame count, the reference and robot frames, and up to 40 frame names |
 | `robot.reference_frame_unavailable`, `robot.reference_frame_changed` | the pose timeline's frame; see [Reference frames](coordinates.md#reference-frames) |
 | `robot.localisation_jump` | a localization step; see [Localization jumps](coordinates.md#localization-jumps) |
+| `robot.frame_lost` | with `pose.enabled` only: a tf frame left the pose stream's rig. Carries `frame`, `parent` and `last_seen_epoch_seconds`; see [Pose stream](pose.md#when-a-frame-comes-goes-or-fails) |
 | `nav.recovery.started`, `nav.recovery.finished`, `nav.recovery.failed`, `nav.recovery.halted`, `nav.bt.node_failed` | Nav2's behavior tree; see [Nav2](#nav2) |
 | `c3d.remote_variables.unavailable` | a failed remote-variables fetch; see [Remote variables](remote-variables.md) |
 
@@ -424,6 +425,7 @@ the node was configured; the others start over with each session.
 | `c3d.events_suppressed` | events discarded by the rate cap | this session |
 | `c3d.event_properties_dropped` | event properties dropped because their key was in `c3d.` | this session |
 | `c3d.gaze_frame_failures` | samples whose `gaze_frame` did not resolve; only with `gaze_frame` set | this session |
+| `c3d.pose.samples`, `c3d.pose.held_frames` | with `pose.enabled` only: [pose stream](pose.md) samples, and joint values held for a frame tf could not look up | this session |
 | `c3d.camera.<name>.*`, `c3d.lidar.<name>.*` | per camera and lidar: frames or scans, bytes, pose failures, refusals and drops; see [Camera and lidar](camera-and-lidar.md) | this session |
 
 Between sessions, the upload state is on the periodic report line and in the

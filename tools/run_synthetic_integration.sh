@@ -5,8 +5,9 @@
 #
 # It stands up the fakes, the node and tools/stub_gateway.py, drives a session,
 # and then ASSERTS on the bytes that would actually have been transmitted -- the
-# JSON streams by reading the captures, and the two binary streams by decoding
-# them with tools/capnp_dump.py.
+# JSON streams by reading the captures, and the three binary streams by decoding
+# them with tools/capnp_dump.py. The pose stream's blocks are decoded down to
+# their joint values.
 #
 # Then it does it twice more, under the two conventions whose position map is a
 # REFLECTION, with a camera and a LaserScan on one tilted mount: that is the only
@@ -72,7 +73,7 @@ SCAN_PLANE_SPOOL=/tmp/c3d_scan_plane_spool
 LOGS=/tmp/c3d_synth_logs
 rm -rf "$SPOOL" "$LOGS"
 mkdir -p "$CAPTURE" "$LOGS"
-rm -f "$CAPTURE"/*.json "$CAPTURE"/*.bin "$CAPTURE"/*.partial 2>/dev/null || true
+rm -f "$CAPTURE"/*.json "$CAPTURE"/*.bin "$CAPTURE"/*.partial "$CAPTURE"/*.jsonl 2>/dev/null || true
 
 echo "=== building the workspace ==="
 mkdir -p /tmp/ws/src
@@ -112,7 +113,10 @@ MOUNT_RPY_DEG=20,35,55
 
 echo "=== starting the stub gateway and the fakes ==="
 start stub_gateway python3 /src/tools/stub_gateway.py 8931 "$CAPTURE"
-start tf_publisher python3 /src/tools/fake_tf_publisher.py
+# With a camera on a panning gimbal: a moving joint for the pose stream's rig. And a robot
+# description, latched before the node starts, which decorates the rig.
+start tf_publisher python3 /src/tools/fake_tf_publisher.py --gimbal \
+  --robot-description /src/tools/synthetic_robot_description.urdf
 start nav_server python3 /src/tools/fake_nav_server.py
 # The three the binary streams need. Rates above what the node is configured to
 # take, so the rate gate is exercised rather than merely satisfied.
@@ -126,7 +130,7 @@ sleep 6
 echo "=== doctor ==="
 timeout 90 /tmp/ws/install/cognitive3d_ros/lib/cognitive3d_ros/doctor \
   --ros-args --params-file /src/tools/synthetic_params.yaml > "$LOGS/doctor.log" 2>&1 || true
-grep 'field of view' "$LOGS/doctor.log" || echo "(doctor printed no field of view line)"
+grep -e 'field of view' -e 'pose stream' "$LOGS/doctor.log" || echo "(doctor printed no field of view or pose stream line)"
 
 echo "=== starting the node ==="
 start node /tmp/ws/install/cognitive3d_ros/lib/cognitive3d_ros/cognitive3d_node \
@@ -157,6 +161,7 @@ echo
 echo "=== assertions ==="
 RUN_START="$RUN_START" RUN_END="$RUN_END" CAPTURE="$CAPTURE" LOGS="$LOGS" python3 - <<'PY'
 import glob
+import hashlib
 import json
 import math
 import os
@@ -310,6 +315,171 @@ if clouds:
     check(all(c['decoded']['points'] == c['pointCount'] for c in clouds),
           'the decoded point count matches the header')
 
+# ---- The pose stream -------------------------------------------------------------------------
+# The fake robot's tree under base_link: base_scan, static 0.2 m up and tagged as the depth lidar's
+# frame, and camera_link panning on a gimbal with its optical frame under it.
+pose_files = sorted(glob.glob(os.path.join(capture, '*-pose.bin')))
+check(bool(pose_files), f'pose parts captured: {len(pose_files)}')
+if pose_files:
+    pose_parts = json.loads(subprocess.check_output(
+        [sys.executable, '/src/tools/capnp_dump.py', *pose_files]))['files']
+    numbers = [e['header']['part'] for e in pose_parts]
+    check(numbers == list(range(1, len(numbers) + 1)),
+          f'pose parts are numbered from 1 with none missing: {numbers}')
+    if gaze:
+        check(all(e['header']['sessionId'] == gaze_session for e in pose_parts),
+              'the pose stream joins the gaze stream on its session id')
+    check(not any(e['manifests'] and e['blocks'] for e in pose_parts),
+          'no pose part carries both manifests and blocks')
+    check(bool(pose_parts[0]['manifests']) and not pose_parts[0]['blocks'],
+          'the first pose part is a manifest')
+    manifest_parts = [e for e in pose_parts if e['manifests']]
+    block_parts = [e for e in pose_parts if e['blocks']]
+    check(all(e['startUs'] == 0 and e['endUs'] == 0 for e in manifest_parts),
+          'a manifest part has no startUs or endUs')
+    manifests = [m for e in pose_parts for m in e['manifests']]
+    first = manifests[0]
+    check(first['manifestId'] == 'ros2-a8ee2656b910c9c7' and first['name'] == 'sim-robot-01',
+          f'the rig is named after device_id: {first["manifestId"]} {first["name"]}')
+    check(first['mesh'] == '' and first['fileType'] == '' and
+          first['riggingMappingType'] == 'meshName' and first['root'] == '',
+          'no model, meshName mapping, no root')
+    # The description is latched before the node starts, but it and the first tick race, so the
+    # first manifest may be tf's alone; the last one is decorated from it.
+    tier1 = {'c3d.profile': 'ros2/1', 'ros.robotName': 'sim-robot-01'}
+    with open('/src/tools/synthetic_robot_description.urdf', 'rb') as f:
+        description_sha = hashlib.sha256(f.read()).hexdigest()
+    tier2 = {'c3d.profile': 'ros2/1', 'ros.robotName': 'synthetic_bot',
+             'ros.urdfSha256': description_sha, 'c3d.model.format': 'urdf',
+             'c3d.model.formatVersion': '1.2'}
+    check(all(m['properties'] in (tier1, tier2) for m in manifests),
+          f'every manifest carries the ros2/1 object keys, tf\'s alone or with the robot '
+          f'description\'s: {[m["properties"] for m in manifests]}')
+    check(manifests[-1]['properties'] == tier2,
+          f'the last manifest carries the robot description\'s name, hash and version: '
+          f'{manifests[-1]["properties"]}')
+    last = manifests[-1]
+    names = [j['meshName'] for j in last['joints']]
+    check(names == ['base_link', 'base_scan', 'camera_link', 'camera_optical_frame'],
+          f'the last manifest is the whole rig, parents first: {names}')
+    check([j['j'] for j in last['joints']] == list(range(len(names))), 'joints are 0..J-1')
+    by_name = {j['meshName']: j['properties'] for j in last['joints']}
+    check('ros.parent' not in by_name.get('base_link', {}), 'the root names no parent')
+    check(by_name.get('base_scan', {}).get('ros.parent') == 'base_link' and
+          by_name.get('camera_link', {}).get('ros.parent') == 'base_link' and
+          by_name.get('camera_optical_frame', {}).get('ros.parent') == 'camera_link',
+          f'every other joint names its tf parent: {by_name}')
+    check(by_name.get('base_scan', {}).get('c3d.kind') == 'lidar',
+          'base_scan, the depth lidar\'s configured frame, is tagged lidar')
+    check(by_name.get('base_link') == {},
+          f'the root carries no joint keys: {by_name.get("base_link")}')
+    check(by_name.get('camera_link') == {'ros.parent': 'base_link', 'ros.jointName': 'gimbal_pan',
+                                         'ros.jointType': 'revolute', 'ros.limit.lower': -0.8,
+                                         'ros.limit.upper': 0.8, 'ros.limit.velocity': 3.0},
+          f'camera_link carries its URDF joint and only its bounded limits: '
+          f'{by_name.get("camera_link")}')
+    check(by_name.get('base_scan', {}).get('ros.jointName') == 'scan_mount' and
+          by_name.get('base_scan', {}).get('ros.jointType') == 'fixed' and
+          by_name.get('camera_optical_frame', {}).get('ros.jointName') == 'camera_optical_joint',
+          'the fixed joints are named and typed')
+    check('wheel_left_link' not in by_name, 'a URDF link tf does not publish is no joint')
+    # The description's <ros2_control> holds an address and a serial port. Nothing that left the
+    # node, and nothing it logged, may carry them: every capture's bytes and every log are searched.
+    leaked = []
+    for path in sorted(glob.glob(os.path.join(capture, '*')) +
+                       glob.glob(os.path.join(os.environ['LOGS'], '*.log'))):
+        if os.path.isfile(path) and not path.endswith(('tf_publisher.log', 'build.log')):
+            with open(path, 'rb') as f:
+                body = f.read()
+            if b'192.0.2.55' in body or b'SECRET' in body:
+                leaked.append(os.path.basename(path))
+    check(not leaked, f'nothing of the description\'s <ros2_control> reached a capture or a log: '
+                      f'{leaked}')
+    with open(os.path.join(os.environ['LOGS'], 'node.log')) as f:
+        node_log = f.read()
+    check("robot description read: robot 'synthetic_bot', URDF 1.2" in node_log,
+          'the node logs the description it read by name and version')
+
+    blocks = [b for e in block_parts for b in e['blocks']]
+    check(bool(blocks), f'pose blocks captured: {len(blocks)}')
+    seqs = [b['seq'] for b in blocks]
+    check(seqs == list(range(len(seqs))), f'block seq runs 0.. with none missing ({len(seqs)})')
+    first_seqs = {m['firstSeq'] for m in manifests}
+    reset = {b['seq'] for b in blocks if b['resetBefore']}
+    check(reset == {s for s in first_seqs if s < len(blocks)},
+          f'resetBefore is set exactly at each manifest send\'s firstSeq: {sorted(reset)}')
+    check(blocks[0]['decoded']['keyframe'], 'the first block is a keyframe')
+    check(all(b['decoded']['consistent'] for b in blocks), 'every block body decodes whole')
+    check(all(b['sampleCount'] == b['decoded']['sampleCount'] and
+              b['startUs'] == b['decoded']['startUs'] for b in blocks),
+          'every envelope copies its block header')
+    for e in block_parts:
+        starts = [b['startUs'] for b in e['blocks']]
+        ends = [b['decoded']['times'][-1] for b in e['blocks']]
+        if e['startUs'] != min(starts) or e['endUs'] != max(ends):
+            check(False, f'pose part {e["header"]["part"]} startUs/endUs span its blocks')
+            break
+    else:
+        check(True, 'every block part\'s startUs and endUs span its blocks')
+    times = [t for b in blocks for t in b['decoded']['times']]
+    check(all(run_start * 1e6 - 5e6 <= t <= run_end * 1e6 + 5e6 for t in times),
+          f'every pose sample time is wall clock inside the run ({min(times)} .. {max(times)})')
+    check(len(times) >= 5 * duration,
+          f'{len(times)} pose samples over {duration}s at 10 Hz')
+
+    # The manifest each block decodes with: the latest whose firstSeq is at or before its seq.
+    def in_force(seq):
+        chosen = None
+        for m in manifests:
+            if m['firstSeq'] <= seq:
+                chosen = m
+        return chosen
+    scan_heights, pans, root_x = [], [], []
+    for b in blocks:
+        m = in_force(b['seq'])
+        joints = [j['meshName'] for j in m['joints']]
+        if b['decoded']['jointCount'] != len(joints):
+            check(False, f'block {b["seq"]} has {b["decoded"]["jointCount"]} joints, its manifest '
+                         f'{len(joints)}')
+        written = b['decoded']['joints']
+        if 'base_scan' in joints and 'p' in written.get(str(joints.index('base_scan')), {}):
+            scan_heights += written[str(joints.index('base_scan'))]['p']
+        if 'camera_link' in joints and 'r' in written.get(str(joints.index('camera_link')), {}):
+            pans += [q[2] for q in written[str(joints.index('camera_link'))]['r']]
+        if 'p' in written.get('0', {}):
+            root_x += [p[0] for p in written['0']['p']]
+    check(bool(scan_heights) and all(abs(p[0]) < 1e-4 and abs(p[1]) < 1e-4 and
+                                     abs(p[2] - 0.2) < 1e-4 for p in scan_heights),
+          f'base_scan is 0.2 m above base_link in every sample that writes it '
+          f'({len(scan_heights)} samples, rep103)')
+    check(bool(pans) and max(pans) - min(pans) > 0.2,
+          f'camera_link pans on its gimbal: rotation z from {min(pans or [0]):.3f} '
+          f'to {max(pans or [0]):.3f}')
+    check(bool(root_x) and root_x[-1] > root_x[0] + 1.0,
+          f'the root drives forward in the reference frame: x {root_x[:1]} .. {root_x[-1:]}')
+
+    properties = {}
+    for path in gaze:
+        properties.update(json.load(open(path))['body'].get('properties', {}))
+    check(properties.get('c3d.ros.pose.rate_hertz') == 10.0,
+          f'c3d.ros.pose.rate_hertz: {properties.get("c3d.ros.pose.rate_hertz")}')
+    check(properties.get('c3d.ros.pose.frame_count') == 4,
+          f'c3d.ros.pose.frame_count: {properties.get("c3d.ros.pose.frame_count")}')
+    check(properties.get('c3d.stream.pose.blockIntervalMs') == 1000,
+          f'c3d.stream.pose.blockIntervalMs: {properties.get("c3d.stream.pose.blockIntervalMs")}')
+    check(isinstance(properties.get('c3d.stream.pose.heldFrames'), int),
+          f'c3d.stream.pose.heldFrames: {properties.get("c3d.stream.pose.heldFrames")}')
+    pose_doctor = [line for line in open(os.path.join(os.environ['LOGS'], 'doctor.log'))
+                   if 'pose stream' in line]
+    check(any('[ok  ] pose stream' in line and '4 frame(s) under base_link' in line and
+              'base_link, base_scan, camera_link, camera_optical_frame' in line
+              for line in pose_doctor),
+          f'doctor names the rig it would send: {pose_doctor}')
+    send_log = os.path.join(capture, 'pose_send_log.jsonl')
+    lines = [json.loads(line) for line in open(send_log)] if os.path.exists(send_log) else []
+    check(len(lines) == len(block_parts),
+          f'the send log has one line per block part: {len(lines)} for {len(block_parts)}')
+
 print()
 if failures:
     print(f'{len(failures)} assertion(s) FAILED')
@@ -344,7 +514,7 @@ scan_plane_pass() {
   # The mount is static under `map` rather than under `base_link`: a sensor that
   # moves with the robot has a world pose only at its own stamp, and this one is
   # the transform that was published, at every stamp.
-  start "$convention-tf_publisher" python3 /src/tools/fake_tf_publisher.py \
+  start "$convention-tf_publisher" python3 /src/tools/fake_tf_publisher.py --gimbal \
     --mount-frame "$MOUNT_FRAME" --mount-xyz "$MOUNT_XYZ" --mount-rpy-deg "$MOUNT_RPY_DEG"
   start "$convention-camera_publisher" python3 /src/tools/fake_camera_publisher.py \
     --rate 4.0 --frame "$MOUNT_FRAME"
@@ -355,7 +525,7 @@ scan_plane_pass() {
   start "$convention-node" \
     /tmp/ws/install/cognitive3d_ros/lib/cognitive3d_ros/cognitive3d_node \
     --ros-args --params-file /src/tools/scan_plane_params.yaml \
-    -p pose_convention:="$convention"
+    -p pose_convention:="$convention" -p pose.enabled:=true -p pose.block_interval_s:=1.0
   for _ in $(seq 1 30); do
     if timeout 10 ros2 lifecycle get /cognitive3d >/dev/null 2>&1; then break; fi
     sleep 1
@@ -372,6 +542,61 @@ scan_plane_pass() {
   python3 /src/tools/verify_scan_plane.py --capture "$capture" --convention "$convention" \
     --frame "$MOUNT_FRAME" --lidar scan --camera mount \
     --mount-xyz "$MOUNT_XYZ" --mount-rpy-deg "$MOUNT_RPY_DEG"
+
+  # The pose stream under a convention whose position map is a reflection, read off the wire at
+  # its two static joints: base_scan 0.2 m up, and camera_optical_frame's fixed turn under
+  # camera_link. Every joint takes the position map and the Dynamic Object rotation rule, written
+  # out here rather than taken from the SDK.
+  CAPTURE_DIR="$capture" CONVENTION="$convention" python3 - <<'PY'
+import glob
+import json
+import os
+import subprocess
+import sys
+
+convention = os.environ['CONVENTION']
+files = sorted(glob.glob(os.path.join(os.environ['CAPTURE_DIR'], '*-pose.bin')))
+if not files:
+    print(f'  FAIL no pose parts captured under {convention}')
+    sys.exit(1)
+parts = json.loads(subprocess.check_output([sys.executable, '/src/tools/capnp_dump.py', *files]))
+manifests = [m for e in parts['files'] for m in e['manifests']]
+blocks = [b for e in parts['files'] for b in e['blocks']]
+# Position map M and the Dynamic Object rule, per convention (docs/data-format.md).
+position = {'unity': lambda x, y, z: (-y, z, x),
+            'gltf_authored': lambda x, y, z: (-x, z, -y)}[convention]
+rotation = {'unity': lambda x, y, z, w: (-y, z, x, -w),
+            'gltf_authored': lambda x, y, z, w: (x, -z, y, w)}[convention]
+want_scan = position(0.0, 0.0, 0.2)
+want_optical = rotation(-0.5, 0.5, -0.5, 0.5)
+failures = []
+seen_scan = seen_optical = 0
+for block in blocks:
+    joints = None
+    for m in manifests:
+        if m['firstSeq'] <= block['seq']:
+            joints = [j['meshName'] for j in m['joints']]
+    written = block['decoded']['joints']
+    if 'base_scan' in joints:
+        for p in written.get(str(joints.index('base_scan')), {}).get('p', []):
+            seen_scan += 1
+            if max(abs(a - b) for a, b in zip(p, want_scan)) > 1e-4:
+                failures.append(f'base_scan at {p}, want {want_scan}')
+    if 'camera_optical_frame' in joints:
+        for q in written.get(str(joints.index('camera_optical_frame')), {}).get('r', []):
+            seen_optical += 1
+            sign = 1 if sum(a * b for a, b in zip(q, want_optical)) >= 0 else -1
+            if max(abs(sign * a - b) for a, b in zip(q, want_optical)) > 1e-4:
+                failures.append(f'camera_optical_frame turned {q}, want {want_optical}')
+if not seen_scan or not seen_optical:
+    failures.append(f'samples read: base_scan {seen_scan}, camera_optical_frame {seen_optical}')
+for failure in failures[:5]:
+    print('  FAIL ' + failure)
+if failures:
+    sys.exit(1)
+print(f'  ok   the pose stream under {convention}: base_scan at {want_scan} in {seen_scan} samples, '
+      f'camera_optical_frame turned {want_optical} in {seen_optical}')
+PY
 }
 
 scan_plane_pass gltf_authored

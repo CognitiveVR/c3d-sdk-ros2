@@ -1,4 +1,4 @@
-#include "sha256.hpp"
+#include "c3d/sha256.hpp"
 
 namespace c3d {
 namespace {

@@ -191,6 +191,22 @@
     #     meaning_0: ""                 # recorded verbatim
     #     meaning_1: ""
 
+    # ---- The pose stream (provisional) -------------------------------------------
+    # The tf tree under robot_frame as a rig, one stream per robot. Off by default.
+    # Needs a Cognitive3D platform that accepts the pose stream: an older one answers
+    # every pose upload 400. Session Replay still draws the robot from the pose
+    # timeline. docs/pose.md.
+    pose:
+      enabled: false
+      rate_hz: 10.0                     # samples per second; at least one per 30 s less block_interval_s
+      block_interval_s: 5.0             # seconds per encoded block, 0.1 to 10
+      # exclude_frames: ["wheel_left_link", "wheel_right_link"]   # each with its subtree
+      manifest_id: ""                   # empty: ros2- and a hash of device_id
+      mesh: ""                          # an uploaded per-frame model; both or neither
+      mesh_file_type: ""
+      read_robot_description: true      # joint names, types, limits from it; never sent itself
+      send_log_path: ""                 # development only: the upload decisions, one JSON line each
+
     # ---- Remote variables --------------------------------------------------------
     # Fetch remote variables and A/B arms once per session. docs/remote-variables.md.
     remote_variables: true

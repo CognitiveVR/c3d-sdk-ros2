@@ -184,6 +184,11 @@ class PoseSampler {
   void Reset();
 
   const std::string& active_reference_frame() const { return active_reference_frame_; }
+  // The frame anything posed beside the gaze channel is posed in: the one the gaze channel
+  // adopted, the fallback when no preferred frame is configured, and "" while the gaze channel
+  // is still deciding -- the `reference_frame_grace_s` window included, where it records
+  // nothing and neither may anything else.
+  std::string reference_frame_in_force() const;
   // kAuto resolved once, at construction. The node reads this back to log the
   // choice and to record it as a session property, so there is one resolution
   // site rather than two that can drift apart.

@@ -6,12 +6,14 @@
 #include "cognitive3d_ros/destination.hpp"
 #include "cognitive3d_ros/identity.hpp"
 #include "cognitive3d_ros/image_codec.hpp"
+#include "cognitive3d_ros/pose_rig.hpp"
 #include "cognitive3d_ros/translators/int32_multi_array_translator.hpp"
 #include "cognitive3d_ros/upload_health.hpp"
 
 #include <lifecycle_msgs/msg/state.hpp>
 #include <rclcpp/version.h>
 #include <rclcpp_components/register_node_macro.hpp>
+#include <tf2/time.h>
 
 #include "c3d/session.hpp"
 #include "c3d/spool.hpp"
@@ -523,6 +525,22 @@ void Cognitive3DNode::DeclareParameters() {
 
   declare_parameter<std::vector<std::string>>("topics", std::vector<std::string>{});
 
+  // The pose stream: the robot's tf tree as a rig. Off by default, so a deployment that does not
+  // ask for it sends nothing new and declares nothing new in its sessions. Provisional, and only
+  // a platform that accepts the stream takes it. The block interval and the send log are core's
+  // own settings, declared from the struct so the two defaults cannot drift apart.
+  declare_parameter<bool>("pose.enabled", false);
+  DeclareDouble("pose.rate_hz", 10.0);
+  DeclareDouble("pose.block_interval_s", c3d_config_.pose_block_interval_s);
+  declare_parameter<std::vector<std::string>>("pose.exclude_frames", std::vector<std::string>{});
+  declare_parameter<std::string>("pose.manifest_id", "");
+  declare_parameter<std::string>("pose.mesh", "");
+  declare_parameter<std::string>("pose.mesh_file_type", "");
+  declare_parameter<std::string>("pose.send_log_path", c3d_config_.pose_send_log_path);
+  // On with the stream: a robot description adds the joints' names, types and limits to the rig.
+  // Only whitelisted fields are read and the XML never leaves the node, so it is the default.
+  declare_parameter<bool>("pose.read_robot_description", true);
+
   // Actions and the two standard event types are enrolled without an allowlist
   // entry, because their topic names are a deployment detail the SDK cannot guess
   // while their TYPES are fixed. An action is matched by NAME, under the node's
@@ -955,6 +973,7 @@ bool Cognitive3DNode::LoadConfig(std::string* error) {
 
   if (!LoadMediaConfig(error)) return false;
   if (!LoadSensorConfig(error)) return false;
+  if (!LoadPoseConfig(error)) return false;
 
   // Validated with a stand-in for a key that is missing, because that problem is already in
   // `missing` under the name of the variable that supplies it.
@@ -1308,6 +1327,94 @@ bool Cognitive3DNode::LoadSensorConfig(std::string* error) {
   return true;
 }
 
+bool Cognitive3DNode::LoadPoseConfig(std::string* error) {
+  // The group's names are fixed, so an override under `pose.` that is not one of them is a
+  // misspelling, which rclcpp would otherwise ignore while the run looked configured.
+  for (const auto& given : get_node_parameters_interface()->get_parameter_overrides()) {
+    const std::string& key = given.first;
+    if (key.rfind("pose.", 0) != 0 || has_parameter(key)) continue;
+    std::string fields;
+    for (const std::string& declared : list_parameters({"pose"}, 0).names) {
+      fields += (fields.empty() ? "" : ", ") + declared.substr(5);
+    }
+    if (error) *error = key + " is not a parameter: the pose stream's fields are " + fields +
+                        ". Correct the spelling";
+    return false;
+  }
+
+  // Every value is checked whether or not the stream is on: validity that moved with
+  // `pose.enabled` would let a wrong file configure until the day the stream is switched on.
+  pose_enabled_ = get_parameter("pose.enabled").as_bool();
+  if (!ReadInRange("pose.block_interval_s", 0.1, 10.0, "a number of seconds from 0.1 to 10",
+                   &c3d_config_.pose_block_interval_s, error)) {
+    return false;
+  }
+  // A replay seeks from the keyframe every 30 s period starts with, and a visible object must
+  // be sampled at least every 30 s less the block interval for every period to have one.
+  const double slowest_period_s = 30.0 - c3d_config_.pose_block_interval_s;
+  std::ostringstream range;
+  range << "a rate from one sample every " << slowest_period_s
+        << " seconds (30 less pose.block_interval_s, the slowest a replay can still seek in) to "
+           "100 Hz";
+  if (!ReadInRange("pose.rate_hz", 1.0 / slowest_period_s, 100.0, range.str(), &pose_rate_hz_,
+                   error)) {
+    return false;
+  }
+  c3d_config_.pose_send_log_path = get_parameter("pose.send_log_path").as_string();
+  pose_read_robot_description_ = get_parameter("pose.read_robot_description").as_bool();
+
+  rig_config_ = TfRigSamplerConfig();
+  rig_config_.robot_frame = sampler_config_.robot_frame;
+  const std::vector<std::string> excluded =
+      get_parameter("pose.exclude_frames").as_string_array();
+  for (const std::string& frame : excluded) {
+    if (frame.empty() || frame == rig_config_.robot_frame) {
+      if (error) {
+        *error = "pose.exclude_frames names '" + frame + "': " +
+                 (frame.empty() ? std::string("an empty frame name excludes nothing")
+                                : "robot_frame is the rig's root, and excluding it would leave "
+                                  "no rig. Set pose.enabled: false to send none");
+      }
+      return false;
+    }
+    rig_config_.excluded.insert(frame);
+  }
+  RigManifestOptions& manifest = rig_config_.manifest;
+  manifest.manifest_id = get_parameter("pose.manifest_id").as_string();
+  if (manifest.manifest_id.empty()) {
+    manifest.manifest_id = DefaultPoseManifestId(c3d_config_.device_id);
+  }
+  manifest.robot_name = c3d_config_.device_id;
+  manifest.mesh = get_parameter("pose.mesh").as_string();
+  manifest.file_type = get_parameter("pose.mesh_file_type").as_string();
+  // The platform takes both or neither, and refuses the whole part otherwise.
+  if (manifest.mesh.empty() != manifest.file_type.empty()) {
+    if (error) {
+      *error = std::string(manifest.mesh.empty() ? "pose.mesh_file_type is set and pose.mesh is "
+                                                   "not"
+                                                 : "pose.mesh is set and pose.mesh_file_type is "
+                                                   "not") +
+               ": set both, to name an uploaded model of the robot and its file type, or "
+               "neither, and Session Replay draws the robot from the gaze stream";
+    }
+    return false;
+  }
+  std::vector<std::pair<std::string, std::string>> kinds;
+  for (const auto& camera : camera_configs_) kinds.emplace_back(camera.frame, "camera");
+  for (const auto& lidar : lidar_configs_) kinds.emplace_back(lidar.frame, "lidar");
+  for (const auto& sensor : sensor_configs_) kinds.emplace_back(sensor.frame, sensor.kind);
+  manifest.kinds = RigFrameKinds(kinds);
+  rig_config_.stale_after_s = StaleTransformAfterSeconds(pose_rate_hz_);
+  // A manifest the platform would refuse is refused here, by what it says.
+  const std::string problem = c3d::pose::ManifestProblem(
+      BuildRigManifest({RigFrame{rig_config_.robot_frame, ""}}, manifest));
+  if (!problem.empty()) {
+    if (error) *error = "the pose stream's manifest would be refused: " + problem;
+    return false;
+  }
+  return true;
+}
+
 std::string Cognitive3DNode::UnreadBlockKey(const std::string& block, const std::string& list,
                                             const std::set<std::string>& listed) {
   const std::string prefix = block + ".";
@@ -1436,6 +1543,26 @@ LifecycleNodeInterface::CallbackReturn Cognitive3DNode::on_configure(
                                              /*automatically_add_to_executor_with_node=*/false);
   pose_sampler_ = std::make_unique<PoseSampler>(tf_buffer_, sampler_config_);
   pose_sampler_->set_event_limiter(&event_limiter_);
+  rig_sampler_.reset();
+  if (pose_enabled_) {
+    // How long tf itself keeps a frame's history: a frame gone longer has left the rig.
+    rig_config_.frame_lost_after_s = tf2::durationToSec(tf_buffer_->getCacheLength());
+    rig_sampler_ = std::make_unique<TfRigSampler>(
+        std::make_shared<Tf2RigTransforms>(tf_buffer_), rig_config_);
+    RCLCPP_INFO(get_logger(),
+                "pose stream on (provisional): the tf tree under '%s' at %.2f Hz as rig '%s', in "
+                "blocks of %.1fs; %zu frame(s) excluded; model %s; %s. Only a platform that "
+                "accepts the pose stream takes it, and an older one refuses every part.",
+                rig_config_.robot_frame.c_str(), pose_rate_hz_,
+                rig_config_.manifest.manifest_id.c_str(), c3d_config_.pose_block_interval_s,
+                rig_config_.excluded.size(),
+                rig_config_.manifest.mesh.empty() ? "none, so Session Replay draws the robot from "
+                                                    "the gaze stream"
+                                                  : rig_config_.manifest.mesh.c_str(),
+                pose_read_robot_description_
+                    ? "joint names, types and limits from /robot_description when it has one"
+                    : "/robot_description not read (pose.read_robot_description is false)");
+  }
 
   if (!sampler_config_.gaze_frame.empty()) {
     const FrameConvention resolved = pose_sampler_->resolved_gaze_frame_convention();
@@ -1657,6 +1784,17 @@ bool Cognitive3DNode::BringUp() {
   // receives no topic traffic at all. On a thread of its own, so tf ingestion cannot be starved by
   // this node's callbacks.
   StartTransformListener();
+  if (rig_sampler_ && pose_read_robot_description_) {
+    // What robot_state_publisher offers: reliable and transient-local, so the description it
+    // published before this node subscribed is delivered now. Absolute, as tf's topics are: a
+    // robot in a namespace remaps it with the node's tf remaps.
+    robot_description_sub_ = create_subscription<std_msgs::msg::String>(
+        "/robot_description", rclcpp::QoS(1).reliable().transient_local(),
+        [this](const std_msgs::msg::String::SharedPtr message) {
+          OnRobotDescription(message->data);
+        },
+        SubscriptionOptionsInGroup());
+  }
   // Reliable with a deep queue: a mission's events are low-rate and each one is a fact nothing
   // else records, so losing one to a full queue is not a trade-off worth making.
   event_sub_ = create_subscription<cognitive3d_ros_msgs::msg::Event>(
@@ -1669,6 +1807,10 @@ bool Cognitive3DNode::BringUp() {
 
   sample_timer_ = CreateActivationTimer(
       std::chrono::duration<double>(1.0 / sampler_config_.rate_hz), [this]() { OnSampleTimer(); });
+  if (rig_sampler_) {
+    pose_timer_ = CreateActivationTimer(std::chrono::duration<double>(1.0 / pose_rate_hz_),
+                                        [this]() { OnPoseTimer(); });
+  }
   discovery_timer_ = CreateActivationTimer(std::chrono::duration<double>(discovery_period_s_),
                                            [this]() { OnDiscoveryTimer(); });
   report_timer_ = CreateActivationTimer(std::chrono::duration<double>(report_period_s_),
@@ -1687,6 +1829,7 @@ rclcpp::TimerBase::SharedPtr Cognitive3DNode::CreateActivationTimer(
 
 void Cognitive3DNode::BringDown(const std::string& reason) {
   sample_timer_.reset();
+  pose_timer_.reset();
   discovery_timer_.reset();
   report_timer_.reset();
   media_hold_timer_.reset();
@@ -1776,6 +1919,9 @@ bool Cognitive3DNode::StartSession(const std::string& participant_id,
         "c3d.ros.gaze_frame_convention",
         std::string(FrameConventionName(pose_sampler_->resolved_gaze_frame_convention())));
   }
+  // The pose stream's own rate. Nothing at all when it is off, so a session from a deployment
+  // that never asked for it is what it was before the stream existed.
+  if (rig_sampler_) session->SetProperty("c3d.ros.pose.rate_hertz", pose_rate_hz_);
   // Which sensors this session carries, and where each came from, so a stored
   // session answers "what was recording?" without the launch configuration beside
   // it -- the same reason `c3d.ros.gaze_frame` is recorded.
@@ -2218,6 +2364,7 @@ std::optional<double> Cognitive3DNode::SessionEndOnWire() const {
 }
 
 void Cognitive3DNode::StopSession(const std::string& reason) {
+  RecordPoseStreamTotals();
   if (runner_) runner_->End(reason, SessionEndOnWire());
   session_from_activation_ = false;
   // The remembered request dies with the session it described. Every deliberate end comes through
@@ -2252,6 +2399,7 @@ LifecycleNodeInterface::CallbackReturn Cognitive3DNode::on_cleanup(
   action_topics_.clear();
   action_topics_logged_ = 0;
   pose_sampler_.reset();
+  rig_sampler_.reset();
   tf_buffer_.reset();
   tf_callback_group_.reset();
   runner_.reset();
@@ -2270,6 +2418,7 @@ LifecycleNodeInterface::CallbackReturn Cognitive3DNode::on_shutdown(
   // Shutdown can come straight from ACTIVE, without a deactivate, and a discovery tick left
   // running would subscribe everything again.
   sample_timer_.reset();
+  pose_timer_.reset();
   discovery_timer_.reset();
   report_timer_.reset();
   media_hold_timer_.reset();
@@ -2328,6 +2477,9 @@ void Cognitive3DNode::TearDownSubscriptions() {
   media_subscriptions_.clear();
   for (auto& kv : stats_) kv.second.subscribed = false;
   event_sub_.reset();
+  robot_description_sub_.reset();
+  // Read again at the next activation, from whatever publishes it then.
+  if (rig_sampler_) rig_sampler_->SetDescription(nullptr);
   StopTransformListener();
   // Its dynamic transforms go too, so a later activation never samples a pose from before this
   // one. tf2 keeps static transforms through a clear, which is what they are.
@@ -2780,6 +2932,8 @@ void Cognitive3DNode::ResetPoseSamplingState() {
   // counter it compares against, which is the only arrangement where one
   // Reset() cannot miss half of a decision.)
   if (pose_sampler_) pose_sampler_->Reset();
+  if (rig_sampler_) rig_sampler_->Reset();
+  next_pose_wire_ = 0.0;
   pose_samples_ = 0;
   pose_failures_ = 0;
   last_gaze_frame_warn_ = 0.0;
@@ -2812,6 +2966,7 @@ void Cognitive3DNode::OnSampleTimer() {
       session_name = requested_session_name_;
       properties = requested_session_properties_;
     }
+    RecordPoseStreamTotals();
     runner_->End("ros_time_jumped_backwards", SessionEndOnWire());
     if (!StartSession(participant_id, /*reuse_remote_variables=*/true)) {
       RCLCPP_ERROR(get_logger(), "could not reopen a session after the backward clock jump");
@@ -2887,6 +3042,60 @@ void Cognitive3DNode::OnSampleTimer() {
   RecordSelfTelemetry(wire_time);
 }
 
+void Cognitive3DNode::OnPoseTimer() {
+  if (runner_ == nullptr || !runner_->active() || rig_sampler_ == nullptr ||
+      pose_sampler_ == nullptr) {
+    return;
+  }
+  const double wire_time = WireNow();
+  // As OnSampleTimer: under `sim_time_on_wire` the rate is held on the wire's own timeline.
+  if (sim_time_on_wire_) {
+    const double period = 1.0 / pose_rate_hz_;
+    if (next_pose_wire_ > 0.0 && wire_time < next_pose_wire_ - 0.1 * period) return;
+    next_pose_wire_ = next_pose_wire_ > 0.0 && wire_time < next_pose_wire_ + period
+                          ? next_pose_wire_ + period
+                          : wire_time + period;
+  }
+  SessionRigSink sink(*runner_, &event_limiter_);
+  rig_sampler_->Tick(wire_time, pose_sampler_->reference_frame_in_force(), sink);
+  for (const std::string& warning : rig_sampler_->TakeWarnings()) {
+    RCLCPP_WARN(get_logger(), "%s", warning.c_str());
+  }
+}
+
+void Cognitive3DNode::OnRobotDescription(const std::string& xml) {
+  if (rig_sampler_ == nullptr) return;
+  auto description = std::make_shared<UrdfDescription>();
+  std::string error;
+  if (!ParseUrdfDescription(xml, description.get(), &error)) {
+    // The parser's refusal names a joint or link at most, never the XML around it.
+    RCLCPP_WARN(get_logger(),
+                "pose stream: the robot description on /robot_description cannot be read (%s); "
+                "the rig is sent from tf alone",
+                error.c_str());
+    rig_sampler_->SetDescription(nullptr);
+    return;
+  }
+  const auto& current = rig_sampler_->description();
+  if (current && current->sha256 == description->sha256) return;
+  RCLCPP_INFO(get_logger(),
+              "pose stream: robot description read: %s. The rig's frames that are its links carry "
+              "their joints' names, types and limits; nothing else in it is kept or sent",
+              DescribeUrdf(*description).c_str());
+  rig_sampler_->SetDescription(std::move(description));
+}
+
+void Cognitive3DNode::RecordPoseStreamTotals() {
+  if (rig_sampler_ == nullptr || runner_ == nullptr || !runner_->active() ||
+      runner_->session() == nullptr || rig_sampler_->manifest_sends() == 0) {
+    return;
+  }
+  // The platform's name and spelling: the values sent again for a frame tf could not look up,
+  // summed over the session's samples.
+  runner_->session()->SetProperty("c3d.stream.pose.heldFrames",
+                                  static_cast<std::int64_t>(rig_sampler_->held_frames()));
+}
+
 void Cognitive3DNode::RecordSelfTelemetry(double wire_time) {
   if (runner_ == nullptr || runner_->session() == nullptr) return;
   // A member, not a function-local static: this node ships as a composable
@@ -2917,6 +3126,12 @@ void Cognitive3DNode::RecordSelfTelemetry(double wire_time) {
   if (pose_sampler_) {
     session->RecordSensor("c3d.stale_poses", wire_time,
                           static_cast<double>(pose_sampler_->stale_transforms()));
+  }
+  if (rig_sampler_) {
+    session->RecordSensor("c3d.pose.samples", wire_time,
+                          static_cast<double>(rig_sampler_->samples()));
+    session->RecordSensor("c3d.pose.held_frames", wire_time,
+                          static_cast<double>(rig_sampler_->held_frames()));
   }
   session->RecordSensor("c3d.events_suppressed", wire_time,
                         static_cast<double>(event_limiter_.suppressed()));
@@ -2987,8 +3202,13 @@ void Cognitive3DNode::OnReportTimer() {
     const c3d::Stats st = runner_->session()->stats();
     const UploadHealth health = DescribeUploads(st, c3d_config_.retry_max_s);
     summary << "\n  session " << runner_->session()->session_id() << "  poses=" << pose_samples_
-            << " frame=" << (pose_sampler_ ? pose_sampler_->active_reference_frame() : "-")
-            << "  recorded=" << st.records_recorded << " dropped=" << st.records_dropped
+            << " frame=" << (pose_sampler_ ? pose_sampler_->active_reference_frame() : "-");
+    if (rig_sampler_) {
+      summary << "  rig=" << rig_sampler_->joints().size() << "/" << rig_sampler_->samples()
+              << " rig_held=" << rig_sampler_->held_frames()
+              << " rig_lost=" << rig_sampler_->frames_lost();
+    }
+    summary << "  recorded=" << st.records_recorded << " dropped=" << st.records_dropped
             << "  uploaded=" << st.chunks_uploaded << " spooled=" << st.spool_count
             << health.report;
     // Reported SEPARATELY, and neither claims the other's cause. `chunks_discarded` is

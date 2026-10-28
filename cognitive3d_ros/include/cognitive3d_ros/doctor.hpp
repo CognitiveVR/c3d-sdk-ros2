@@ -472,6 +472,23 @@ struct PoseChannelFacts {
 };
 Check CheckPoseChannel(const PoseChannelFacts& facts);
 
+// The pose stream, the robot's tf tree as a rig, as doctor found it. Off by default, and then
+// one `ok` line saying so. On, it names the frames the rig would carry now and says that the
+// platform must take the stream: a gateway that does not answers every pose part 400, and the
+// node discards a refused part rather than retry it.
+struct PoseStreamFacts {
+  bool enabled = false;
+  double rate_hz = 0.0;
+  std::string robot_frame;
+  std::string manifest_id;
+  bool mesh_set = false;
+  // Whether tf knows `robot_frame` at all, and the rig's frames, root first, as it stands.
+  bool robot_frame_known = false;
+  std::vector<std::string> frames;
+  std::size_t excluded = 0;
+};
+Check CheckPoseStream(const PoseStreamFacts& facts);
+
 // One configured camera or lidar, as doctor found it on the graph.
 //
 // The size is MEASURED rather than assumed: doctor encodes one real message

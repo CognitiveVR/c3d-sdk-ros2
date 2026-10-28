@@ -369,6 +369,39 @@ TEST(GazeFrame, ConfiguredButUnresolvableIsFatal_UnsetIsFine) {
   EXPECT_EQ(CheckGazeFrame("cam", true).severity, Severity::kOk);
 }
 
+TEST(PoseStream, OffIsOneOkLineAndOnNamesTheRigAndThatThePlatformMustTakeIt) {
+  PoseStreamFacts facts;
+  const Check off = CheckPoseStream(facts);
+  EXPECT_EQ(off.name, "pose stream");
+  EXPECT_EQ(off.severity, Severity::kOk);
+  EXPECT_TRUE(Mentions(off, "pose.enabled is false"));
+
+  facts.enabled = true;
+  facts.rate_hz = 10.0;
+  facts.robot_frame = "base_link";
+  facts.manifest_id = "ros2-64a722d4f3a20f48";
+  facts.robot_frame_known = true;
+  facts.frames = {"base_link", "camera_link", "camera_optical_frame", "laser"};
+  facts.excluded = 1;
+  const Check on = CheckPoseStream(facts);
+  EXPECT_EQ(on.severity, Severity::kOk);
+  EXPECT_TRUE(Mentions(on, "4 frame(s) under base_link"));
+  EXPECT_TRUE(Mentions(on, "camera_optical_frame"));
+  EXPECT_TRUE(Mentions(on, "ros2-64a722d4f3a20f48"));
+  EXPECT_TRUE(Mentions(on, "1 excluded"));
+  EXPECT_TRUE(Mentions(on, "gaze stream")) << "no model: the robot is drawn as before";
+  // The platform dependency, said whenever the stream is on.
+  EXPECT_TRUE(Mentions(on, "400"));
+  EXPECT_TRUE(Mentions(on, "Provisional"));
+
+  facts.robot_frame_known = false;
+  facts.frames.clear();
+  const Check waiting = CheckPoseStream(facts);
+  EXPECT_EQ(waiting.severity, Severity::kAdvisory);
+  EXPECT_TRUE(Mentions(waiting, "base_link"));
+  EXPECT_TRUE(Mentions(waiting, "400"));
+}
+
 TEST(Gateway, UnreachableCarriesTheTransportsOwnMessage) {
   const Check check = CheckGateway("https", "data.cognitive3d.com", 0, false,
                                    "Could not resolve host");

@@ -6,6 +6,7 @@
 
 #include "c3d/media.hpp"
 #include "c3d/types.hpp"
+#include "pose_queue.hpp"
 
 namespace c3d {
 
@@ -42,7 +43,26 @@ struct LidarScanRecord {
   EncodedPointCloud cloud;
 };
 
-// The eight header fields both payloads share, at the same ordinals. Written out
+// One pose manifest entry as it goes on the wire: c3d::pose::Manifest with the two fields a
+// session fills in, each joint's `j` (its index) and the send's `firstSeq`.
+struct PoseJointRecord {
+  std::uint32_t j = 0;
+  std::string mesh_name;
+  Properties properties;
+};
+struct PoseManifestRecord {
+  std::string manifest_id;
+  std::string name;
+  std::string mesh;
+  std::string file_type;
+  std::string rigging_mapping_type;
+  std::vector<PoseJointRecord> joints;
+  std::string root;
+  Properties properties;
+  std::uint32_t first_seq = 0;
+};
+
+// The eight header fields every binary payload shares, at the same ordinals. Written out
 // once here and twice on the wire, because Cap'n Proto has no inheritance.
 struct BinaryEnvelope {
   std::string user_id;
@@ -63,5 +83,12 @@ std::string SerializeCameraPayload(const BinaryEnvelope& envelope,
                                    const std::vector<CameraFrameRecord>& frames);
 std::string SerializeLidarPayload(const BinaryEnvelope& envelope,
                                   const std::vector<LidarScanRecord>& scans);
+// A pose part carries manifests or blocks, never both (spec §10.1 rule 6), so this takes one
+// list or the other; `start_us` and `end_us` are the part's envelope times, 0 on a manifest
+// part. A property's int and double both travel as the schema's number.
+std::string SerializePosePayload(const BinaryEnvelope& envelope,
+                                 const std::vector<PoseManifestRecord>& manifests,
+                                 const std::vector<pose::QueuedBlock>& blocks,
+                                 std::int64_t start_us, std::int64_t end_us);
 
 }  // namespace c3d

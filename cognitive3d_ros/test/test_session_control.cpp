@@ -51,6 +51,7 @@
 #include <sensor_msgs/msg/range.hpp>
 #include <sensor_msgs/msg/temperature.hpp>
 #include <std_msgs/msg/float32.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <rosgraph_msgs/msg/clock.hpp>
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_broadcaster.h>
@@ -58,6 +59,7 @@
 
 #include "c3d/environment.hpp"
 #include "c3d/properties.hpp"
+#include "c3d/sha256.hpp"
 #include "cognitive3d_ros/doctor.hpp"
 #include "cognitive3d_ros/node.hpp"
 #include "throttled_http_server.hpp"
@@ -1186,6 +1188,83 @@ TEST_F(LifecycleContractTest, AStaleRobotTransformIsCountedInTheSession) {
     }
   }
   EXPECT_TRUE(counted) << "no c3d.stale_poses sample above zero reached the spool";
+}
+
+namespace {
+
+std::string NamedRobot(const std::string& name) {
+  return "<robot name=\"" + name + "\"><link name=\"base_link\"/><link name=\"laser\"/>"
+         "<joint name=\"laser_mount\" type=\"fixed\"><parent link=\"base_link\"/>"
+         "<child link=\"laser\"/></joint></robot>";
+}
+
+}  // namespace
+
+// robot_state_publisher latches its description: published once, before or after this node
+// subscribes. The node reads it either way, reads a new one mid-run, lets go of one it cannot
+// read, and holds none while inactive.
+TEST_F(LifecycleContractTest, TheRobotDescriptionIsReadWhetherPublishedBeforeOrAfterActivation) {
+  MakeNode(/*auto_start_session=*/false, {{"pose.enabled", true}});
+  auto publisher = client_->create_publisher<std_msgs::msg::String>(
+      "/robot_description", rclcpp::QoS(1).reliable().transient_local());
+  const auto publish = [&](const std::string& xml) {
+    std_msgs::msg::String message;
+    message.data = xml;
+    publisher->publish(message);
+  };
+  const auto robot_is = [this](const std::string& name) {
+    const auto description = node_->robot_description();
+    return description != nullptr && description->robot_name == name &&
+           description->sha256 == c3d::Sha256Hex(NamedRobot(name));
+  };
+  publish(NamedRobot("published_before"));
+
+  ASSERT_EQ(node_->configure().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+  EXPECT_TRUE(node_->resolved_pose_read_robot_description()) << "on by default";
+  SpinUntil([] { return false; }, std::chrono::milliseconds(200));
+  EXPECT_EQ(node_->robot_description(), nullptr) << "a configured but inactive node reads nothing";
+  EXPECT_EQ(client_->count_subscribers("/robot_description"), 0u);
+
+  ASSERT_EQ(node_->activate().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
+  ASSERT_TRUE(SpinUntil([&] { return robot_is("published_before"); }))
+      << "the description latched before the node subscribed";
+  EXPECT_EQ(node_->robot_description()->joints.size(), 1u);
+
+  publish(NamedRobot("published_after"));
+  EXPECT_TRUE(SpinUntil([&] { return robot_is("published_after"); }))
+      << "a new description while active replaces the one in force";
+
+  publish("<robot name=\"broken\"><link name=\"a\"/></robo>");
+  EXPECT_TRUE(SpinUntil([&] { return node_->robot_description() == nullptr; }))
+      << "the latest description is the robot's: one that cannot be read leaves none in force";
+
+  publish(NamedRobot("published_while_active"));
+  EXPECT_TRUE(SpinUntil([&] { return robot_is("published_while_active"); }));
+  ASSERT_EQ(node_->deactivate().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+  EXPECT_EQ(node_->robot_description(), nullptr) << "an inactive node holds no description";
+  EXPECT_TRUE(SpinUntil([&] { return client_->count_subscribers("/robot_description") == 0; }));
+
+  ASSERT_EQ(node_->activate().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
+  EXPECT_TRUE(SpinUntil([&] { return robot_is("published_while_active"); }))
+      << "read again from the latched message at the next activation";
+}
+
+TEST_F(LifecycleContractTest, TheRobotDescriptionIsNotSubscribedWhenTheRigCannotUseIt) {
+  for (const auto& extra : std::vector<std::vector<rclcpp::Parameter>>{
+           {{"pose.enabled", true}, {"pose.read_robot_description", false}},
+           {{"pose.enabled", false}}}) {
+    if (node_) executor_.remove_node(node_->get_node_base_interface());
+    MakeNode(/*auto_start_session=*/false, extra);
+    ASSERT_EQ(node_->configure().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+    ASSERT_EQ(node_->activate().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
+    // Long enough for the events subscription to be seen, which is created beside it.
+    EXPECT_TRUE(SpinUntil([&] { return client_->count_subscribers("/cognitive3d/events") > 0; }));
+    EXPECT_EQ(client_->count_subscribers("/robot_description"), 0u)
+        << extra[0].get_name() << " " << extra[0].value_to_string();
+    EXPECT_EQ(node_->robot_description(), nullptr);
+    ASSERT_EQ(node_->deactivate().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+    EXPECT_TRUE(SpinUntil([&] { return client_->count_subscribers("/cognitive3d/events") == 0; }));
+  }
 }
 
 // An unset spool_dir is a per-user state directory, never a shared world-writable one.

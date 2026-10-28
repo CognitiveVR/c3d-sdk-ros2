@@ -110,4 +110,5 @@ them from their own distributions, under their own licenses.
 | zstd | BSD-3-Clause or GPL-2.0 | point cloud compression |
 | Cap'n Proto runtime | MIT | the camera and lidar payloads |
 | OpenCV | Apache-2.0 | `cv_bridge`, and the camera frame encoder |
+| TinyXML-2 | Zlib | the robot description reader |
 | ROS 2 (rclcpp, tf2, cv_bridge, message packages, Nav2 messages) | Apache-2.0 and BSD | the node |

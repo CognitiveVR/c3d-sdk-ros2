@@ -74,6 +74,7 @@
       depth:
         topic: "/fake/points"
         rate_hz: 1.0
+        frame: "base_scan"
         pointcloud:
           voxel_leaf_m: 0.05
           position: "int16_mm"
@@ -85,3 +86,12 @@
     # counter is actually exercised.
     camera_flush_s: 2.0
     lidar_flush_s: 2.0
+
+    # The pose stream: the fake robot's tf tree under base_link, with base_scan tagged as the
+    # depth lidar's frame and camera_link on a panning gimbal. One-second blocks, so a run of this
+    # length cuts several, and the send log for the platform's upload check.
+    pose:
+      enabled: true
+      rate_hz: 10.0
+      block_interval_s: 1.0
+      send_log_path: "/tmp/c3d_capture/pose_send_log.jsonl"

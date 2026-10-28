@@ -7,7 +7,7 @@
 #include <sstream>
 
 #include "json_dump.hpp"
-#include "sha256.hpp"
+#include "c3d/sha256.hpp"
 #include "util.hpp"
 
 namespace c3d {
@@ -79,6 +79,7 @@ std::uint64_t PartBase(Stream stream) {
       return 1;
     case Stream::kCamera:
     case Stream::kLidar:
+    case Stream::kPose:
       return 1;
   }
   return 1;

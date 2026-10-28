@@ -30,6 +30,10 @@ find_package(cognitive3d_ros_msgs REQUIRED)
 # doctor.cpp parses JSON itself, and core keeps its own use of the library private. Found before
 # core is added, so core's own lookup resolves to this same imported target.
 find_package(nlohmann_json 3.9 REQUIRED)
+# The robot description parser reads URDF XML with tinyxml2, which every ROS 2 install already has
+# (Fast DDS and urdfdom link it). The vendor package supplies the find module for both distros.
+find_package(tinyxml2_vendor REQUIRED)
+find_package(TinyXML2 REQUIRED)
 
 # The ingest core. Built from source as a plain CMake subproject; it has no ROS
 # dependency and must never acquire one.
@@ -57,6 +61,9 @@ add_library(cognitive3d_ros_component SHARED
   src/doctor.cpp
   src/run_doctor.cpp
   src/pose_sampler.cpp
+  src/pose_rig.cpp
+  src/tf_rig_sampler.cpp
+  src/urdf_description.cpp
   src/translators/registry.cpp
   src/translators/battery_translator.cpp
   src/translators/joint_state_translator.cpp
@@ -75,7 +82,8 @@ target_include_directories(cognitive3d_ros_component PUBLIC
 # Plain signature throughout: ament_target_dependencies uses the plain form,
 # and CMake refuses to mix keyword and plain on one target.
 target_link_libraries(cognitive3d_ros_component c3d_core ${OpenCV_LIBS}
-  nlohmann_json::nlohmann_json)
+  nlohmann_json::nlohmann_json ${TinyXML2_LIBRARIES})
+target_include_directories(cognitive3d_ros_component PRIVATE ${TinyXML2_INCLUDE_DIRS})
 ament_target_dependencies(cognitive3d_ros_component
   rclcpp rclcpp_lifecycle rclcpp_components ament_index_cpp lifecycle_msgs diagnostic_msgs
   rosgraph_msgs tf2 tf2_ros std_msgs geometry_msgs sensor_msgs nav_msgs tf2_msgs action_msgs
@@ -197,6 +205,23 @@ if(BUILD_TESTING)
   ament_add_gtest(test_pose_sampler test/test_pose_sampler.cpp)
   target_link_libraries(test_pose_sampler cognitive3d_ros_component)
   ament_target_dependencies(test_pose_sampler rclcpp tf2_ros geometry_msgs)
+
+  ament_add_gtest(test_urdf_description test/test_urdf_description.cpp
+    ENV C3D_URDF_FIXTURES=${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures)
+  target_link_libraries(test_urdf_description cognitive3d_ros_component)
+
+  ament_add_gtest(test_pose_rig test/test_pose_rig.cpp
+    ENV C3D_URDF_FIXTURES=${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures)
+  target_link_libraries(test_pose_rig cognitive3d_ros_component)
+  ament_target_dependencies(test_pose_rig rclcpp tf2_ros geometry_msgs)
+
+  # A real graph: a robot publishing tf, a listener, and the pose stream into a session. Its own
+  # ROS domain, so another suite's tf in the same workspace cannot reach its buffer.
+  ament_add_gtest(test_pose_stream test/test_pose_stream.cpp
+    TIMEOUT 120
+    ENV ROS_DOMAIN_ID=86 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST)
+  target_link_libraries(test_pose_stream cognitive3d_ros_component)
+  ament_target_dependencies(test_pose_stream rclcpp tf2_ros geometry_msgs)
 
   # A node-level test: it builds a real Cognitive3DNode, drives its lifecycle and
   # calls its services over a real executor, because session control IS the

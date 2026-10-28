@@ -1,0 +1,53 @@
+<?xml version="1.0"?>
+<!-- Hardware detail a URDF often carries and the SDK must never send or log: an address, serial
+     ports and a credential-shaped parameter in <ros2_control>, <transmission> and <gazebo>,
+     including a <joint> nested in each that must not be read as one of the robot's. All values
+     are made up; 192.0.2.0/24 is the documentation range. -->
+<robot name="gripper_cell" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <mesh filename="package://acme_secret_description/meshes/base.stl"/>
+      </geometry>
+    </visual>
+  </link>
+  <link name="finger_link"/>
+  <joint name="finger_joint" type="prismatic">
+    <parent link="base_link"/>
+    <child link="finger_link"/>
+    <limit lower="0" upper="0.04" effort="20" velocity="0.1"/>
+  </joint>
+  <ros2_control name="AcmeGripperSystem" type="system">
+    <hardware>
+      <plugin>acme_secret_driver/AcmeHardware</plugin>
+      <param name="robot_ip">192.0.2.77</param>
+      <param name="serial_port">/dev/ttyACM-SECRET-7</param>
+      <param name="password">hunter2-SECRET</param>
+    </hardware>
+    <joint name="finger_joint">
+      <command_interface name="position">
+        <param name="min">-0.5</param>
+      </command_interface>
+      <state_interface name="position"/>
+    </joint>
+    <joint name="SECRET_192.0.2.77_joint" type="revolute">
+      <parent link="base_link"/>
+      <child link="finger_link"/>
+      <limit lower="-9" upper="9" effort="9" velocity="9"/>
+    </joint>
+  </ros2_control>
+  <transmission name="SECRET_tx_192.0.2.78">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="finger_joint">
+      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="motor_on_/dev/ttyUSB-SECRET-9">
+      <mechanicalReduction>50</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <gazebo>
+    <plugin filename="libacme_SECRET.so" name="SECRET_plugin">
+      <host>192.0.2.79</host>
+    </plugin>
+  </gazebo>
+</robot>

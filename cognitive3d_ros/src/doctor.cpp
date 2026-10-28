@@ -1328,6 +1328,38 @@ double TiltDegrees(double qx, double qy, double qz, double qw) {
 
 bool CarriesTilt(double qx, double qy) { return qx != 0.0 || qy != 0.0; }
 
+Check CheckPoseStream(const PoseStreamFacts& facts) {
+  const char* kName = "pose stream";
+  if (!facts.enabled) {
+    return {kName, Severity::kOk, "off (pose.enabled is false); nothing is sent on it", ""};
+  }
+  std::ostringstream joined;
+  for (std::size_t i = 0; i < facts.frames.size() && i < 20; ++i) {
+    joined << (i ? ", " : "") << facts.frames[i];
+  }
+  if (facts.frames.size() > 20) joined << ", ... (" << (facts.frames.size() - 20) << " more)";
+  const std::string platform =
+      "Provisional: only a platform that accepts the pose stream takes it. An older gateway "
+      "answers every pose part 400, and the node discards a refused part and counts it in the "
+      "uploads report.";
+  if (!facts.robot_frame_known) {
+    return {kName, Severity::kAdvisory,
+            "on, at " + Fixed(facts.rate_hz, 2) + " Hz, and tf has no frame '" + facts.robot_frame +
+                "' yet, so the rig has no root",
+            "Fine while the robot is starting up: the rig is sent from the first tick the body "
+            "resolves, and frames join as they appear. " + platform};
+  }
+  return {kName, Severity::kOk,
+          "on, at " + Fixed(facts.rate_hz, 2) + " Hz, rig '" + facts.manifest_id + "' of " +
+              std::to_string(facts.frames.size()) + " frame(s) under " + facts.robot_frame +
+              " now: " + joined.str() +
+              (facts.excluded > 0 ? "; " + std::to_string(facts.excluded) + " excluded" : "") +
+              (facts.mesh_set ? "" : "; no model, so Session Replay draws the robot from the "
+                                     "gaze stream") +
+              ". " + platform,
+          ""};
+}
+
 Check CheckPoseChannel(const PoseChannelFacts& facts) {
   const char* kName = "pose channel";
   const char* kSkipped = "pose channel (NOT CHECKED)";

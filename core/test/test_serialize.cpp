@@ -57,6 +57,8 @@ TEST(Url, TheBinaryStreamsAreSessionKeyedAndCarryNoSceneInThePath) {
             "https://data.cognitive3d.com/v0/camera");
   EXPECT_EQ(BuildUrl("https", "data.cognitive3d.com", "0", Stream::kLidar, "SCENEGUID", "2"),
             "https://data.cognitive3d.com/v0/lidar");
+  EXPECT_EQ(BuildUrl("https", "data.cognitive3d.com", "0", Stream::kPose, "SCENEGUID", "2"),
+            "https://data.cognitive3d.com/v0/pose");
 }
 
 TEST(Headers, AuthSchemeIsApiKeyData) {
@@ -68,7 +70,7 @@ TEST(Headers, AuthSchemeIsApiKeyData) {
 }
 
 TEST(Headers, TheBinaryStreamsAnnounceOctetStreamAndDropTheUnityOverride) {
-  for (Stream s : {Stream::kCamera, Stream::kLidar}) {
+  for (Stream s : {Stream::kCamera, Stream::kLidar, Stream::kPose}) {
     const auto headers = BuildHeaders("APPKEY123", s);
     ASSERT_EQ(headers.size(), 2u) << StreamName(s);
     EXPECT_EQ(headers[0], "Content-Type: application/octet-stream");
@@ -91,15 +93,18 @@ TEST(PartBase, TheBinaryStreamsStartAtOne) {
   // No reference implementation has these routes: docs/data-format.md fixes the base at 1.
   EXPECT_EQ(PartBase(Stream::kCamera), 1u);
   EXPECT_EQ(PartBase(Stream::kLidar), 1u);
+  EXPECT_EQ(PartBase(Stream::kPose), 1u);
 }
 
-TEST(StreamNames, TheTwoBinaryStreamsAreNamedAndFlagged) {
+TEST(StreamNames, TheThreeBinaryStreamsAreNamedAndFlagged) {
   // The name is the url segment, the chunk-id suffix the spool sorts and evicts
   // by, and what StreamFromName reads back on recovery -- one string, three jobs.
   EXPECT_STREQ(StreamName(Stream::kCamera), "camera");
   EXPECT_STREQ(StreamName(Stream::kLidar), "lidar");
+  EXPECT_STREQ(StreamName(Stream::kPose), "pose");
   EXPECT_TRUE(IsBinaryStream(Stream::kCamera));
   EXPECT_TRUE(IsBinaryStream(Stream::kLidar));
+  EXPECT_TRUE(IsBinaryStream(Stream::kPose));
   for (Stream s : {Stream::kGaze, Stream::kEvents, Stream::kSensors, Stream::kDynamics}) {
     EXPECT_FALSE(IsBinaryStream(s)) << StreamName(s);
   }
@@ -112,6 +117,7 @@ TEST(FormatVersion, SensorsAreTheOnlyStreamAtFormatVersionTwo) {
   EXPECT_STREQ(FormatVersion(Stream::kDynamics), "1.0");
   EXPECT_STREQ(FormatVersion(Stream::kCamera), "1.0");
   EXPECT_STREQ(FormatVersion(Stream::kLidar), "1.0");
+  EXPECT_STREQ(FormatVersion(Stream::kPose), "1.0");  // the envelope's; a block has its own
 }
 
 // ---------------------------------------------------------------------------
