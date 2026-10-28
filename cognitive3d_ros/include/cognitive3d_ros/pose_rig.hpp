@@ -4,14 +4,15 @@
 //
 // The profile is `ros2/1`: one rig per robot. Joint 0 is `robot_frame`, carrying its pose in the
 // session's reference frame; every other tf frame under it is a joint carrying its transform in
-// its tf parent; `meshName` is the frame's name. Everything the manifest says comes from tf and
-// from this node's own configuration (tier 1). A URDF on `/robot_description` would add more keys
-// (tier 2), through the seam marked below; nothing implements it yet.
+// its tf parent; `meshName` is the frame's name. tf and this node's own configuration decide the
+// manifest (tier 1), which is valid by itself. A robot description, when `/robot_description`
+// has one, only adds keys to it (tier 2): it never adds a joint, and never removes one.
 #pragma once
 
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <utility>
@@ -20,6 +21,7 @@
 #include "c3d/pose.hpp"
 #include "c3d/pose_manifest.hpp"
 #include "cognitive3d_ros/coordinate_transform.hpp"
+#include "cognitive3d_ros/urdf_description.hpp"
 
 namespace cognitive3d_ros {
 
@@ -59,7 +61,7 @@ std::string DefaultPoseManifestId(const std::string& device_id);
 
 struct RigManifestOptions {
   std::string manifest_id;
-  // `name` and `ros.robotName`: the node's `device_id`, until a URDF names the robot.
+  // `name`, and `ros.robotName` until a robot description names the robot: the node's `device_id`.
   std::string robot_name;
   // The uploaded per-link model and its file type, both "" until one exists: an empty mesh
   // tells Session Replay there is nothing to draw from this stream, and the robot is drawn from
@@ -70,12 +72,8 @@ struct RigManifestOptions {
   std::map<std::string, std::string> kinds;
 };
 
-// TIER 2 SEAM. A URDF read from `/robot_description` decorates the tf-only manifest: object keys
-// such as `ros.urdfSha256` and `c3d.model.format`, joint keys such as `ros.jointName`,
-// `ros.jointType` and `ros.limit.*`, matched by link name. tf still decides which joints exist;
-// a decoration only adds keys, and the result must still pass c3d::pose::ManifestProblem. Not
-// implemented: BuildRigManifest takes one so that the URDF reader plugs in here and nowhere
-// else.
+// Adds keys to a tier 1 manifest, after BuildRigManifest has built it. tf still decides which
+// joints exist; the result must still pass c3d::pose::ManifestProblem.
 using RigManifestDecoration = std::function<void(c3d::pose::Manifest*)>;
 
 // The tf-only (tier 1) manifest of the rig `frames`, as RigFramesUnder orders them: one entry,
@@ -86,6 +84,25 @@ using RigManifestDecoration = std::function<void(c3d::pose::Manifest*)>;
 c3d::pose::Manifest BuildRigManifest(const std::vector<RigFrame>& frames,
                                      const RigManifestOptions& options,
                                      const RigManifestDecoration& decorate = nullptr);
+
+// Tier 2: the keys a robot description adds, matched to the rig by link name.
+//
+// On the object: `ros.robotName` becomes `<robot name>` (the manifest's `name` stays the node's
+// `device_id`), and `ros.urdfSha256`, `c3d.model.format` "urdf" and `c3d.model.formatVersion`
+// join it. On every joint but the root whose frame is a link that some URDF joint has as its
+// child: `ros.jointName` and `ros.jointType` from that joint, and each of its
+// `ros.limit.lower/.upper/.effort/.velocity/.acceleration/.deceleration/.jerk` that is finite,
+// so an absent limit means unbounded in every URDF version. A frame the description does not
+// name, and the root, keep their tier 1 keys only.
+//
+// A value the platform could not take -- a name past its string limit, a limit past float32 --
+// is left out rather than refused, and should the result still break a shape rule (a description
+// whose names are not UTF-8) the manifest stays tier 1: a description never costs the robot its
+// rig.
+void DecorateRigManifest(const UrdfDescription& description, c3d::pose::Manifest* manifest);
+
+// DecorateRigManifest as a decoration for BuildRigManifest; null for a null description.
+RigManifestDecoration UrdfDecoration(std::shared_ptr<const UrdfDescription> description);
 
 // One joint's transform in ROS axes: joint 0 in the reference frame, every other joint in its tf
 // parent.

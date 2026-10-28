@@ -114,6 +114,8 @@ void TfRigSampler::Reset() {
   joints_.clear();
   last_values_.clear();
   manifest_sent_ = false;
+  // The next session's first manifest carries the description anyway.
+  description_changed_ = false;
   enabled_ = true;
   have_body_ = false;
   body_position_ = c3d::Vec3{};
@@ -128,6 +130,13 @@ void TfRigSampler::Reset() {
   manifest_sends_ = 0;
   warnings_.clear();
   last_refusal_.clear();
+}
+
+void TfRigSampler::SetDescription(std::shared_ptr<const UrdfDescription> description) {
+  const std::string had = description_ ? description_->sha256 : std::string();
+  const std::string has = description ? description->sha256 : std::string();
+  description_ = std::move(description);
+  if (had != has) description_changed_ = true;
 }
 
 std::vector<std::string> TfRigSampler::TakeWarnings() {
@@ -243,9 +252,10 @@ TfRigSampler::Outcome TfRigSampler::Tick(double wire_time, const std::string& re
     in_next.insert(frame.name);
   }
 
-  if (!manifest_sent_ || !SameJoints(next, joints_)) {
+  if (!manifest_sent_ || description_changed_ || !SameJoints(next, joints_)) {
     std::string error;
-    if (!sink.SendManifest(BuildRigManifest(next, config_.manifest), &error)) {
+    if (!sink.SendManifest(
+            BuildRigManifest(next, config_.manifest, UrdfDecoration(description_)), &error)) {
       if (error != last_refusal_) {
         last_refusal_ = error;
         warnings_.push_back("the pose stream refused the robot's manifest: " + error);
@@ -254,6 +264,7 @@ TfRigSampler::Outcome TfRigSampler::Tick(double wire_time, const std::string& re
     }
     joints_ = next;
     manifest_sent_ = true;
+    description_changed_ = false;
     ++manifest_sends_;
     for (const RigFrame& frame : lost) {
       FrameState& state = frames_[frame.name];

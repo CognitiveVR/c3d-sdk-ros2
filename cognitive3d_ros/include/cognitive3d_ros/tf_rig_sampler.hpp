@@ -133,6 +133,8 @@ struct TfRigSamplerConfig {
 //     `robot.frame_lost` with the frame and the epoch second it was last seen; if it comes back,
 //     it joins again;
 //   - a frame whose tf parent changes is sent again under the new one.
+// A robot description, when one is set, decorates every manifest (tier 2); a new one is a re-send
+// too.
 class TfRigSampler {
  public:
   enum class Outcome {
@@ -153,6 +155,12 @@ class TfRigSampler {
   Outcome Tick(double wire_time, const std::string& reference, PoseRigSink& sink);
   // Everything per session: the next session sends its manifest again from nothing.
   void Reset();
+  // The robot description that decorates every manifest from now on, or null for none. One whose
+  // hash differs from the description in force re-sends the manifest at the next tick, mid-session
+  // included, so a robot whose description changes says so on the stream; the same one again
+  // changes nothing. Kept across Reset: it describes the robot, not a session.
+  void SetDescription(std::shared_ptr<const UrdfDescription> description);
+  const std::shared_ptr<const UrdfDescription>& description() const { return description_; }
 
   const TfRigSamplerConfig& config() const { return config_; }
   std::uint64_t samples() const { return samples_; }
@@ -186,6 +194,9 @@ class TfRigSampler {
   std::vector<RigFrame> joints_;
   std::vector<RosJointPose> last_values_;
   bool manifest_sent_ = false;
+  std::shared_ptr<const UrdfDescription> description_;
+  // The description changed since the last manifest went out.
+  bool description_changed_ = false;
   bool enabled_ = true;
   bool have_body_ = false;
   c3d::Vec3 body_position_;

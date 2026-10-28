@@ -10,7 +10,10 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
@@ -23,6 +26,7 @@
 #include "c3d/spool.hpp"
 #include "cognitive3d_ros/pose_rig.hpp"
 #include "cognitive3d_ros/tf_rig_sampler.hpp"
+#include "cognitive3d_ros/urdf_description.hpp"
 
 using namespace cognitive3d_ros;
 namespace fs = std::filesystem;
@@ -299,7 +303,7 @@ TEST(RigManifest, AModelIsBothMeshAndFileTypeOrNeither) {
   EXPECT_NE(c3d::pose::ManifestProblem(BuildRigManifest(rig, options)), "");
 }
 
-TEST(RigManifest, TheTierTwoSeamDecoratesTheTfOnlyManifest) {
+TEST(RigManifest, ADecorationAddsKeysToTheTfOnlyManifest) {
   const auto rig = RigFramesUnder(RaspbotTree(), "base_link", {});
   RigManifestOptions options;
   options.manifest_id = "r";
@@ -309,6 +313,234 @@ TEST(RigManifest, TheTierTwoSeamDecoratesTheTfOnlyManifest) {
   });
   EXPECT_EQ(Property(m.properties, "c3d.model.format"), "urdf");
   EXPECT_EQ(JointNames(m).size(), 4u) << "a decoration adds keys; tf decides the joints";
+}
+
+// ---- Tier 2: the robot description's keys ---------------------------------------------------
+
+namespace {
+
+std::string UrdfFixture(const std::string& name) {
+  const char* dir = std::getenv("C3D_URDF_FIXTURES");
+  EXPECT_NE(dir, nullptr) << "C3D_URDF_FIXTURES is set by the test's CMake entry";
+  std::ifstream in(std::string(dir == nullptr ? "." : dir) + "/" + name, std::ios::binary);
+  EXPECT_TRUE(in.good()) << name;
+  return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+std::shared_ptr<const UrdfDescription> Description(const std::string& xml) {
+  auto description = std::make_shared<UrdfDescription>();
+  std::string error;
+  EXPECT_TRUE(ParseUrdfDescription(xml, description.get(), &error)) << error;
+  return description;
+}
+
+double Number(const c3d::Properties& properties, const std::string& key) {
+  for (const auto& [k, v] : properties) {
+    if (k == key) return v.kind() == c3d::PropertyValue::Kind::kDouble ? v.as_double() : -999.0;
+  }
+  return std::nan("");
+}
+
+std::vector<std::string> Keys(const c3d::Properties& properties) {
+  std::vector<std::string> keys;
+  for (const auto& kv : properties) keys.push_back(kv.first);
+  return keys;
+}
+
+c3d::pose::Manifest Decorated(const std::vector<RigFrame>& tree,
+                              std::shared_ptr<const UrdfDescription> description) {
+  RigManifestOptions options;
+  options.manifest_id = "rig";
+  options.robot_name = "raspbot-01";
+  options.kinds = RigFrameKinds({{"camera_link", "camera"}, {"laser", "lidar"}});
+  return BuildRigManifest(RigFramesUnder(tree, "base_link", {}), options,
+                          UrdfDecoration(std::move(description)));
+}
+
+}  // namespace
+
+// Yahboom's stock description names the wheels and the gimbal's two links; tf on the Raspbot
+// publishes none of them, and the description names none of tf's sensor frames. Only base_link
+// is shared, and it is the root, so the joints are tf's alone and keep their tier 1 keys.
+TEST(RigManifestTier2, YahboomsDescriptionOnTheRaspbotsTfAddsObjectKeysAndNoJoint) {
+  const auto yahboom = Description(UrdfFixture("raspbot_v2_yahboom.urdf"));
+  const c3d::pose::Manifest tier1 = Decorated(RaspbotTree(), nullptr);
+  const c3d::pose::Manifest m = Decorated(RaspbotTree(), yahboom);
+
+  EXPECT_EQ(m.name, "raspbot-01") << "the manifest's name stays device_id";
+  EXPECT_EQ(Property(m.properties, "ros.robotName"), "Raspbot-V2");
+  EXPECT_EQ(Property(m.properties, "ros.urdfSha256"),
+            "e18f29dc721ddf4b8fa485e08ffef60fca90e634572ce612210901fbae3d3ce6");
+  EXPECT_EQ(Property(m.properties, "c3d.model.format"), "urdf");
+  EXPECT_EQ(Property(m.properties, "c3d.model.formatVersion"), "1.0");
+  EXPECT_EQ(Keys(m.properties), (std::vector<std::string>{"c3d.profile", "ros.robotName",
+                                                          "ros.urdfSha256", "c3d.model.format",
+                                                          "c3d.model.formatVersion"}));
+  EXPECT_EQ(JointNames(m), JointNames(tier1)) << "tf decides the joints";
+  for (std::size_t j = 0; j < m.joints.size(); ++j) {
+    EXPECT_EQ(Keys(m.joints[j].properties), Keys(tier1.joints[j].properties))
+        << m.joints[j].mesh_name << " is not a URDF joint's child, or is the root";
+  }
+  EXPECT_EQ(c3d::pose::ManifestProblem(m), "");
+}
+
+// Had tf published the gimbal's links, its continuous joints would carry what Yahboom wrote:
+// effort and velocity 0, and no position limits, since a continuous joint has none.
+TEST(RigManifestTier2, AContinuousJointCarriesItsLimitsAsWrittenAndNoPositionLimits) {
+  std::vector<RigFrame> tree = RaspbotTree();
+  tree.push_back({"arm1_Link", "base_link"});
+  tree.push_back({"arm2_Link", "arm1_Link"});
+  const c3d::pose::Manifest m =
+      Decorated(tree, Description(UrdfFixture("raspbot_v2_yahboom.urdf")));
+  ASSERT_EQ(JointNames(m), (std::vector<std::string>{"base_link", "arm1_Link", "arm2_Link",
+                                                     "camera_link", "camera_optical_frame",
+                                                     "laser"}));
+  for (const auto& [j, joint] : {std::pair<int, std::string>{1, "arm1_Joint"}, {2, "arm2_Joint"}}) {
+    const c3d::Properties& p = m.joints[j].properties;
+    EXPECT_EQ(Property(p, "ros.jointName"), joint);
+    EXPECT_EQ(Property(p, "ros.jointType"), "continuous");
+    EXPECT_EQ(Number(p, "ros.limit.effort"), 0.0) << joint;
+    EXPECT_EQ(Number(p, "ros.limit.velocity"), 0.0) << joint;
+    EXPECT_EQ(Keys(p), (std::vector<std::string>{"ros.parent", "ros.jointName", "ros.jointType",
+                                                 "ros.limit.effort", "ros.limit.velocity"}))
+        << joint << ": no lower or upper, which would pin the gimbal at 0";
+  }
+}
+
+// A URDF 1.2 arm whose tf tree is its links plus a camera on the tool: each URDF link gets its
+// joint's name, type and finite limits; the camera, which no URDF joint has as a child, keeps
+// tier 1 only.
+TEST(RigManifestTier2, EachLinkCarriesItsJointAndOnlyItsFiniteLimits) {
+  const std::vector<RigFrame> tree = {
+      {"base_link", "odom"},        {"shoulder_link", "base_link"}, {"elbow_link", "shoulder_link"},
+      {"slider_link", "elbow_link"}, {"tool_link", "slider_link"},  {"camera_link", "tool_link"},
+      {"wheel_link", "base_link"},  {"plane_link", "base_link"},    {"float_link", "base_link"},
+      {"odom", ""}};
+  const c3d::pose::Manifest m =
+      Decorated(tree, Description(UrdfFixture("arm_urdf_1_2_partial_limits.urdf")));
+  EXPECT_EQ(Property(m.properties, "ros.robotName"), "arm_v12");
+  EXPECT_EQ(Property(m.properties, "c3d.model.formatVersion"), "1.2");
+  std::map<std::string, const c3d::Properties*> by_name;
+  for (const auto& joint : m.joints) by_name[joint.mesh_name] = &joint.properties;
+  ASSERT_EQ(by_name.size(), 9u);
+
+  EXPECT_EQ(Keys(*by_name["base_link"]), std::vector<std::string>{}) << "the root";
+  const c3d::Properties& shoulder = *by_name["shoulder_link"];
+  EXPECT_EQ(Property(shoulder, "ros.jointName"), "shoulder_joint");
+  EXPECT_EQ(Property(shoulder, "ros.jointType"), "revolute");
+  EXPECT_EQ(Number(shoulder, "ros.limit.lower"), -1.5);
+  EXPECT_EQ(Number(shoulder, "ros.limit.upper"), 1.5);
+  EXPECT_EQ(Number(shoulder, "ros.limit.velocity"), 2.0);
+  EXPECT_EQ(Number(shoulder, "ros.limit.acceleration"), 4.0);
+  EXPECT_EQ(Number(shoulder, "ros.limit.deceleration"), 4.0) << "acceleration's, unset";
+  EXPECT_FALSE(Has(shoulder, "ros.limit.effort")) << "unset in 1.2 is unbounded: omitted";
+  EXPECT_FALSE(Has(shoulder, "ros.limit.jerk"));
+  EXPECT_EQ(Keys(*by_name["elbow_link"]),
+            (std::vector<std::string>{"ros.parent", "ros.jointName", "ros.jointType",
+                                      "ros.limit.lower", "ros.limit.upper", "ros.limit.effort",
+                                      "ros.limit.velocity", "ros.limit.acceleration",
+                                      "ros.limit.deceleration", "ros.limit.jerk"}));
+  EXPECT_EQ(Number(*by_name["elbow_link"], "ros.limit.jerk"), 50.0);
+  EXPECT_EQ(Keys(*by_name["slider_link"]),
+            (std::vector<std::string>{"ros.parent", "ros.jointName", "ros.jointType",
+                                      "ros.limit.lower", "ros.limit.upper"}));
+  EXPECT_EQ(Keys(*by_name["wheel_link"]),
+            (std::vector<std::string>{"ros.parent", "ros.jointName", "ros.jointType",
+                                      "ros.limit.velocity"}))
+      << "effort=\"inf\" is omitted like an unset one";
+  EXPECT_EQ(Keys(*by_name["plane_link"]),
+            (std::vector<std::string>{"ros.parent", "ros.jointName", "ros.jointType",
+                                      "ros.limit.effort"}));
+  EXPECT_EQ(Property(*by_name["tool_link"], "ros.jointType"), "fixed");
+  EXPECT_EQ(Property(*by_name["float_link"], "ros.jointType"), "floating");
+  EXPECT_EQ(Property(*by_name["plane_link"], "ros.jointType"), "planar");
+  EXPECT_EQ(Property(*by_name["wheel_link"], "ros.jointType"), "continuous");
+  EXPECT_EQ(Property(*by_name["slider_link"], "ros.jointType"), "prismatic");
+  EXPECT_EQ(Keys(*by_name["camera_link"]), (std::vector<std::string>{"ros.parent", "c3d.kind"}))
+      << "a frame outside the description keeps tier 1 only";
+  EXPECT_EQ(c3d::pose::ManifestProblem(m), "");
+}
+
+TEST(RigManifestTier2, AValueThePlatformCouldNotTakeIsLeftOutAndTheRigSurvives) {
+  const std::string long_name(c3d::pose::kMaxPropertyStringBytes + 1, 'n');
+  const auto description = Description(
+      "<robot name=\"" + long_name + "\" version=\"1.2\"><link name=\"base_link\"/>"
+      "<link name=\"laser\"/><link name=\"camera_link\"/>"
+      "<joint name=\"" + long_name + "\" type=\"revolute\"><parent link=\"base_link\"/>"
+      "<child link=\"laser\"/><limit lower=\"-1\" upper=\"1\" effort=\"1e39\"/></joint>"
+      "<joint name=\"pan\" type=\"revolute\"><parent link=\"base_link\"/>"
+      "<child link=\"camera_link\"/><limit lower=\"-1e300\" upper=\"0.5\"/></joint></robot>");
+  const c3d::pose::Manifest m = Decorated(RaspbotTree(), description);
+  EXPECT_EQ(c3d::pose::ManifestProblem(m), "");
+  EXPECT_EQ(Property(m.properties, "ros.robotName"), "raspbot-01")
+      << "a name past the platform's string limit keeps the device_id";
+  EXPECT_EQ(Property(m.properties, "c3d.model.format"), "urdf");
+  const c3d::Properties& laser = m.joints[3].properties;
+  EXPECT_FALSE(Has(laser, "ros.jointName"));
+  EXPECT_EQ(Property(laser, "ros.jointType"), "revolute");
+  EXPECT_FALSE(Has(laser, "ros.limit.effort")) << "past float32";
+  EXPECT_EQ(Number(laser, "ros.limit.upper"), 1.0);
+  EXPECT_FALSE(Has(m.joints[1].properties, "ros.limit.lower")) << "past float32";
+  EXPECT_EQ(Number(m.joints[1].properties, "ros.limit.upper"), 0.5);
+}
+
+// robot_frame is often a URDF joint's child (base_footprint -> base_link). It is still the rig's
+// root, posed in the reference frame, so no joint keys go on it.
+TEST(RigManifestTier2, TheRootCarriesNoJointKeysThoughTheDescriptionHasAJointForIt) {
+  const c3d::pose::Manifest m = Decorated(
+      RaspbotTree(),
+      Description("<robot name=\"r\"><link name=\"base_footprint\"/><link name=\"base_link\"/>"
+                  "<link name=\"laser\"/><joint name=\"footprint\" type=\"fixed\">"
+                  "<parent link=\"base_footprint\"/><child link=\"base_link\"/></joint>"
+                  "<joint name=\"laser_mount\" type=\"fixed\"><parent link=\"base_link\"/>"
+                  "<child link=\"laser\"/></joint></robot>"));
+  EXPECT_EQ(Keys(m.joints[0].properties), std::vector<std::string>{});
+  EXPECT_EQ(Property(m.joints[3].properties, "ros.jointName"), "laser_mount");
+}
+
+// A description in another encoding than UTF-8 parses, and its names cannot go on the wire. The
+// manifest the platform would refuse is never sent: it stays tier 1.
+TEST(RigManifestTier2, ADescriptionWhoseNamesAreNotUtf8LeavesTheManifestTier1) {
+  const c3d::pose::Manifest tier1 = Decorated(RaspbotTree(), nullptr);
+  const c3d::pose::Manifest m = Decorated(
+      RaspbotTree(),
+      Description("<robot name=\"r\"><link name=\"base_link\"/><link name=\"laser\"/>"
+                  "<joint name=\"m\xe9tal\" type=\"fixed\"><parent link=\"base_link\"/>"
+                  "<child link=\"laser\"/></joint></robot>"));
+  EXPECT_EQ(Keys(m.properties), Keys(tier1.properties));
+  EXPECT_EQ(Property(m.properties, "ros.robotName"), "raspbot-01");
+  for (std::size_t j = 0; j < m.joints.size(); ++j) {
+    EXPECT_EQ(Keys(m.joints[j].properties), Keys(tier1.joints[j].properties)) << j;
+  }
+  EXPECT_EQ(c3d::pose::ManifestProblem(m), "");
+}
+
+// The gripper's <ros2_control>, <transmission> and <gazebo> carry an address, serial ports and a
+// password. None of it is in any key or value of the manifest the description decorates.
+TEST(RigManifestTier2, NothingOutsideTheWhitelistReachesTheManifest) {
+  const std::string xml = UrdfFixture("gripper_with_ros2_control.urdf");
+  const c3d::pose::Manifest m = Decorated(
+      {{"base_link", "map"}, {"finger_link", "base_link"}, {"map", ""}}, Description(xml));
+  std::string all = m.manifest_id + m.name + m.mesh + m.file_type + m.root;
+  const auto add = [&all](const c3d::Properties& properties) {
+    for (const auto& [key, value] : properties) {
+      all += "|" + key + "=" +
+             (value.kind() == c3d::PropertyValue::Kind::kString ? value.as_string() : "#");
+    }
+  };
+  add(m.properties);
+  for (const auto& joint : m.joints) {
+    all += "|" + joint.mesh_name;
+    add(joint.properties);
+  }
+  EXPECT_NE(all.find("ros.jointName=finger_joint"), std::string::npos) << all;
+  EXPECT_EQ(Property(m.joints[1].properties, "ros.jointType"), "prismatic");
+  for (const char* secret :
+       {"192.0.2", "SECRET", "ttyACM", "ttyUSB", "hunter2", "acme", "Acme", "package://"}) {
+    EXPECT_EQ(all.find(secret), std::string::npos) << secret << " in: " << all;
+  }
+  EXPECT_EQ(Number(m.joints[1].properties, "ros.limit.upper"), 0.04)
+      << "finger_joint's own limit, not the one on the <joint> nested in <ros2_control>";
 }
 
 // ---- The conversion pins --------------------------------------------------------------------
@@ -679,6 +911,109 @@ TEST_F(TfRigSamplerTest, ResetSendsTheManifestAgainForTheNextSession) {
   EXPECT_EQ(sink_.manifests.size(), 2u);
   EXPECT_EQ(sampler.manifest_sends(), 1u);
   EXPECT_EQ(sampler.samples(), 1u);
+}
+
+namespace {
+
+// The FakeTf Raspbot as a URDF would describe it, with its gimbal as a revolute joint; the laser
+// is not in it.
+std::string GimbalUrdf(const std::string& upper) {
+  return "<robot name=\"raspbot\"><link name=\"base_link\"/><link name=\"camera_link\"/>"
+         "<link name=\"camera_optical_frame\"/>"
+         "<joint name=\"gimbal_pan\" type=\"revolute\"><parent link=\"base_link\"/>"
+         "<child link=\"camera_link\"/><limit lower=\"-1.5\" upper=\"" + upper +
+         "\" effort=\"1\" velocity=\"2\"/></joint>"
+         "<joint name=\"optical\" type=\"fixed\"><parent link=\"camera_link\"/>"
+         "<child link=\"camera_optical_frame\"/></joint></robot>";
+}
+
+}  // namespace
+
+TEST_F(TfRigSamplerTest, ADescriptionSetBeforeTheFirstTickDecoratesTheFirstManifest) {
+  TfRigSampler sampler(tf_, config_);
+  sampler.SetDescription(Description(GimbalUrdf("1.5")));
+  Raspbot(100.0);
+  Tick(sampler, kWire0);
+  ASSERT_EQ(sink_.manifests.size(), 1u);
+  const c3d::pose::Manifest& m = sink_.manifests[0];
+  EXPECT_EQ(Property(m.properties, "ros.robotName"), "raspbot");
+  EXPECT_EQ(Property(m.joints[1].properties, "ros.jointName"), "gimbal_pan");
+  EXPECT_EQ(Property(m.joints[2].properties, "ros.jointName"), "optical");
+  EXPECT_FALSE(Has(m.joints[3].properties, "ros.jointName")) << "laser is not in the URDF";
+  Raspbot(100.1);
+  Tick(sampler, kWire0 + 0.1);
+  EXPECT_EQ(sink_.manifests.size(), 1u);
+}
+
+// A description that arrives or changes mid-session re-sends the manifest with the same joints,
+// at the next tick, and the samples go on under it. The same description again sends nothing;
+// a description withdrawn sends the tier 1 manifest.
+TEST_F(TfRigSamplerTest, ANewDescriptionMidSessionReSendsTheManifestWithTheSameJoints) {
+  TfRigSampler sampler(tf_, config_);
+  Raspbot(100.0);
+  Tick(sampler, kWire0);
+  ASSERT_EQ(sink_.manifests.size(), 1u);
+  EXPECT_FALSE(Has(sink_.manifests[0].properties, "ros.urdfSha256")) << "tf only, at first";
+
+  const auto first = Description(GimbalUrdf("1.5"));
+  sampler.SetDescription(first);
+  Raspbot(100.1);
+  ASSERT_EQ(Tick(sampler, kWire0 + 0.1), TfRigSampler::Outcome::kRecorded);
+  ASSERT_EQ(sink_.manifests.size(), 2u);
+  EXPECT_EQ(JointNames(sink_.manifests[1]), JointNames(sink_.manifests[0]));
+  EXPECT_EQ(Property(sink_.manifests[1].properties, "ros.urdfSha256"), first->sha256);
+  EXPECT_EQ(Number(sink_.manifests[1].joints[1].properties, "ros.limit.upper"), 1.5);
+  EXPECT_EQ(sink_.samples.size(), 2u);
+
+  Raspbot(100.2);
+  Tick(sampler, kWire0 + 0.2);
+  sampler.SetDescription(Description(GimbalUrdf("1.5")));
+  Raspbot(100.3);
+  Tick(sampler, kWire0 + 0.3);
+  EXPECT_EQ(sink_.manifests.size(), 2u)
+      << "the same description, delivered again, is not a change";
+
+  sampler.SetDescription(Description(GimbalUrdf("1.25")));
+  Raspbot(100.4);
+  Tick(sampler, kWire0 + 0.4);
+  ASSERT_EQ(sink_.manifests.size(), 3u);
+  EXPECT_EQ(Number(sink_.manifests[2].joints[1].properties, "ros.limit.upper"), 1.25);
+  EXPECT_NE(Property(sink_.manifests[2].properties, "ros.urdfSha256"), first->sha256);
+
+  sampler.SetDescription(nullptr);
+  Raspbot(100.5);
+  Tick(sampler, kWire0 + 0.5);
+  ASSERT_EQ(sink_.manifests.size(), 4u);
+  EXPECT_EQ(Keys(sink_.manifests[3].properties),
+            (std::vector<std::string>{"c3d.profile", "ros.robotName"}));
+  EXPECT_EQ(Property(sink_.manifests[3].properties, "ros.robotName"), "raspbot-01");
+  EXPECT_EQ(sink_.samples.size(), 6u);
+  EXPECT_EQ(sampler.manifest_sends(), 4u);
+}
+
+TEST_F(TfRigSamplerTest, ARefusedReSendIsTriedAgainAndTheDescriptionOutlivesTheSession) {
+  TfRigSampler sampler(tf_, config_);
+  Raspbot(100.0);
+  Tick(sampler, kWire0);
+  sampler.SetDescription(Description(GimbalUrdf("1.5")));
+  sink_.refuse_manifests = true;
+  Raspbot(100.1);
+  EXPECT_EQ(Tick(sampler, kWire0 + 0.1), TfRigSampler::Outcome::kRefused);
+  sink_.refuse_manifests = false;
+  Raspbot(100.2);
+  Tick(sampler, kWire0 + 0.2);
+  ASSERT_EQ(sink_.manifests.size(), 2u);
+  EXPECT_TRUE(Has(sink_.manifests[1].properties, "ros.urdfSha256"));
+
+  sampler.Reset();
+  Raspbot(100.3);
+  Tick(sampler, kWire0 + 0.3);
+  ASSERT_EQ(sink_.manifests.size(), 3u);
+  EXPECT_TRUE(Has(sink_.manifests[2].properties, "ros.urdfSha256"))
+      << "the next session's first manifest is decorated: the robot did not change";
+  Raspbot(100.4);
+  Tick(sampler, kWire0 + 0.4);
+  EXPECT_EQ(sink_.manifests.size(), 3u);
 }
 
 // ---- The tf2 adapter ------------------------------------------------------------------------

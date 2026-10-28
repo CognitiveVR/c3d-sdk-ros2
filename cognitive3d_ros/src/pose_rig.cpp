@@ -1,6 +1,7 @@
 #include "cognitive3d_ros/pose_rig.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 
 namespace cognitive3d_ros {
@@ -93,6 +94,55 @@ c3d::pose::Manifest BuildRigManifest(const std::vector<RigFrame>& frames,
   }
   if (decorate) decorate(&manifest);
   return manifest;
+}
+
+void DecorateRigManifest(const UrdfDescription& description, c3d::pose::Manifest* manifest) {
+  const c3d::pose::Manifest tier1 = *manifest;
+  const auto fits = [](const std::string& text) {
+    return !text.empty() && text.size() <= c3d::pose::kMaxPropertyStringBytes;
+  };
+  if (fits(description.robot_name)) {
+    for (auto& [key, value] : manifest->properties) {
+      if (key == "ros.robotName") value = description.robot_name;
+    }
+  }
+  manifest->properties.emplace_back("ros.urdfSha256", description.sha256);
+  manifest->properties.emplace_back("c3d.model.format", std::string("urdf"));
+  manifest->properties.emplace_back("c3d.model.formatVersion", description.format_version);
+
+  // The root's pose is in the reference frame, not in a parent link of the rig, so no URDF joint
+  // describes how it moves there.
+  for (std::size_t j = 1; j < manifest->joints.size(); ++j) {
+    c3d::pose::ManifestJoint& rig_joint = manifest->joints[j];
+    const UrdfJoint* joint = description.JointWithChild(rig_joint.mesh_name);
+    if (joint == nullptr) continue;
+    if (fits(joint->name)) rig_joint.properties.emplace_back("ros.jointName", joint->name);
+    rig_joint.properties.emplace_back("ros.jointType", joint->type);
+    if (!joint->has_limit) continue;
+    const std::pair<const char*, double> limits[] = {
+        {"ros.limit.lower", joint->limits.lower},
+        {"ros.limit.upper", joint->limits.upper},
+        {"ros.limit.effort", joint->limits.effort},
+        {"ros.limit.velocity", joint->limits.velocity},
+        {"ros.limit.acceleration", joint->limits.acceleration},
+        {"ros.limit.deceleration", joint->limits.deceleration},
+        {"ros.limit.jerk", joint->limits.jerk},
+    };
+    for (const auto& [key, value] : limits) {
+      // Infinite is unbounded, which absence says. Past float32 the platform could not store it,
+      // and a limit that large bounds nothing a robot does.
+      if (!std::isfinite(value) || std::fabs(value) > c3d::pose::kMaxPropertyNumber) continue;
+      rig_joint.properties.emplace_back(key, value);
+    }
+  }
+  if (!c3d::pose::ManifestProblem(*manifest).empty()) *manifest = tier1;
+}
+
+RigManifestDecoration UrdfDecoration(std::shared_ptr<const UrdfDescription> description) {
+  if (!description) return nullptr;
+  return [description](c3d::pose::Manifest* manifest) {
+    DecorateRigManifest(*description, manifest);
+  };
 }
 
 c3d::pose::JointPose RigJointScenePose(const RosJointPose& ros, PoseConvention convention) {
