@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -85,6 +86,9 @@ struct Stats {
   // Access units refused because they would have taken their chunk past
   // kMaxVideoChunkBytes. The caller re-encodes them, so they are not lost.
   std::uint64_t camera_access_units_refused = 0;
+  // Camera chunks the gateway refused as too large (413) and that were deleted, by
+  // camera id: also in chunks_discarded.
+  std::map<std::string, std::uint64_t> camera_chunks_too_large;
 };
 
 // A Cognitive3D session.

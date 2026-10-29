@@ -235,6 +235,8 @@ struct Session::Impl {
   // The cameras whose unusable field of view has been warned about this session:
   // at 30 Hz a per-frame warning is the log.
   std::set<std::string> camera_fov_warned;
+  // Cameras whose too-large chunk this session has logged; the rest are counted only.
+  std::set<std::string> camera_too_large_said;
   // Epoch milliseconds, resolved once at Begin. Every binary payload carries it,
   // and recomputing it per part would let two parts of one session disagree about
   // when the session started.
@@ -983,15 +985,31 @@ struct Session::Impl {
         // Cleared for EVERY removal: a chunk that answered 401 once and is then
         // discarded must not leave an allowance keyed on an id that is gone.
         ForgetUnauthorizedAllowance();
+        // A camera's chunk refused as too large is said once per camera per session:
+        // every chunk of a camera past the limit would be, and the count is the record.
+        const bool too_large = response.status == 413 && chunk.stream == Stream::kCamera;
+        const std::string camera_id = too_large ? CameraIdOfPayload(chunk.body) : std::string();
+        bool say = true;
         {
           std::lock_guard<std::mutex> lock(mu);
           ++stats.chunks_discarded;
           stats.chunks_deferred = CountDeferred();
+          if (too_large) {
+            ++stats.camera_chunks_too_large[camera_id];
+            say = camera_too_large_said.insert(camera_id).second;
+          }
         }
         std::string message = "upload rejected with status " + std::to_string(response.status) +
                               " for stream " + StreamName(chunk.stream) + "; chunk discarded";
+        if (too_large) {
+          message += ": camera '" + camera_id + "' sent a chunk of " +
+                     std::to_string(chunk.body.size()) + " bytes, and the gateway takes at most " +
+                     std::to_string(kMaxObjectBytes) + " bytes an object. Every such chunk is "
+                     "counted in c3d.camera." + camera_id + ".rejected_too_large and logged once "
+                     "per session";
+        }
         if (!response.body.empty()) message += "; gateway said: " + LogSafeBody(response.body);
-        log->Error(message);
+        if (say) log->Error(message);
         go_on = true;
       } else {
         go_on = HandleRetryableFailure(chunk, response, attempt);
@@ -1830,6 +1848,7 @@ bool Session::Begin() {
     impl_->scan_blocks.clear();
     impl_->cloud_objects.clear();
     impl_->camera_fov_warned.clear();
+    impl_->camera_too_large_said.clear();
 
     // Do not clear known_properties: anything the caller set before Begin is
     // legitimate session metadata. Re-mark the whole set as pending so a new

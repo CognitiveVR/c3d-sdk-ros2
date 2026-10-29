@@ -506,6 +506,7 @@ series, except where a row says otherwise:
 | `c3d.camera.<name>.encoder_restarts` | Encoders replaced after one died, or after a wedged one was killed |
 | `c3d.camera.<name>.gap_restarts` | Encoders replaced after the camera was quiet for a chunk's length or more. A time-lapse camera, slower than a frame every 3 seconds, adds one for every frame, and that means nothing is wrong |
 | `c3d.camera.<name>.size_restarts` | Encoders replaced because a chunk reached 8 MiB before its time was up; see [How a camera is encoded](#how-a-camera-is-encoded) |
+| `c3d.camera.<name>.rejected_too_large` | Chunks the platform refused as larger than its 10 MiB, which were deleted. Counted since the node was configured. It reads 0 while the 8 MiB rule above holds, and the first one in a session is logged |
 | `c3d.camera.<name>.dropped_replay` | Frames a size restart could not encode again, because `replay_max_mb` had no room for them or the replacement encoder could not start |
 | `c3d.lidar.<name>.dropped_oversize` | Clouds dropped whole for exceeding `max_points` |
 | `c3d.lidar.<name>.dropped_range` | Points dropped for being out of `int16_mm` range |

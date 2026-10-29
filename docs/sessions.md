@@ -311,7 +311,7 @@ them in `c3d.chunks_evicted`, and `~/diagnostics` warns once any has happened.
 | -- | -- |
 | a success: any 2xx carrying the Cognitive3D gateway's `cvr-request-time` header | removes the chunk |
 | 401, 403 or 407 | tries once more a second later, then pauses every upload with everything kept, logged once at error level. Authentication is tried again every `retry_max_s`, one stream at a time, and the first accepted chunk resumes uploads. A stream that stays refused while another is accepted stops alone. |
-| 400, 413, 415 or 422 | discards the chunk, whose payload was rejected, and logs the status |
+| 400, 413, 415 or 422 | discards the chunk, whose payload was rejected, and logs the status. A camera chunk refused with 413, larger than the platform's 10 MiB, is logged once per camera per session and counted in `c3d.camera.<name>.rejected_too_large` |
 | anything else, or nothing | keeps the chunk and backs off: `retry_min_s` (60 seconds), doubling up to `retry_max_s` (240 seconds). A `Retry-After` can lengthen a wait, up to an hour. 404 is logged as a configuration problem. |
 
 The last row covers redirects, a captive portal's 2xx without the gateway's header, 404, 408, 429,
@@ -412,7 +412,7 @@ actions. `, refusing <n>` follows when it refuses some. The session line:
 | `[UPLOADS PAUSED: credentials refused]`, `[CREDENTIALS REFUSED: <streams>]`, `[STREAMS DEFERRED: <streams>]`, `[UPLOADS PAUSED]`, `[BACKING OFF]` | The upload state, shown only when it applies. See [Outages and refused keys](#outages-and-refused-keys) and [Pausing uploads](#pausing-uploads). |
 | `held=`, `deferred=` | Chunks held for another host or project, and chunks waiting behind the rest of the spool. See [Outages and refused keys](#outages-and-refused-keys). |
 | `EVICTED=` | Chunks evicted at `spool_max_mb`, which never upload. See [The size cap](#the-size-cap). |
-| `[<n> chunk(s) REJECTED and discarded; …]` | Chunks the platform rejected with 400, 413, 415 or 422. The log names the status of each. |
+| `[<n> chunk(s) REJECTED and discarded; …]` | Chunks the platform rejected with 400, 413, 415 or 422. The log names the status of each, except a camera's 413, said once per camera per session. |
 | `401retries=` | Retries scheduled after a refused upload, most of which then succeed. |
 | `events=` | Events published on `~/events` that the node recorded since it started. Only these: objectives, and the events the node records from diagnostics, batteries, Nav2 and the pose timeline, are not counted. Shown once anything is counted. |
 | `DROPPED=` | Events on `~/events` that were dropped, because no session was open or the name was empty. |

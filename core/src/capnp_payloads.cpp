@@ -87,6 +87,18 @@ std::string Pack(capnp::MessageBuilder& message) {
 
 }  // namespace
 
+std::string CameraIdOfPayload(const std::string& packed) {
+  try {
+    kj::ArrayInputStream in(
+        kj::ArrayPtr<const kj::byte>(reinterpret_cast<const kj::byte*>(packed.data()),
+                                     packed.size()));
+    capnp::PackedMessageReader reader(in);
+    return reader.getRoot<cvr::capnp::CameraPayload>().getCameraId().cStr();
+  } catch (const kj::Exception&) {
+    return std::string();
+  }
+}
+
 std::string SerializeCameraChunk(const BinaryEnvelope& envelope, const CameraChunkRecord& chunk) {
   capnp::MallocMessageBuilder message;
   auto payload = message.initRoot<cvr::capnp::CameraPayload>();

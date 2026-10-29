@@ -13,6 +13,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <utility>
@@ -199,6 +200,7 @@ class CountingLogger : public ILogger {
   void Log(LogLevel level, const std::string& message) override {
     std::lock_guard<std::mutex> lock(mu_);
     if (level == LogLevel::kWarn) warnings_.push_back(message);
+    if (level == LogLevel::kError) errors_.push_back(message);
   }
   int Warnings(const std::string& fragment) const {
     std::lock_guard<std::mutex> lock(mu_);
@@ -206,10 +208,17 @@ class CountingLogger : public ILogger {
     for (const auto& m : warnings_) n += m.find(fragment) != std::string::npos ? 1 : 0;
     return n;
   }
+  int Errors(const std::string& fragment) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    int n = 0;
+    for (const auto& m : errors_) n += m.find(fragment) != std::string::npos ? 1 : 0;
+    return n;
+  }
 
  private:
   mutable std::mutex mu_;
   std::vector<std::string> warnings_;
+  std::vector<std::string> errors_;
 };
 
 class BinaryStreamTest : public ::testing::Test {
@@ -963,6 +972,100 @@ TEST_F(BinaryStreamTest, AForcedCloseDropsTheFramesUntilTheNextKeyframe) {
   EXPECT_TRUE(frames[0].getKeyframe());
   EXPECT_EQ(frames[0].getSeq(), 5u);
   EXPECT_EQ(BytesOf(second.camera().getData()), "i5p6");
+}
+
+// The gateway refuses an object over 10 MiB with a 413 and the chunk is deleted. Nothing the SDK
+// builds should get there, so each one is counted per camera and said once per camera per session.
+TEST_F(BinaryStreamTest, ACameraChunkRefusedAsTooLargeIsCountedPerCameraAndSaidOncePerSession) {
+  transport_->SetResponder([](const FakeTransport::Request& request) -> std::optional<HttpResponse> {
+    if (request.url.find("/v0/camera") == std::string::npos) return std::nullopt;
+    HttpResponse refused;
+    refused.status = 413;
+    return refused;
+  });
+  Build();
+  const VideoChunkContext context = SomeContext();
+  for (std::uint32_t i = 0; i < 3; ++i) {
+    session_->RecordCameraAccessUnit("front", EntryAt(100 + i, i), context, "i", true);
+  }
+  session_->RecordCameraAccessUnit("rear", EntryAt(100, 0), context, "i", true);
+  session_->Flush();
+  session_->PumpUploads();
+  Stats stats = session_->stats();
+  EXPECT_EQ(stats.camera_chunks_too_large["front"], 3u);
+  EXPECT_EQ(stats.camera_chunks_too_large["rear"], 1u);
+  EXPECT_EQ(stats.chunks_discarded, 4u);
+  EXPECT_EQ(logger_->Errors("camera 'front' sent a chunk"), 1);
+  EXPECT_EQ(logger_->Errors("camera 'rear' sent a chunk"), 1);
+  EXPECT_EQ(logger_->Errors("c3d.camera.front.rejected_too_large"), 1);
+
+  session_->End();
+  ASSERT_TRUE(session_->Begin());
+  session_->RecordCameraAccessUnit("front", EntryAt(200, 0), context, "i", true);
+  session_->Flush();
+  session_->PumpUploads();
+  EXPECT_EQ(session_->stats().camera_chunks_too_large["front"], 4u);
+  EXPECT_EQ(logger_->Errors("camera 'front' sent a chunk"), 2) << "not said again in a new session";
+}
+
+// The size rules hold by construction: a camera chunk, a scan block and a cloud object closed at
+// their caps, of bytes nothing compresses, with many frames or scans, each serialise under the
+// gateway's 10 MiB.
+TEST_F(BinaryStreamTest, AnObjectClosedAtItsCapStaysUnderTheGatewaysLimit) {
+  Build();
+  std::mt19937 random(11);
+  const auto noise = [&random](std::size_t n) {
+    std::string bytes(n, '\0');
+    for (char& byte : bytes) byte = static_cast<char>(random());
+    return bytes;
+  };
+  const VideoChunkContext context = SomeContext();
+  const std::uint32_t frames = 300;
+  const std::size_t unit = kMaxVideoChunkBytes / frames;
+  for (std::uint32_t i = 0; i < frames; ++i) {
+    const std::size_t size = i + 1 < frames ? unit : kMaxVideoChunkBytes - unit * (frames - 1);
+    ASSERT_EQ(session_->RecordCameraAccessUnit("front", EntryAt(1000 + i, i, PoseNumber(i)),
+                                               context, noise(size), i == 0),
+              VideoUnitFate::kAppended)
+        << "frame " << i;
+  }
+
+  // 1024 rays of noise without intensities, all at one stamp: the code cap closes the block.
+  LaserScanData scan = SomeScan();
+  scan.ranges.resize(1024);
+  scan.intensities.clear();
+  std::uniform_real_distribution<float> metres(0.2f, 11.9f);
+  const std::uint32_t scans = static_cast<std::uint32_t>(kMaxScanBlockCodeBytes / 2048);
+  for (std::uint32_t i = 0; i <= scans; ++i) {
+    for (float& range : scan.ranges) range = metres(random);
+    session_->RecordLaserScan("scan", 5000ull, i, "laser", SomePose(), scan);
+  }
+
+  EncodedPointCloud cloud;
+  cloud.ok = true;
+  cloud.point_count = 1000000;
+  cloud.zstd_level = 3;
+  cloud.data = noise(kMaxCloudBytes);
+  session_->RecordPointCloud("points", 6000ull, 0, "lidar", SomePose(), cloud);
+  session_->End();
+  session_->PumpUploads();
+
+  auto chunks = CameraBodies("front");
+  ASSERT_EQ(chunks.size(), 1u);
+  PackedBody chunk(chunks[0]);
+  EXPECT_EQ(chunk.camera().getFrames().size(), frames);
+  EXPECT_LT(chunks[0].size(), kMaxObjectBytes);
+  std::size_t full_blocks = 0, full_clouds = 0;
+  for (const auto& request : RequestsTo("/v0/lidar")) {
+    EXPECT_LT(request.body.size(), kMaxObjectBytes);
+    PackedBody body(request.body);
+    if (body.lidar().isScans() && body.lidar().getScans().getEntries().size() == scans) {
+      ++full_blocks;
+    }
+    if (body.lidar().isClouds()) ++full_clouds;
+  }
+  EXPECT_EQ(full_blocks, 1u) << "no block was closed by its code cap";
+  EXPECT_EQ(full_clouds, 1u);
 }
 
 // A unit that would pass the chunk's cap is refused, not dropped: the session says so, so that the

@@ -250,6 +250,10 @@ time without a frame missing. A chunk's first frame is never encoded again: a ke
 dropped, with the camera's frames until the next keyframe, and counted in
 `c3d.camera_access_units_dropped`.
 
+The platform refuses an object larger than 10 MiB, and the SDK deletes an object the platform
+refuses, so it builds none that large: a chunk's `data` closes at 8 MiB, a scan block's codes at
+8 MiB, and `max_points` bounds one cloud to 8 MiB, which leaves room for the rest of the payload.
+
 Camera and lidar objects upload one at a time, each naming its session id, device id, scene id,
 scene version number and SDK version. The per-sensor `seq` numbers them from 0 per camera or lidar
 per session, and the platform keeps it with every object, so a missing or repeated `seq` shows an

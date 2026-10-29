@@ -34,4 +34,7 @@ std::string SerializeScanBlock(const BinaryEnvelope& envelope, const ScanBlockRe
                                const scanblock::EncodedScanBlock& encoded);
 std::string SerializeCloudObject(const BinaryEnvelope& envelope, const CloudObjectRecord& object);
 
+// The cameraId of a packed CameraPayload; empty when `packed` is not one.
+std::string CameraIdOfPayload(const std::string& packed);
+
 }  // namespace c3d

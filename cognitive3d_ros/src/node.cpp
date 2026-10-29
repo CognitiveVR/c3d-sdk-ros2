@@ -2948,6 +2948,7 @@ void Cognitive3DNode::RecordSelfTelemetry(double wire_time) {
   // Per sensor, because "the camera stream is healthy" is not a fact a fleet has:
   // one camera's pose failures and another's are different problems with the same
   // symptom in an aggregate.
+  const std::map<std::string, std::uint64_t>& too_large = stats.camera_chunks_too_large;
   for (const auto& capture : cameras_) {
     const std::string prefix = "c3d.camera." + capture->config().name + ".";
     // A copy: the encoder's reader thread advances frames and bytes while this reads them.
@@ -2976,6 +2977,10 @@ void Cognitive3DNode::RecordSelfTelemetry(double wire_time) {
                           static_cast<double>(stats.size_restarts));
     session->RecordSensor(prefix + "dropped_replay", wire_time,
                           static_cast<double>(stats.dropped_replay));
+    const auto rejected = too_large.find(capture->config().name);
+    session->RecordSensor(prefix + "rejected_too_large", wire_time,
+                          rejected == too_large.end() ? 0.0
+                                                      : static_cast<double>(rejected->second));
   }
   for (const auto& capture : lidars_) {
     const std::string prefix = "c3d.lidar." + capture->config().name + ".";

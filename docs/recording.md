@@ -435,8 +435,9 @@ counts in none of the restart series.
 | `c3d.events_suppressed` | events discarded by the rate cap | this session |
 | `c3d.event_properties_dropped` | event properties dropped because their key was in `c3d.` | this session |
 | `c3d.gaze_frame_failures` | samples whose `gaze_frame` did not resolve; only with `gaze_frame` set | this session |
-| `c3d.camera.<name>.*`, `c3d.lidar.<name>.*` | per camera and lidar: frames or scans, bytes, pose failures, refusals and drops; see [Camera and lidar](camera-and-lidar.md) | this session, except the two series below |
+| `c3d.camera.<name>.*`, `c3d.lidar.<name>.*` | per camera and lidar: frames or scans, bytes, pose failures, refusals and drops; see [Camera and lidar](camera-and-lidar.md) | this session, except the three series below |
 | `c3d.camera.<name>.dropped_at_stop`, `c3d.camera.<name>.dropped_no_session` | per camera: frames the encoder had accepted and could not finish when it was stopped, and encoded frames that arrived with no session open | since configure |
+| `c3d.camera.<name>.rejected_too_large` | per camera: chunks the platform refused as larger than 10 MiB, and deleted | since configure |
 
 Between sessions, the upload state is on the periodic report line and in the
 `cognitive3d: uploads` status on `~/diagnostics`; see [Doctor and verification](doctor-and-verification.md).
