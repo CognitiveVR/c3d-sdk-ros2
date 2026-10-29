@@ -22,6 +22,10 @@ marks as provisional may change in a minor release, and its entry here says how 
   encoder is restarted and the frames since encoded again from a keyframe, counted per camera in
   `size_restarts`, with `dropped_replay` for any it could not keep. `camera.<name>.replay_max_mb`,
   default 192, bounds the memory that keeps them.
+- A camera whose 3 second chunk is estimated over 6 MiB gets chunks of 1 to 3 seconds, chosen when
+  its encoder starts and logged once. One at which not even 1 second fits is refused: by
+  configure with `max_width_px` set, at its first frame otherwise, counted in `refused`. `doctor`'s
+  `camera/<name>` check prints the chunk length and fails such a camera.
 - `doctor`'s `camera encoder` check, which is FATAL when a camera is configured and `ffmpeg` cannot
   run. Its `camera/<name>` check reports an estimated size and rate.
 

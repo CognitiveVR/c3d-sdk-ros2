@@ -61,6 +61,28 @@ constexpr int kMaxCameraCrf = 32;
 constexpr int kMaxCameraBitrateKbps = 1000000;
 constexpr int kMaxCameraReplayMb = 16384;
 
+// The bytes a camera's chunk is sized to. A chunk closes at c3d::kMaxVideoChunkBytes whatever the
+// estimate says; the margin is for a scene busier than the footage the estimate was fitted to.
+constexpr double kCameraChunkTargetBytes = 6.0 * 1024 * 1024;
+constexpr double kMinCameraChunkSeconds = 1.0;
+
+// Bytes per second a camera's video costs, ESTIMATED: 5120 bytes per frame at
+// 640x480 and crf 28, in proportion to the pixel count, doubling every 4 crf
+// steps lower, times `rate_hz`. Fitted to footage recorded across the 24 to 32
+// band, so it says what such a camera usually costs, not what this one will: the
+// bytes follow what the scene does. `preset` is not in it: no measurement here
+// separates the presets' bytes at one crf.
+double EstimatedCameraBytesPerSecond(int width, int height, int crf, double rate_hz);
+// That estimate for `camera` at this frame size, capped by its max_bitrate_kbps when set.
+double CameraBytesPerSecond(const CameraConfig& camera, int width, int height);
+// The chunk length for `camera` at this frame size: the longest, in tenths of a second from
+// kMinCameraChunkSeconds to c3d::kVideoChunkSeconds, whose CameraBytesPerSecond fits
+// kCameraChunkTargetBytes. 0 when not even kMinCameraChunkSeconds does.
+double CameraChunkSeconds(const CameraConfig& camera, int width, int height);
+// Why not even kMinCameraChunkSeconds fits at this frame size, naming the parameters that change
+// it, for configure, the node and doctor alike.
+std::string CameraChunkTooLarge(const CameraConfig& camera, int width, int height);
+
 struct LidarConfig {
   std::string name;
   std::string topic;

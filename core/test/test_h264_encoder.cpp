@@ -251,7 +251,7 @@ TEST(H264Encoder, TheArgumentsPinTheMeasuredSettings) {
       "-an", "-vf", "setpts=PTS-STARTPTS", "-vsync", "passthrough",
       "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
       "-g", "1000000", "-keyint_min", "1000000", "-sc_threshold", "0", "-threads", "1",
-      "-force_key_frames", "expr:gte(t,n_forced*3)",
+      "-force_key_frames", "expr:if(isnan(prev_forced_t),1,gte(t,prev_forced_t+3))",
       "-x264-params", "aud=1:repeat-headers=1:bframes=0", "-pix_fmt", "yuv420p",
       "-flush_packets", "1", "-f", "h264", "pipe:1"};
   EXPECT_EQ(FfmpegArguments(settings), expected);
@@ -278,7 +278,7 @@ TEST(H264Encoder, TheArgumentsPinTheMeasuredSettings) {
   const std::vector<std::string> half = FfmpegArguments(settings);
   const auto forced = std::find(half.begin(), half.end(), "-force_key_frames");
   ASSERT_NE(forced, half.end());
-  EXPECT_EQ(*(forced + 1), "expr:gte(t,n_forced*0.5)");
+  EXPECT_EQ(*(forced + 1), "expr:if(isnan(prev_forced_t),1,gte(t,prev_forced_t+0.5))");
 
   settings.chunk_s = 3.0;
   Collector c;
@@ -386,6 +386,32 @@ TEST(H264Encoder, AChunkIsOneSecondOfRealTimeWhateverTheDeclaredRate) {
     EXPECT_TRUE(keyframes[k] == 4 * k || keyframes[k] == 4 * k + 1)
         << "keyframe " << k << " at " << keyframes[k];
   }
+}
+
+// A pause in the input longer than a chunk forces one keyframe when frames resume, then the next a
+// chunk after it: never a run of keyframes catching up with the chunks the pause spanned.
+TEST(H264Encoder, APauseForcesOneKeyframeNotOnePerChunkItSpanned) {
+  REQUIRE_FFMPEG();
+  Collector c;
+  auto encoder = NewEncoder(Small(10.0, 1.0), &c);
+  std::string error;
+  ASSERT_TRUE(encoder->Start(&error)) << error;
+  std::this_thread::sleep_for(kFfmpegStartUp);
+  const auto start = Clock::now();
+  for (int i = 0; i < 16; ++i) {
+    // Frames 0-4 at 0.0 to 0.4 s, then a pause, then frames 5-15 at 3.0 to 4.0 s.
+    const auto slot = start + std::chrono::milliseconds(i < 5 ? 100 * i : 3000 + 100 * (i - 5));
+    std::this_thread::sleep_until(slot);
+    ASSERT_TRUE(encoder->Feed(Frame(64, 48, i), static_cast<std::uint64_t>(i))) << "frame " << i;
+  }
+  encoder->Finish(1.0);
+  EXPECT_EQ(c.FailureCount(), 0u) << c.FirstFailure();
+  ASSERT_EQ(c.UnitCount(), 16u);
+  const std::vector<std::size_t> keyframes = c.KeyframeIndices();
+  ASSERT_EQ(keyframes.size(), 3u) << "keyframes at " << ::testing::PrintToString(keyframes);
+  EXPECT_EQ(keyframes[0], 0u);
+  EXPECT_EQ(keyframes[1], 5u);
+  EXPECT_TRUE(keyframes[2] == 15 || keyframes[2] == 14) << keyframes[2];
 }
 
 TEST(H264Encoder, EachChunkDecodesOnItsOwn) {

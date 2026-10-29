@@ -193,7 +193,8 @@ text in `session_properties` would be typed; `mount_yaw_radians` is always a dou
 
 ## Camera chunks
 
-A camera record is one chunk: one camera's frames for about 3 seconds of real time, encoded as H.264
+A camera record is one chunk: one camera's frames for about 3 seconds of real time, or 1 to 3
+seconds for a camera whose 3-second chunks would be too large, encoded as H.264
 and stored as one object. A chunk is one closed group of pictures, so it decodes on its own, and its
 first frame is always a keyframe. The record is a `CameraPayload`:
 

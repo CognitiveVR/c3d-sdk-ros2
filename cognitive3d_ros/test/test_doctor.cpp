@@ -32,6 +32,7 @@
 #include "throttled_http_server.hpp"
 
 using namespace cognitive3d_ros::doctor;
+using cognitive3d_ros::EstimatedCameraBytesPerSecond;
 
 namespace {
 
@@ -635,6 +636,46 @@ TEST(DoctorChecks, TheCameraSizeIsAnEstimateFromResolutionAndCrf) {
   EXPECT_EQ(check.severity, Severity::kOk);
   EXPECT_NE(check.detail.find("about 300.0 KB/s estimated"), std::string::npos) << check.detail;
   EXPECT_NE(check.detail.find("crf 24"), std::string::npos) << check.detail;
+  EXPECT_NE(check.detail.find("chunks of 3 s, about 900.0 KB each"), std::string::npos)
+      << check.detail;
+}
+
+// Doctor sizes a camera's chunks from its live sample by the node's own rule: the chunk length it
+// prints is the one the encoder would start with, and a sample at which not even a 1-second chunk
+// fits fails the check, as the node would refuse the camera at its first frame.
+TEST(DoctorChecks, TheCameraCheckPrintsTheChunkLengthAndFailsWhenNoneFits) {
+  MediaSensorFacts camera;
+  camera.kind = "camera";
+  camera.name = "front";
+  camera.topic = "/image";
+  camera.rate_hz = 30.0;
+  camera.topic_present = true;
+  camera.type = "sensor_msgs/msg/Image";
+  camera.type_handled = true;
+  camera.qos = "best_effort/volatile/keep_last(1)";
+  camera.frame = "camera_link";
+  camera.frame_resolves = true;
+  camera.sample_seen = true;
+  camera.crf = 24;
+  camera.prepared_width = 2560;
+  camera.prepared_height = 1440;
+  Check check = CheckMediaSensor(camera);
+  EXPECT_EQ(check.severity, Severity::kOk);
+  EXPECT_NE(check.detail.find("chunks of 1.7 s"), std::string::npos) << check.detail;
+
+  camera.prepared_width = 3840;
+  camera.prepared_height = 2160;
+  check = CheckMediaSensor(camera);
+  EXPECT_EQ(check.severity, Severity::kFatal);
+  for (const char* lever : {"3840x2160", "max_width_px", "crf", "max_bitrate_kbps"}) {
+    EXPECT_NE(check.detail.find(lever), std::string::npos) << lever << ": " << check.detail;
+  }
+
+  camera.max_bitrate_kbps = 20000;
+  check = CheckMediaSensor(camera);
+  EXPECT_EQ(check.severity, Severity::kOk);
+  EXPECT_NE(check.detail.find("capped by max_bitrate_kbps"), std::string::npos) << check.detail;
+  EXPECT_NE(check.detail.find("chunks of 2.5 s"), std::string::npos) << check.detail;
 }
 
 // `Config::Validate` reports every missing mandatory value in ONE string, so a refusal naming

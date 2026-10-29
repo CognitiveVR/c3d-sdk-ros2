@@ -1,8 +1,12 @@
 #include "cognitive3d_ros/media_config.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <sstream>
 #include <string>
 #include <utility>
+
+#include "c3d/sensor_blocks.hpp"
 
 namespace cognitive3d_ros {
 namespace {
@@ -21,7 +25,46 @@ bool UsableFovParameter(double degrees) {
   return wire > 0.0f && wire < 180.0f;
 }
 
+std::string Mebibytes(double bytes) {
+  std::ostringstream text;
+  text.precision(1);
+  text << std::fixed << bytes / (1024.0 * 1024.0);
+  return text.str();
+}
+
 }  // namespace
+
+double EstimatedCameraBytesPerSecond(int width, int height, int crf, double rate_hz) {
+  const double pixels = static_cast<double>(width) * static_cast<double>(height);
+  return 5120.0 * pixels / (640.0 * 480.0) * std::pow(2.0, (28.0 - crf) / 4.0) * rate_hz;
+}
+
+double CameraBytesPerSecond(const CameraConfig& camera, int width, int height) {
+  const double estimate = EstimatedCameraBytesPerSecond(width, height, camera.crf, camera.rate_hz);
+  if (camera.max_bitrate_kbps <= 0) return estimate;
+  return std::min(estimate, static_cast<double>(camera.max_bitrate_kbps) * 1000.0 / 8.0);
+}
+
+double CameraChunkSeconds(const CameraConfig& camera, int width, int height) {
+  const double per_second = CameraBytesPerSecond(camera, width, height);
+  if (!(per_second > 0.0)) return c3d::kVideoChunkSeconds;
+  const double fits = std::floor(kCameraChunkTargetBytes / per_second * 10.0 + 1e-9) / 10.0;
+  if (fits < kMinCameraChunkSeconds) return 0.0;
+  return std::min(fits, c3d::kVideoChunkSeconds);
+}
+
+std::string CameraChunkTooLarge(const CameraConfig& camera, int width, int height) {
+  std::ostringstream text;
+  text << "at " << width << "x" << height << ", crf " << camera.crf << " and " << camera.rate_hz
+       << " Hz";
+  if (camera.max_bitrate_kbps > 0) text << " under max_bitrate_kbps " << camera.max_bitrate_kbps;
+  text << " its video is estimated at " << Mebibytes(CameraBytesPerSecond(camera, width, height))
+       << " MiB a second, so not even a " << kMinCameraChunkSeconds << "-second chunk stays under "
+       << "the " << Mebibytes(kCameraChunkTargetBytes) << " MiB a chunk is sized to; the platform "
+       << "refuses an object over " << c3d::kMaxObjectBytes / (1024 * 1024) << " MiB. Lower "
+       << "max_width_px, raise crf or set max_bitrate_kbps";
+  return text.str();
+}
 
 std::string ValidateCameraConfig(const CameraConfig& camera) {
   const std::string where = "camera." + camera.name + ".";
@@ -65,6 +108,14 @@ std::string ValidateCameraConfig(const CameraConfig& camera) {
     // One angle is half a frustum, and a reader would have to invent the other.
     return where + "hfov_degrees and vfov_degrees are set together or not at all; only " +
            (camera.hfov_degrees == 0.0 ? "vfov_degrees" : "hfov_degrees") + " is set";
+  }
+  // Sized as a 16:9 frame, the widest common shape and so the fewest pixels at that width: what
+  // fails here fails for every camera. The node sizes the real frame again at its encoder's start.
+  const int width = camera.max_width_px & ~1;
+  const int height = (camera.max_width_px * 9 / 16) & ~1;
+  if (width >= 2 && height >= 2 && CameraChunkSeconds(camera, width, height) == 0.0) {
+    return where + "max_width_px is " + std::to_string(camera.max_width_px) +
+           ", and sized as a 16:9 frame " + CameraChunkTooLarge(camera, width, height);
   }
   return ValidateQosOverride(camera.qos, "camera." + camera.name);
 }

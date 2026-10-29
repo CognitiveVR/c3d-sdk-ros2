@@ -1420,19 +1420,23 @@ Check CheckPoseChannel(const PoseChannelFacts& facts) {
           ""};
 }
 
-double EstimatedCameraBytesPerSecond(int width, int height, int crf, double rate_hz) {
-  const double pixels = static_cast<double>(width) * static_cast<double>(height);
-  return 5120.0 * pixels / (640.0 * 480.0) * std::pow(2.0, (28.0 - crf) / 4.0) * rate_hz;
-}
-
 namespace {
+
+// The settings the size estimate reads, from what doctor found.
+CameraConfig SizedCamera(const MediaSensorFacts& facts) {
+  CameraConfig camera;
+  camera.name = facts.name;
+  camera.rate_hz = facts.rate_hz;
+  camera.crf = facts.crf;
+  camera.max_bitrate_kbps = facts.max_bitrate_kbps;
+  return camera;
+}
 
 // A lidar's measured sample, or a camera's estimate, at its rate; 0 when there is neither.
 double SensorBytesPerSecond(const MediaSensorFacts& facts) {
   if (!facts.sample_seen) return 0.0;
   if (facts.kind == "camera") {
-    return EstimatedCameraBytesPerSecond(facts.prepared_width, facts.prepared_height, facts.crf,
-                                         facts.rate_hz);
+    return CameraBytesPerSecond(SizedCamera(facts), facts.prepared_width, facts.prepared_height);
   }
   return static_cast<double>(facts.encoded_bytes) * facts.rate_hz;
 }
@@ -1513,10 +1517,27 @@ Check CheckMediaSensor(const MediaSensorFacts& facts) {
   std::ostringstream detail;
   detail << facts.topic << " [" << facts.type << "] qos=" << facts.qos << " frame=" << facts.frame;
   if (camera) {
+    const CameraConfig sized = SizedCamera(facts);
+    const double chunk_s = CameraChunkSeconds(sized, facts.prepared_width, facts.prepared_height);
+    if (chunk_s == 0.0) {
+      check.severity = Severity::kFatal;
+      check.detail = "one frame prepares to " + std::to_string(facts.prepared_width) + "x" +
+                     std::to_string(facts.prepared_height) + ", and " +
+                     CameraChunkTooLarge(sized, facts.prepared_width, facts.prepared_height);
+      check.remedy = "the node would refuse this camera at its first frame and record none of "
+                     "its video. Change one of those parameters, then run doctor again.";
+      return check;
+    }
+    const double per_second = SensorBytesPerSecond(facts);
     detail << ", one frame prepares to " << facts.prepared_width << "x" << facts.prepared_height
-           << "; about " << Bytes(static_cast<std::uint64_t>(SensorBytesPerSecond(facts)))
+           << "; about " << Bytes(static_cast<std::uint64_t>(per_second))
            << "/s estimated (from that size, crf " << facts.crf << " and " << facts.rate_hz
-           << " Hz, by a model fitted to recorded footage; not measured on this camera)";
+           << " Hz";
+    if (facts.max_bitrate_kbps > 0) detail << ", capped by max_bitrate_kbps";
+    detail << ", by a model fitted to recorded footage; not measured on this camera); chunks of "
+           << chunk_s << " s, about " << Bytes(static_cast<std::uint64_t>(per_second * chunk_s))
+           << " each (sized to stay under "
+           << Bytes(static_cast<std::uint64_t>(kCameraChunkTargetBytes)) << ")";
   } else {
     detail << ", one sample encodes to " << Bytes(facts.encoded_bytes) << " -- about "
            << Bytes(static_cast<std::uint64_t>(SensorBytesPerSecond(facts))) << "/s at "

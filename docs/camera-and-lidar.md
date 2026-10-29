@@ -51,7 +51,15 @@ configure refuses when that binary cannot run, naming the package to install, an
 `camera encoder` check says the same before a session opens.
 
 A chunk is 3 seconds of real time, one closed group of pictures, whatever the camera delivers, and
-every chunk starts on a keyframe. Under `sim_time_on_wire`, 3 seconds of real time is 3 x the
+every chunk starts on a keyframe. A camera whose 3-second chunk the node estimates at more than
+6 MiB gets shorter chunks: the longest length, in tenths of a second down to 1 second, whose
+estimate fits, chosen when its encoder starts from the size of the frame it starts on and logged
+once. The estimate is `doctor`'s, from the frame size, `crf` and `rate_hz`, capped by
+`max_bitrate_kbps` when that is set; `preset` is not in it. A camera at which not even a 1-second
+chunk fits is refused: with `max_width_px` set, configure refuses it, sizing the frame as a 16:9
+one that wide; with `max_width_px: 0`, the node refuses it at its first frame, logs it once and
+counts its frames in `refused`. Either way the message names `max_width_px`, `crf` and
+`max_bitrate_kbps`, the parameters that make the chunks smaller. Under `sim_time_on_wire`, 3 seconds of real time is 3 x the
 real-time factor seconds on the wire. `rate_hz` caps the frames fed to the encoder, as it caps
 every sensor's records: it does not set a chunk's length, so a camera that delivers 15 frames a
 second with `rate_hz: 30` makes chunks of about 45 frames. A camera slower than one frame every 3
@@ -394,7 +402,7 @@ What the encoder costs the node, and what it loses, is bounded:
   waits for the encoder to finish what it has accepted, then to be killed and collected. A healthy
   encoder finishes in milliseconds. Stopping several cameras waits once, not once per camera.
 - **A wedged encoder is killed without waiting** when the camera is fast enough to show that it has
-  refused every frame for 3 seconds, and the node starts a new one 5 seconds later. On a camera too
+  refused every frame for a chunk's length, and the node starts a new one 5 seconds later. On a camera too
   slow to show the refusals, the wedge is found as a quiet gap and costs 1.25 seconds once and then
   0.5 seconds every 5 seconds, for as long as the cause lasts.
 - **The measured envelope is `ultrafast` and `veryfast` at 640 wide on a Pi 5.** A configuration
@@ -420,6 +428,8 @@ Configure refuses, naming the parameter:
 - a negative `camera.<name>.max_width_px`, a `preset` other than `ultrafast` or `veryfast`, a `crf`
   outside 24 to 32, or a `max_bitrate_kbps` that is negative or above 1,000,000
 - a `camera.<name>.format` or `camera.<name>.jpeg_quality`, which a camera no longer has
+- a camera with `max_width_px` set at which not even a 1-second chunk is estimated under 6 MiB; see
+  [How a camera is encoded](#how-a-camera-is-encoded)
 - a camera configured while the binary named by `ffmpeg_path` cannot run, or lists no `libx264`
   encoder: the refusal names the binary and says `sudo apt install ffmpeg`
 - a `pointcloud.voxel_leaf_m` below 0 or above 65 meters, a `pointcloud.max_points` below 1, or a
@@ -457,7 +467,7 @@ properties:
 | `c3d.ros.cameras`, `c3d.ros.lidars` | The configured names, comma-separated |
 | `c3d.ros.camera.<name>.topic` | The camera's topic |
 | `c3d.ros.camera.<name>.rate_hertz`, `.max_width_pixels` | The camera's settings in force, defaults included |
-| `c3d.ros.camera.<name>.codec`, `.preset`, `.crf`, `.max_bitrate_kilobits_per_second`, `.chunk_seconds` | How the camera is encoded: `h264`, the preset and `crf` in force, the bitrate cap with 0 for none, and the chunk length, `3` |
+| `c3d.ros.camera.<name>.codec`, `.preset`, `.crf`, `.max_bitrate_kilobits_per_second`, `.chunk_seconds` | How the camera is encoded: `h264`, the preset and `crf` in force, the bitrate cap with 0 for none, and the chunk length in seconds: `3` when the session starts, and the length the encoder chose once it differs. Each chunk's `encoderSettings` names its own |
 | `c3d.ros.camera.<name>.hfov_degrees`, `.vfov_degrees` | The field of view parameters, 0 when unset. Each chunk carries its own field of view; see [A camera's field of view](#a-cameras-field-of-view) |
 | `c3d.ros.camera.<name>.fov_source` | The source the camera is configured to take its chunks' field of view from: `parameter`, `camera_info`, or `none`. `camera_info` does not say that a CameraInfo arrived: a chunk whose first frame precedes the first one carries none |
 | `c3d.ros.camera.<name>.camera_info_topic` | The CameraInfo topic, resolved; empty when switched off |
@@ -482,7 +492,7 @@ series, except where a row says otherwise:
 | `c3d.camera.<name>.dropped_at_stop` | Frames the encoder had accepted and could not finish when it was stopped. Counted since the node was configured, not since the session started, because the stop that ends a session comes after that session's last sample |
 | `c3d.camera.<name>.dropped_no_session` | Encoded frames that arrived when no session was open. Counted since the node was configured, for the same reason. It reads 0 when the node stops the encoder before it ends a session, as it does on every path |
 | `c3d.camera.<name>.encoder_restarts` | Encoders replaced after one died, or after a wedged one was killed |
-| `c3d.camera.<name>.gap_restarts` | Encoders replaced after the camera was quiet for 3 seconds or more. A time-lapse camera, slower than a frame every 3 seconds, adds one for every frame, and that means nothing is wrong |
+| `c3d.camera.<name>.gap_restarts` | Encoders replaced after the camera was quiet for a chunk's length or more. A time-lapse camera, slower than a frame every 3 seconds, adds one for every frame, and that means nothing is wrong |
 | `c3d.camera.<name>.size_restarts` | Encoders replaced because a chunk reached 8 MiB before its time was up; see [How a camera is encoded](#how-a-camera-is-encoded) |
 | `c3d.camera.<name>.dropped_replay` | Frames a size restart could not encode again, because `replay_max_mb` had no room for them or the replacement encoder could not start |
 | `c3d.lidar.<name>.dropped_oversize` | Clouds dropped whole for exceeding `max_points` |

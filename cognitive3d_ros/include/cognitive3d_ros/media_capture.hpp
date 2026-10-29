@@ -314,10 +314,13 @@ class CameraCapture {
   bool FeedFrame(PreparedFrame frame, const c3d::SensorEntry& entry,
                  const c3d::VideoChunkContext& context, const MediaEnvironment& environment,
                  SessionRunner& runner);
-  // A new instance for frames of this size and frame, counted by pending_start_reason_. False when
-  // it cannot start: the backoff is then set and the reason warned once.
-  bool StartEncoder(std::uint16_t width, std::uint16_t height, const std::string& frame_id,
-                    double wall_offset, double now, const MediaEnvironment& environment);
+  enum class Started { kYes, kFailed, kTooLarge };
+  // A new instance for frames of this size and frame, with the chunk length CameraChunkSeconds
+  // gives that size, counted by pending_start_reason_. kFailed when it cannot start: the backoff
+  // is then set and the reason warned once. kTooLarge, with nothing started and no backoff, when not
+  // even the shortest chunk fits: said once a session.
+  Started StartEncoder(std::uint16_t width, std::uint16_t height, const std::string& frame_id,
+                       double wall_offset, double now, const MediaEnvironment& environment);
   // The size row: kills the instance whose chunk refused a unit, starts another and re-encodes,
   // in order, every frame from the refused one on.
   void RestartForSize(double now, double wall_offset, const MediaEnvironment& environment);
@@ -337,6 +340,8 @@ class CameraCapture {
   bool refusal_warned_ = false;
   bool unstamped_warned_ = false;
   bool start_warned_ = false;
+  bool chunk_warned_ = false;
+  bool too_large_warned_ = false;
   bool clock_step_warned_ = false;
   c3d::CameraFov camera_info_fov_;
   bool camera_info_warned_ = false;
@@ -358,6 +363,11 @@ class CameraCapture {
   std::string encoder_frame_id_;
   // The wall clock less the steady clock when the running encoder started.
   double encoder_wall_offset_ = 0.0;
+  // The running encoder's chunk length, or the last one's: the quiet-gap and wedge rows wait this
+  // long.
+  double chunk_s_ = c3d::kVideoChunkSeconds;
+  // What c3d.ros.camera.<name>.chunk_seconds was last set to in this session.
+  double recorded_chunk_s_ = c3d::kVideoChunkSeconds;
   std::map<std::uint64_t, Pending> pending_;
   std::uint64_t next_token_ = 0;
   ReplayStore replay_;

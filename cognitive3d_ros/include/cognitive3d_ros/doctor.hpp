@@ -7,6 +7,7 @@
 
 #include "c3d/config.hpp"
 #include "cognitive3d_ros/action_discovery.hpp"
+#include "cognitive3d_ros/media_config.hpp"
 #include "cognitive3d_ros/sensor_config.hpp"
 
 // Preflight checks, as PURE functions.
@@ -501,6 +502,7 @@ struct MediaSensorFacts {
   std::uint16_t prepared_width = 0;
   std::uint16_t prepared_height = 0;
   int crf = 0;
+  int max_bitrate_kbps = 0;
   // Why the sample could not be prepared or encoded, when one arrived and was
   // refused. This is the check that catches a camera pointed at a depth topic.
   std::string encode_error;
@@ -534,12 +536,6 @@ struct CameraFovFacts {
 };
 Check CheckCameraFov(const CameraFovFacts& facts);
 
-// Bytes per second a camera's video costs, ESTIMATED: 5120 bytes per frame at
-// 640x480 and crf 28, in proportion to the pixel count, doubling every 4 crf
-// steps lower, times `rate_hz`. Fitted to footage recorded across the 24 to 32
-// band, so it says what such a camera usually costs, not what this one will: the
-// bytes follow what the scene does.
-double EstimatedCameraBytesPerSecond(int width, int height, int crf, double rate_hz);
 Check CheckMediaSensor(const MediaSensorFacts& facts);
 
 // What the configured streams will cost, added up: a lidar's measured sample and a

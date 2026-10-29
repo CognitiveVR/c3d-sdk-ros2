@@ -325,6 +325,8 @@ void CameraCapture::Reset() {
   refusal_warned_ = false;
   unstamped_warned_ = false;
   start_warned_ = false;
+  chunk_warned_ = false;
+  too_large_warned_ = false;
   clock_step_warned_ = false;
   std::lock_guard<std::mutex> lock(pending_mu_);
   failed_ = false;
@@ -337,6 +339,7 @@ void CameraCapture::Reset() {
   failure_warned_ = false;
   no_session_warned_ = false;
   size_warned_ = false;
+  recorded_chunk_s_ = c3d::kVideoChunkSeconds;
 }
 
 c3d::CameraFov CameraFovFromCameraInfo(const sensor_msgs::msg::CameraInfo& info) {
@@ -511,9 +514,11 @@ bool CameraCapture::FeedFrame(PreparedFrame frame, const c3d::SensorEntry& entry
   bool wedged = false;
   double wall_step = 0.0;  // non-zero when row 5 stops the encoder
   double stop_timeout = c3d::kH264FinishTimeoutSeconds;
+  double chunk_s = c3d::kVideoChunkSeconds;
   {
     std::lock_guard<std::mutex> lock(pending_mu_);
     bind();
+    chunk_s = chunk_s_;
     if (now < backoff_until_) {
       // Row 1.
       AddToStats(&CameraStats::dropped_backlog);
@@ -537,9 +542,9 @@ bool CameraCapture::FeedFrame(PreparedFrame frame, const c3d::SensorEntry& entry
         stop = true;
         wall_step = wall_offset - encoder_wall_offset_;
         pending_start_reason_ = StartReason::kOther;
-      } else if (now - last_accepted_ >= c3d::kVideoChunkSeconds) {
+      } else if (now - last_accepted_ >= chunk_s_) {
         stop = true;
-        if (last_attempt_refused_ && now - last_attempt_ < c3d::kVideoChunkSeconds) {
+        if (last_attempt_refused_ && now - last_attempt_ < chunk_s_) {
           // Row 6.
           wedged = true;
           stop_timeout = 0.0;
@@ -566,7 +571,7 @@ bool CameraCapture::FeedFrame(PreparedFrame frame, const c3d::SensorEntry& entry
                           (wall_step > 0.0 ? "forward" : "back") + " by " +
                           SecondsText(std::fabs(wall_step)) +
                           " seconds while its encoder ran. The encoder times its " +
-                          SecondsText(c3d::kVideoChunkSeconds) +
+                          SecondsText(chunk_s) +
                           "-second chunks by the wall clock, so it was restarted");
   }
 
@@ -586,10 +591,17 @@ bool CameraCapture::FeedFrame(PreparedFrame frame, const c3d::SensorEntry& entry
   }
 
   // Row 8.
-  if (start && !StartEncoder(frame.width, frame.height, context.frame_id, wall_offset, now,
-                             environment)) {
-    AddToStats(&CameraStats::dropped_backlog);
-    return false;
+  if (start) {
+    const Started started =
+        StartEncoder(frame.width, frame.height, context.frame_id, wall_offset, now, environment);
+    if (started == Started::kTooLarge) {
+      AddToStats(&CameraStats::refused);
+      return false;
+    }
+    if (started == Started::kFailed) {
+      AddToStats(&CameraStats::dropped_backlog);
+      return false;
+    }
   }
 
   // Kept, before the feed moves the frame, for a size restart to re-encode.
@@ -621,9 +633,30 @@ bool CameraCapture::FeedFrame(PreparedFrame frame, const c3d::SensorEntry& entry
   return fed;
 }
 
-bool CameraCapture::StartEncoder(std::uint16_t width, std::uint16_t height,
-                                 const std::string& frame_id, double wall_offset, double now,
-                                 const MediaEnvironment& environment) {
+CameraCapture::Started CameraCapture::StartEncoder(std::uint16_t width, std::uint16_t height,
+                                                   const std::string& frame_id,
+                                                   double wall_offset, double now,
+                                                   const MediaEnvironment& environment) {
+  const double chunk_s = CameraChunkSeconds(config_, width, height);
+  if (chunk_s == 0.0) {
+    if (!too_large_warned_ && environment.warn_once) {
+      too_large_warned_ = true;
+      environment.warn_once("camera '" + config_.name + "' is refused: " +
+                            CameraChunkTooLarge(config_, width, height) + ". Its frames are " +
+                            "counted in c3d.camera." + config_.name + ".refused");
+    }
+    return Started::kTooLarge;
+  }
+  if (chunk_s < c3d::kVideoChunkSeconds && !chunk_warned_ && environment.warn_once) {
+    chunk_warned_ = true;
+    environment.warn_once("camera '" + config_.name + "': at " + std::to_string(width) + "x" +
+                          std::to_string(height) + ", crf " + std::to_string(config_.crf) +
+                          " and " + SecondsText(config_.rate_hz) + " Hz a " +
+                          SecondsText(c3d::kVideoChunkSeconds) + "-second chunk is estimated " +
+                          "past the bytes a chunk is sized to, so its chunks are " +
+                          SecondsText(chunk_s) + " seconds. Raise crf, lower max_width_px or "
+                          "set max_bitrate_kbps for longer ones");
+  }
   StartReason reason = StartReason::kNone;
   {
     std::lock_guard<std::mutex> lock(pending_mu_);
@@ -637,6 +670,7 @@ bool CameraCapture::StartEncoder(std::uint16_t width, std::uint16_t height,
   settings.width = width;
   settings.height = height;
   settings.fps = config_.rate_hz;
+  settings.chunk_s = chunk_s;
   std::unique_ptr<c3d::IH264Encoder> encoder =
       factory_(settings, [this](c3d::EncodedAccessUnit unit) { OnAccessUnit(std::move(unit)); },
                [this](const c3d::EncoderFailure& failure) { OnEncoderFailure(failure); });
@@ -655,7 +689,18 @@ bool CameraCapture::StartEncoder(std::uint16_t width, std::uint16_t height,
                             " seconds. Check that ffmpeg_path '" + ffmpeg_path_ +
                             "' still runs");
     }
-    return false;
+    return Started::kFailed;
+  }
+  SessionRunner* runner = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(pending_mu_);
+    if (chunk_s != recorded_chunk_s_) {
+      recorded_chunk_s_ = chunk_s;
+      runner = runner_;
+    }
+  }
+  if (runner != nullptr && runner->session() != nullptr) {
+    runner->session()->SetProperty("c3d.ros.camera." + config_.name + ".chunk_seconds", chunk_s);
   }
   std::lock_guard<std::mutex> lock(pending_mu_);
   encoder_ = std::move(encoder);
@@ -663,6 +708,7 @@ bool CameraCapture::StartEncoder(std::uint16_t width, std::uint16_t height,
   encoder_height_ = height;
   encoder_frame_id_ = frame_id;
   encoder_wall_offset_ = wall_offset;
+  chunk_s_ = chunk_s;
   last_accepted_ = now;
   last_attempt_refused_ = false;
   if (reason == StartReason::kFailure || reason == StartReason::kWedge) {
@@ -674,7 +720,7 @@ bool CameraCapture::StartEncoder(std::uint16_t width, std::uint16_t height,
   }
   // Unless the new instance has already died, whose on_failure set the reason for the next.
   if (!failed_) pending_start_reason_ = StartReason::kNone;
-  return true;
+  return Started::kYes;
 }
 
 void CameraCapture::RestartForSize(double now, double wall_offset,
@@ -719,7 +765,7 @@ void CameraCapture::RestartForSize(double now, double wall_offset,
     }
     AddToStats(&CameraStats::dropped_replay);
   };
-  if (!StartEncoder(width, height, frame_id, wall_offset, now, environment)) {
+  if (StartEncoder(width, height, frame_id, wall_offset, now, environment) != Started::kYes) {
     for (const std::uint64_t token : tokens) lose(token);
     return;
   }
@@ -843,12 +889,14 @@ void CameraCapture::OnAccessUnit(c3d::EncodedAccessUnit unit) {
 void CameraCapture::OnEncoderFailure(const c3d::EncoderFailure& failure) {
   std::function<double()> clock;
   bool at_stop = false;
+  double chunk_s = c3d::kVideoChunkSeconds;
   {
     std::lock_guard<std::mutex> lock(pending_mu_);
     at_stop = stopping_on_ == std::this_thread::get_id();
     // The size row's own kill: everything it abandons is re-encoded.
     if (at_stop && size_stop_) return;
     clock = arrival_time_;
+    chunk_s = chunk_s_;
   }
   // Read unlocked: the arrival clock is the node's, which locks itself.
   const double now = clock ? clock() : SteadySeconds();
@@ -878,7 +926,7 @@ void CameraCapture::OnEncoderFailure(const c3d::EncoderFailure& failure) {
   if (!warn) return;
   std::string cause;
   if (wedge) {
-    cause = "it was wedged, taking no frame for " + SecondsText(c3d::kVideoChunkSeconds) +
+    cause = "it was wedged, taking no frame for " + SecondsText(chunk_s) +
             " seconds while frames kept arriving, and was killed";
   } else if (failure.killed) {
     cause = "it did not finish in time and was killed";

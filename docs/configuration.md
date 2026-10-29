@@ -266,7 +266,7 @@ what is refused.
 | -- | -- | -- | -- | -- |
 | `cameras` | string[] | `[]` | — | The camera names, each configured under `camera.<name>.*`. A name must be non-empty, carry no `.` or `/`, and appear once. A `camera.<name>.<field>` key whose name is not listed here, or whose field is not one of those below, refuses configure, naming the key. |
 | `camera.<name>.topic` | string | `""` | — | A `sensor_msgs/msg/Image` or `sensor_msgs/msg/CompressedImage` topic. Required for every listed name: empty refuses configure. A topic of another type is refused when it appears on the graph, not at configure; `doctor` checks it. |
-| `camera.<name>.rate_hz` | double | `30.0` | Hz | Frames accepted per second, counted on arrival. They are encoded into one H.264 chunk per 3 seconds of real time; the rate does not set a chunk's length. Must be positive. |
+| `camera.<name>.rate_hz` | double | `30.0` | Hz | Frames accepted per second, counted on arrival. They are encoded into one H.264 chunk per 3 seconds of real time, or per 1 to 3 seconds when a 3-second chunk is estimated over 6 MiB; the rate does not set a chunk's length. Must be positive. |
 | `camera.<name>.preset` | string | `"ultrafast"` | — | x264's speed preset, `ultrafast` or `veryfast`. `veryfast` spends more CPU for fewer bytes. |
 | `camera.<name>.crf` | int | `28` | — | The constant rate factor, 24 to 32; lower is higher quality and more bytes. |
 | `camera.<name>.max_bitrate_kbps` | int | `0` | kilobits per second | A cap on the video's bitrate, at most 1,000,000 (1 Gbit/s). `0` sets no cap. Must not be negative. |

@@ -463,6 +463,51 @@ TEST(ImageEncodings, ColourAndGreyscaleAreAcceptedAndDepthIsNamedSeparately) {
 // Configuration
 // ---------------------------------------------------------------------------
 
+// A chunk is sized, by the fitted estimate, to stay under 6 MiB: the longest length from 1 to 3 s,
+// in tenths, that fits, with max_bitrate_kbps capping the estimate; 0 when not even 1 s fits.
+TEST(CameraChunkSeconds, TheLongestLengthUnderTheTargetFromOneToThreeSeconds) {
+  CameraConfig camera;
+  camera.rate_hz = 30.0;
+  camera.crf = 24;
+  EXPECT_EQ(CameraChunkSeconds(camera, 640, 480), 3.0);
+  EXPECT_EQ(CameraChunkSeconds(camera, 1920, 1080), 3.0);
+  // 3.69 MB a second: 6 MiB is 1.71 s of it.
+  EXPECT_DOUBLE_EQ(CameraChunkSeconds(camera, 2560, 1440), 1.7);
+  // 8.29 MB a second: not even 1 s fits.
+  EXPECT_EQ(CameraChunkSeconds(camera, 3840, 2160), 0.0);
+  camera.max_bitrate_kbps = 20000;
+  EXPECT_DOUBLE_EQ(CameraChunkSeconds(camera, 3840, 2160), 2.5);
+  camera.max_bitrate_kbps = 0;
+  camera.crf = 28;
+  EXPECT_DOUBLE_EQ(CameraChunkSeconds(camera, 3840, 2160), 1.5);
+  camera.rate_hz = 15.0;
+  EXPECT_DOUBLE_EQ(CameraChunkSeconds(camera, 3840, 2160), 3.0);
+}
+
+// With max_width_px set, configure sizes the camera as a 16:9 frame that wide and refuses it when
+// not even a 1-second chunk fits, naming the parameters that change that. Unset, the size is
+// known only at the first frame.
+TEST(MediaConfig, ACameraWhoseWidthFitsNoChunkIsRefusedNamingTheLevers) {
+  CameraConfig camera;
+  camera.name = "front";
+  camera.topic = "/image";
+  camera.rate_hz = 30.0;
+  camera.crf = 24;
+  camera.max_width_px = 3840;
+  const std::string refusal = ValidateCameraConfig(camera);
+  EXPECT_EQ(refusal.rfind("camera.front.max_width_px is 3840", 0), 0u) << refusal;
+  for (const char* lever : {"max_width_px", "crf", "max_bitrate_kbps", "10 MiB"}) {
+    EXPECT_NE(refusal.find(lever), std::string::npos) << lever << ": " << refusal;
+  }
+  camera.max_width_px = 2560;
+  EXPECT_EQ(ValidateCameraConfig(camera), "");
+  camera.max_width_px = 0;
+  EXPECT_EQ(ValidateCameraConfig(camera), "");
+  camera.max_width_px = 3840;
+  camera.max_bitrate_kbps = 20000;
+  EXPECT_EQ(ValidateCameraConfig(camera), "");
+}
+
 TEST(MediaConfig, EveryRefusalNamesTheParameter) {
   CameraConfig camera;
   camera.name = "front";
@@ -1433,6 +1478,50 @@ TEST_F(MediaTest, AResolutionOrFrameChangeRestartsTheEncoder) {
   EXPECT_EQ(capture->stats().gap_restarts, 0u);
 }
 
+// The chunk length is chosen at the encoder's start, from the frame it starts on: the longest the
+// estimate fits, said once when it is under 3 s. The quiet-gap row waits that length, not 3 s.
+TEST_F(MediaTest, TheEncoderStartsWithTheChunkLengthItsFrameSizeFits) {
+  CameraConfig config = Front();
+  config.rate_hz = 30.0;
+  config.crf = 24;
+  config.max_width_px = 0;
+  auto capture = OnFakes(config);
+  ASSERT_TRUE(FrameAt(*capture, 0.0, 2560, 1440));
+  ASSERT_EQ(fakes_.built(), 1u);
+  EXPECT_DOUBLE_EQ(fakes_.record(0).settings.chunk_s, 1.7);
+  ASSERT_EQ(warnings_.size(), 1u);
+  EXPECT_NE(warnings_[0].find("its chunks are 1.7 seconds"), std::string::npos) << warnings_[0];
+  ASSERT_TRUE(FrameAt(*capture, 1.6, 2560, 1440));
+  EXPECT_EQ(fakes_.built(), 1u);
+  ASSERT_TRUE(FrameAt(*capture, 3.4, 2560, 1440));
+  EXPECT_EQ(fakes_.built(), 2u) << "a quiet gap of a chunk's length restarted nothing";
+  EXPECT_EQ(capture->stats().gap_restarts, 1u);
+  EXPECT_EQ(warnings_.size(), 1u);
+
+  ASSERT_TRUE(FrameAt(*capture, 3.5, 640, 480));
+  EXPECT_DOUBLE_EQ(fakes_.last().settings.chunk_s, 3.0);
+}
+
+// A frame size at which not even a 1-second chunk fits refuses the camera at its first frame: no
+// encoder starts, no backoff runs, every frame is counted as refused, and it is said once.
+TEST_F(MediaTest, ACameraWhoseFrameFitsNoChunkIsRefusedAtItsFirstFrame) {
+  CameraConfig config = Front();
+  config.rate_hz = 30.0;
+  config.crf = 24;
+  config.max_width_px = 0;
+  auto capture = OnFakes(config);
+  EXPECT_FALSE(FrameAt(*capture, 0.0, 3840, 2160));
+  EXPECT_FALSE(FrameAt(*capture, 0.1, 3840, 2160));
+  EXPECT_EQ(fakes_.built(), 0u);
+  EXPECT_EQ(capture->stats().refused, 2u);
+  EXPECT_EQ(capture->stats().dropped_backlog, 0u);
+  ASSERT_EQ(warnings_.size(), 1u);
+  EXPECT_NE(warnings_[0].find("camera 'front' is refused"), std::string::npos) << warnings_[0];
+  EXPECT_NE(warnings_[0].find("max_width_px"), std::string::npos) << warnings_[0];
+  ASSERT_TRUE(FrameAt(*capture, 0.2, 1920, 1080)) << "a smaller frame is still refused";
+  EXPECT_EQ(fakes_.built(), 1u);
+}
+
 // A unit that would take its chunk past c3d::kMaxVideoChunkBytes is refused by the session. The next
 // frame kills that encoder at once -- no backoff, nothing counted as dropped or failed -- and a
 // replacement re-encodes the refused frame under its own token, so it keeps its seq, time and pose,
@@ -1517,6 +1606,7 @@ TEST_F(MediaTest, UnitsAfterTheRefusedOneAreHeldAndReEncodedInOrder) {
 TEST_F(MediaTest, AFrameTheReplayStoreCouldNotKeepIsDroppedAndCounted) {
   fakes_.next.unit_bytes = [](int) { return std::size_t{3} << 20; };
   CameraConfig config = Front();
+  config.rate_hz = 30.0;
   config.max_width_px = 0;
   config.replay_max_mb = 1;
   auto capture = OnFakes(config);

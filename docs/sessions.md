@@ -207,8 +207,8 @@ doctor's `wall clock` check fails for the same reading.
 The floor catches only a clock before 2026-01-01. A board that restores the time it last saved,
 as `fake-hwclock` and `systemd-timesyncd` do at boot, starts with a clock that is set but stale.
 The node and doctor accept it, sessions are dated at the stale time, and a session that is open
-when NTP corrects the clock jumps forward with it. Each camera's encoder, which times its 3-second
-chunks by the wall clock, is restarted at the step, so the chunks after it stay 3 seconds long.
+when NTP corrects the clock jumps forward with it. Each camera's encoder, which times its chunks by
+the wall clock, is restarted at the step, so the chunks after it keep their length.
 Start the node only once the clock is
 synchronized: `timedatectl` reports it, and under systemd the unit can wait for it (see
 [Running in a container or under systemd](#running-in-a-container-or-under-systemd)).

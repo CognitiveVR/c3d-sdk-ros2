@@ -776,7 +776,10 @@ std::vector<std::string> FfmpegArguments(const H264EncoderSettings& s) {
       "-c:v", "libx264", "-preset", s.preset, "-crf", std::to_string(s.crf),
       "-g", "1000000", "-keyint_min", "1000000", "-sc_threshold", "0",
       "-threads", std::to_string(s.threads),
-      "-force_key_frames", "expr:gte(t,n_forced*" + ChunkText(s.chunk_s) + ")",
+      // Counted from the last forced keyframe, not from 0: after a gap in the input, one keyframe
+      // is forced rather than one for every chunk length the gap spanned.
+      "-force_key_frames",
+      "expr:if(isnan(prev_forced_t),1,gte(t,prev_forced_t+" + ChunkText(s.chunk_s) + "))",
       "-x264-params", "aud=1:repeat-headers=1:bframes=0",
       "-pix_fmt", "yuv420p"};
   if (s.max_bitrate_kbps > 0) {
