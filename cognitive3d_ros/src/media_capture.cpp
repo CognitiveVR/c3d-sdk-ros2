@@ -278,7 +278,8 @@ CameraCapture::CameraCapture(CameraConfig config, std::string ffmpeg_path,
     : config_(std::move(config)),
       ffmpeg_path_(std::move(ffmpeg_path)),
       factory_(std::move(factory)),
-      replay_(static_cast<std::uint64_t>(config_.replay_max_mb) * kMebibyte) {}
+      replay_(static_cast<std::uint64_t>(config_.replay_max_mb) * kMebibyte),
+      recorded_bitrate_kbps_(config_.max_bitrate_kbps) {}
 
 CameraCapture::~CameraCapture() {
   std::unique_ptr<c3d::IH264Encoder> encoder;
@@ -340,6 +341,11 @@ void CameraCapture::Reset() {
   no_session_warned_ = false;
   size_warned_ = false;
   recorded_chunk_s_ = c3d::kVideoChunkSeconds;
+  recorded_bitrate_kbps_ = config_.max_bitrate_kbps;
+  size_restarts_since_escalation_ = 0;
+  chunk_cap_s_ = c3d::kVideoChunkSeconds;
+  escalated_bitrate_cap_ = false;
+  escalation_warned_ = false;
 }
 
 c3d::CameraFov CameraFovFromCameraInfo(const sensor_msgs::msg::CameraInfo& info) {
@@ -637,8 +643,16 @@ CameraCapture::Started CameraCapture::StartEncoder(std::uint16_t width, std::uin
                                                    const std::string& frame_id,
                                                    double wall_offset, double now,
                                                    const MediaEnvironment& environment) {
-  const double chunk_s = CameraChunkSeconds(config_, width, height);
-  if (chunk_s == 0.0) {
+  const double fits_s = CameraChunkSeconds(config_, width, height);
+  double cap_s = c3d::kVideoChunkSeconds;
+  bool escalated_cap = false;
+  {
+    std::lock_guard<std::mutex> lock(pending_mu_);
+    cap_s = chunk_cap_s_;
+    escalated_cap = escalated_bitrate_cap_;
+  }
+  const double chunk_s = std::min(fits_s, cap_s);
+  if (fits_s == 0.0) {
     if (!too_large_warned_ && environment.warn_once) {
       too_large_warned_ = true;
       environment.warn_once("camera '" + config_.name + "' is refused: " +
@@ -647,14 +661,14 @@ CameraCapture::Started CameraCapture::StartEncoder(std::uint16_t width, std::uin
     }
     return Started::kTooLarge;
   }
-  if (chunk_s < c3d::kVideoChunkSeconds && !chunk_warned_ && environment.warn_once) {
+  if (fits_s < c3d::kVideoChunkSeconds && !chunk_warned_ && environment.warn_once) {
     chunk_warned_ = true;
     environment.warn_once("camera '" + config_.name + "': at " + std::to_string(width) + "x" +
                           std::to_string(height) + ", crf " + std::to_string(config_.crf) +
                           " and " + SecondsText(config_.rate_hz) + " Hz a " +
                           SecondsText(c3d::kVideoChunkSeconds) + "-second chunk is estimated " +
                           "past the bytes a chunk is sized to, so its chunks are " +
-                          SecondsText(chunk_s) + " seconds. Raise crf, lower max_width_px or "
+                          SecondsText(fits_s) + " seconds. Raise crf, lower max_width_px or "
                           "set max_bitrate_kbps for longer ones");
   }
   StartReason reason = StartReason::kNone;
@@ -666,7 +680,13 @@ CameraCapture::Started CameraCapture::StartEncoder(std::uint16_t width, std::uin
   settings.ffmpeg_path = ffmpeg_path_;
   settings.preset = config_.preset;
   settings.crf = config_.crf;
+  // An operator's cap always wins. Without one, a frame size whose replay the store cannot hold, or
+  // a camera whose chunks kept reaching the byte cap, gets one sized to the chunk.
   settings.max_bitrate_kbps = config_.max_bitrate_kbps;
+  if (settings.max_bitrate_kbps == 0 &&
+      (escalated_cap || ReplayNeedsBitrateCap(config_, width, height))) {
+    settings.max_bitrate_kbps = DefaultCameraBitrateKbps(chunk_s);
+  }
   settings.width = width;
   settings.height = height;
   settings.fps = config_.rate_hz;
@@ -692,15 +712,22 @@ CameraCapture::Started CameraCapture::StartEncoder(std::uint16_t width, std::uin
     return Started::kFailed;
   }
   SessionRunner* runner = nullptr;
+  bool chunk_changed = false, bitrate_changed = false;
   {
     std::lock_guard<std::mutex> lock(pending_mu_);
-    if (chunk_s != recorded_chunk_s_) {
-      recorded_chunk_s_ = chunk_s;
-      runner = runner_;
-    }
+    chunk_changed = chunk_s != recorded_chunk_s_;
+    bitrate_changed = settings.max_bitrate_kbps != recorded_bitrate_kbps_;
+    recorded_chunk_s_ = chunk_s;
+    recorded_bitrate_kbps_ = settings.max_bitrate_kbps;
+    runner = runner_;
   }
   if (runner != nullptr && runner->session() != nullptr) {
-    runner->session()->SetProperty("c3d.ros.camera." + config_.name + ".chunk_seconds", chunk_s);
+    const std::string prefix = "c3d.ros.camera." + config_.name + ".";
+    if (chunk_changed) runner->session()->SetProperty(prefix + "chunk_seconds", chunk_s);
+    if (bitrate_changed) {
+      runner->session()->SetProperty(prefix + "max_bitrate_kilobits_per_second",
+                                     settings.max_bitrate_kbps);
+    }
   }
   std::lock_guard<std::mutex> lock(pending_mu_);
   encoder_ = std::move(encoder);
@@ -739,6 +766,7 @@ void CameraCapture::RestartForSize(double now, double wall_offset,
   // kill abandoned. Every earlier one was delivered first, the encoder pairing units to tokens in
   // feed order.
   std::vector<std::uint64_t> tokens;
+  std::string escalated;
   {
     std::lock_guard<std::mutex> lock(pending_mu_);
     size_stop_ = false;
@@ -746,6 +774,25 @@ void CameraCapture::RestartForSize(double now, double wall_offset,
     held_units_ = 0;
     for (const auto& kept : pending_) tokens.push_back(kept.first);
     pending_start_reason_ = StartReason::kSize;
+    if (++size_restarts_since_escalation_ >= kSizeRestartsToEscalate) {
+      size_restarts_since_escalation_ = 0;
+      if (chunk_s_ > kMinCameraChunkSeconds) {
+        chunk_cap_s_ =
+            std::max(kMinCameraChunkSeconds, std::floor(chunk_s_ / 2.0 * 10.0 + 1e-9) / 10.0);
+        escalated = "its chunks are now " + SecondsText(chunk_cap_s_) + " seconds";
+      } else if (config_.max_bitrate_kbps == 0 && !escalated_bitrate_cap_) {
+        escalated_bitrate_cap_ = true;
+        escalated = "its bitrate is now capped at " +
+                    std::to_string(DefaultCameraBitrateKbps(chunk_s_)) + " kbps";
+      }
+    }
+  }
+  if (!escalated.empty() && !escalation_warned_ && environment.warn_once) {
+    escalation_warned_ = true;
+    environment.warn_once("camera '" + config_.name + "': its chunks reached " +
+                          std::to_string(c3d::kMaxVideoChunkBytes / kMebibyte) + " MiB " +
+                          std::to_string(kSizeRestartsToEscalate) + " times this session, so " +
+                          escalated + ". Raise crf, lower max_width_px or set max_bitrate_kbps");
   }
   if (!size_warned_ && environment.warn_once) {
     size_warned_ = true;

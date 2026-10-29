@@ -83,6 +83,16 @@ double CameraChunkSeconds(const CameraConfig& camera, int width, int height);
 // it, for configure, the node and doctor alike.
 std::string CameraChunkTooLarge(const CameraConfig& camera, int width, int height);
 
+// The frames a size restart may have to encode again, at most: the encoder's queue, pipe and
+// input, x264's lookahead at veryfast, the unit the splitter holds, and those that arrive while
+// the restart is found and the replacement spawns.
+constexpr int kReplayWindowFrames = 28;
+// Whether kReplayWindowFrames frames of this size, as yuv420p, overflow replay_max_mb. Then a size
+// restart cannot be relied on to lose nothing, and the encoder caps its bitrate by default.
+bool ReplayNeedsBitrateCap(const CameraConfig& camera, int width, int height);
+// The default cap then: kCameraChunkTargetBytes over a chunk of `chunk_s`, in kilobits per second.
+int DefaultCameraBitrateKbps(double chunk_s);
+
 struct LidarConfig {
   std::string name;
   std::string topic;

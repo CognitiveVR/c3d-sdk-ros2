@@ -676,6 +676,39 @@ TEST(DoctorChecks, TheCameraCheckPrintsTheChunkLengthAndFailsWhenNoneFits) {
   EXPECT_EQ(check.severity, Severity::kOk);
   EXPECT_NE(check.detail.find("capped by max_bitrate_kbps"), std::string::npos) << check.detail;
   EXPECT_NE(check.detail.find("chunks of 2.5 s"), std::string::npos) << check.detail;
+  EXPECT_NE(check.detail.find("the bitrate is capped at max_bitrate_kbps 20000"),
+            std::string::npos)
+      << check.detail;
+}
+
+// Doctor names the regime the node would run the camera in: no cap while the replay store holds
+// what a size restart re-encodes, a default cap where it cannot.
+TEST(DoctorChecks, TheCameraCheckNamesTheBitrateRegime) {
+  MediaSensorFacts camera;
+  camera.kind = "camera";
+  camera.name = "front";
+  camera.topic = "/image";
+  camera.rate_hz = 15.0;
+  camera.topic_present = true;
+  camera.type = "sensor_msgs/msg/Image";
+  camera.type_handled = true;
+  camera.qos = "best_effort/volatile/keep_last(1)";
+  camera.frame = "camera_link";
+  camera.frame_resolves = true;
+  camera.sample_seen = true;
+  camera.crf = 28;
+  camera.replay_max_mb = 192;
+  camera.prepared_width = 1920;
+  camera.prepared_height = 1080;
+  Check check = CheckMediaSensor(camera);
+  EXPECT_NE(check.detail.find("no bitrate cap"), std::string::npos) << check.detail;
+  camera.prepared_width = 3840;
+  camera.prepared_height = 2160;
+  check = CheckMediaSensor(camera);
+  EXPECT_EQ(check.severity, Severity::kOk);
+  EXPECT_NE(check.detail.find("overflow replay_max_mb 192, so the bitrate is capped at 16777 kbps"),
+            std::string::npos)
+      << check.detail;
 }
 
 // `Config::Validate` reports every missing mandatory value in ONE string, so a refusal naming

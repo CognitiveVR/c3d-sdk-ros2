@@ -1429,6 +1429,7 @@ CameraConfig SizedCamera(const MediaSensorFacts& facts) {
   camera.rate_hz = facts.rate_hz;
   camera.crf = facts.crf;
   camera.max_bitrate_kbps = facts.max_bitrate_kbps;
+  if (facts.replay_max_mb > 0) camera.replay_max_mb = facts.replay_max_mb;
   return camera;
 }
 
@@ -1537,7 +1538,18 @@ Check CheckMediaSensor(const MediaSensorFacts& facts) {
     detail << ", by a model fitted to recorded footage; not measured on this camera); chunks of "
            << chunk_s << " s, about " << Bytes(static_cast<std::uint64_t>(per_second * chunk_s))
            << " each (sized to stay under "
-           << Bytes(static_cast<std::uint64_t>(kCameraChunkTargetBytes)) << ")";
+           << Bytes(static_cast<std::uint64_t>(kCameraChunkTargetBytes)) << "); ";
+    if (facts.max_bitrate_kbps > 0) {
+      detail << "the bitrate is capped at max_bitrate_kbps " << facts.max_bitrate_kbps;
+    } else if (ReplayNeedsBitrateCap(sized, facts.prepared_width, facts.prepared_height)) {
+      detail << kReplayWindowFrames << " frames of this size overflow replay_max_mb "
+             << sized.replay_max_mb << ", so the bitrate is capped at "
+             << DefaultCameraBitrateKbps(chunk_s) << " kbps by default, and a chunk that still "
+             << "reaches 8 MiB loses the frames the store could not keep";
+    } else {
+      detail << "no bitrate cap: a chunk that reaches 8 MiB ends and its last frames are encoded "
+             << "again from the replay store";
+    }
   } else {
     detail << ", one sample encodes to " << Bytes(facts.encoded_bytes) << " -- about "
            << Bytes(static_cast<std::uint64_t>(SensorBytesPerSecond(facts))) << "/s at "

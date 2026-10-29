@@ -79,13 +79,23 @@ not kept, and is dropped and counted in `dropped_replay` if it has to be encoded
 first frame, a keyframe, is never encoded again: up to 9 MiB it is kept as a chunk of its own, and
 a larger one is dropped and counted in `c3d.camera_access_units_dropped`.
 
+Where 28 frames of the camera's size, as yuv420p, do not fit in `replay_max_mb`, a restart could
+lose the frames that memory cannot keep, so the encoder caps its bitrate by default at 6 MiB over
+the chunk's length, 16,777 kilobits per second for a 3-second chunk. At the default 192 MiB that is
+a frame of more than about 4.8 million pixels, so a 4K camera recorded with `max_width_px: 0` is
+capped and a 1440p one is not.
+`max_bitrate_kbps` always wins over the default. A camera whose chunks reach 8 MiB 3 times in a
+session gets chunks half as long from its next restart, down to 1 second, and after 3 more at
+1 second its bitrate is capped too; the first of these is logged once per session, and a new
+session starts from the full length again.
+
 Three parameters set the encoder's trade of bytes against quality and CPU:
 
 | parameter | default | what |
 | -- | -- | -- |
 | `preset` | `ultrafast` | x264's speed preset: `ultrafast` or `veryfast`. `veryfast` spends more CPU for fewer bytes, at somewhat lower quality at the same `crf` |
 | `crf` | `28` | The constant rate factor, 24 to 32. It sets the quality the encoder holds, and the bytes follow the scene: lower is higher quality and more bytes, and the size roughly doubles every 4 steps lower. Measured at the default 3-second chunks: `24` is about 1.6 to 2.2 times the bytes of `28` depending on the footage, and `32` about 0.55 to 0.6 times |
-| `max_bitrate_kbps` | `0` | A cap on the stream's bitrate in kilobits per second, held over a 2-second window by lowering quality when a scene needs more. `0` sets no cap |
+| `max_bitrate_kbps` | `0` | A cap on the stream's bitrate in kilobits per second, held over a 2-second window by lowering quality when a scene needs more. `0` sets no cap, unless the node sets one by default, as below |
 
 Measured on a 20-second clip of a robot's 640 x 480 camera at 15 frames a second, `ultrafast`,
 encoded in 2-second chunks, against the uncompressed frames. The table shows quality, not bytes: VMAF is a video quality score out of 100, and the keypoint columns are the
@@ -467,7 +477,7 @@ properties:
 | `c3d.ros.cameras`, `c3d.ros.lidars` | The configured names, comma-separated |
 | `c3d.ros.camera.<name>.topic` | The camera's topic |
 | `c3d.ros.camera.<name>.rate_hertz`, `.max_width_pixels` | The camera's settings in force, defaults included |
-| `c3d.ros.camera.<name>.codec`, `.preset`, `.crf`, `.max_bitrate_kilobits_per_second`, `.chunk_seconds` | How the camera is encoded: `h264`, the preset and `crf` in force, the bitrate cap with 0 for none, and the chunk length in seconds: `3` when the session starts, and the length the encoder chose once it differs. Each chunk's `encoderSettings` names its own |
+| `c3d.ros.camera.<name>.codec`, `.preset`, `.crf`, `.max_bitrate_kilobits_per_second`, `.chunk_seconds` | How the camera is encoded: `h264`, the preset and `crf` in force, the bitrate cap with 0 for none, and the chunk length in seconds. The last two are the configured values when the session starts, and the ones the encoder runs with once the node chooses others. Each chunk's `encoderSettings` names its own |
 | `c3d.ros.camera.<name>.hfov_degrees`, `.vfov_degrees` | The field of view parameters, 0 when unset. Each chunk carries its own field of view; see [A camera's field of view](#a-cameras-field-of-view) |
 | `c3d.ros.camera.<name>.fov_source` | The source the camera is configured to take its chunks' field of view from: `parameter`, `camera_info`, or `none`. `camera_info` does not say that a CameraInfo arrived: a chunk whose first frame precedes the first one carries none |
 | `c3d.ros.camera.<name>.camera_info_topic` | The CameraInfo topic, resolved; empty when switched off |

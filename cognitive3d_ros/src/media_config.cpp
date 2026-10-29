@@ -66,6 +66,16 @@ std::string CameraChunkTooLarge(const CameraConfig& camera, int width, int heigh
   return text.str();
 }
 
+bool ReplayNeedsBitrateCap(const CameraConfig& camera, int width, int height) {
+  const double frame = static_cast<double>(width) * static_cast<double>(height) * 1.5;
+  return kReplayWindowFrames * frame >
+         static_cast<double>(camera.replay_max_mb) * 1024.0 * 1024.0;
+}
+
+int DefaultCameraBitrateKbps(double chunk_s) {
+  return static_cast<int>(kCameraChunkTargetBytes * 8.0 / chunk_s / 1000.0);
+}
+
 std::string ValidateCameraConfig(const CameraConfig& camera) {
   const std::string where = "camera." + camera.name + ".";
   if (camera.topic.empty()) {

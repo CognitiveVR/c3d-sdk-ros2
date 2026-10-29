@@ -397,6 +397,7 @@ std::vector<cognitive3d_ros::doctor::MediaSensorFacts> ProbeMediaSensors(
         }
         sensor.crf = cameras[probe->index].crf;
         sensor.max_bitrate_kbps = cameras[probe->index].max_bitrate_kbps;
+        sensor.replay_max_mb = cameras[probe->index].replay_max_mb;
       } else {
         cognitive3d_ros::LidarCapture capture(lidars[probe->index]);
         capture.MeasureEncodedScan(sensor.type, *probe->sample, convention, &bytes, &why);

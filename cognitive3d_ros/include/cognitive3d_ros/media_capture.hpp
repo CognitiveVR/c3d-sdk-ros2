@@ -291,6 +291,8 @@ class CameraCapture {
   // How far the wall clock may move against the steady clock under a running encoder before the
   // encoder is restarted. NTP's slewing stays far under it; a step does not.
   static constexpr double kWallClockStepSeconds = 1.0;
+  // Size restarts in one session after which the camera's chunks are made smaller.
+  static constexpr int kSizeRestartsToEscalate = 3;
 
  private:
   // Why the next encoder will start, which decides what that start counts as.
@@ -366,8 +368,16 @@ class CameraCapture {
   // The running encoder's chunk length, or the last one's: the quiet-gap and wedge rows wait this
   // long.
   double chunk_s_ = c3d::kVideoChunkSeconds;
-  // What c3d.ros.camera.<name>.chunk_seconds was last set to in this session.
+  // What c3d.ros.camera.<name>.chunk_seconds and .max_bitrate_kilobits_per_second were last set to
+  // in this session.
   double recorded_chunk_s_ = c3d::kVideoChunkSeconds;
+  int recorded_bitrate_kbps_ = 0;
+  // Every kSizeRestartsToEscalate size restarts in a session, the next encoder's chunk is half
+  // the last one's, down to kMinCameraChunkSeconds, and after that the bitrate is capped.
+  int size_restarts_since_escalation_ = 0;
+  double chunk_cap_s_ = c3d::kVideoChunkSeconds;
+  bool escalated_bitrate_cap_ = false;
+  bool escalation_warned_ = false;
   std::map<std::uint64_t, Pending> pending_;
   std::uint64_t next_token_ = 0;
   ReplayStore replay_;

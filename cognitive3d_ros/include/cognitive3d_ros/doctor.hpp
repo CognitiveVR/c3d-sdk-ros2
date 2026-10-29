@@ -503,6 +503,7 @@ struct MediaSensorFacts {
   std::uint16_t prepared_height = 0;
   int crf = 0;
   int max_bitrate_kbps = 0;
+  int replay_max_mb = 0;
   // Why the sample could not be prepared or encoded, when one arrived and was
   // refused. This is the check that catches a camera pointed at a depth topic.
   std::string encode_error;

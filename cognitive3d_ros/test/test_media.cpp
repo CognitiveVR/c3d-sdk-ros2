@@ -484,6 +484,20 @@ TEST(CameraChunkSeconds, TheLongestLengthUnderTheTargetFromOneToThreeSeconds) {
   EXPECT_DOUBLE_EQ(CameraChunkSeconds(camera, 3840, 2160), 3.0);
 }
 
+// The replay store must hold kReplayWindowFrames frames of the size, as yuv420p, for a size
+// restart to lose nothing; past it the encoder caps its bitrate by default, at 6 MiB over a chunk.
+TEST(CameraChunkSeconds, TheBitrateIsCappedByDefaultOnlyWhereTheReplayOverflows) {
+  CameraConfig camera;
+  EXPECT_EQ(camera.replay_max_mb, 192);
+  EXPECT_FALSE(ReplayNeedsBitrateCap(camera, 1920, 1080));
+  EXPECT_FALSE(ReplayNeedsBitrateCap(camera, 2560, 1440));
+  EXPECT_TRUE(ReplayNeedsBitrateCap(camera, 3840, 2160));
+  camera.replay_max_mb = 64;
+  EXPECT_TRUE(ReplayNeedsBitrateCap(camera, 1920, 1080));
+  EXPECT_EQ(DefaultCameraBitrateKbps(3.0), 16777);
+  EXPECT_EQ(DefaultCameraBitrateKbps(1.0), 50331);
+}
+
 // With max_width_px set, configure sizes the camera as a 16:9 frame that wide and refuses it when
 // not even a 1-second chunk fits, naming the parameters that change that. Unset, the size is
 // known only at the first frame.
@@ -1500,6 +1514,64 @@ TEST_F(MediaTest, TheEncoderStartsWithTheChunkLengthItsFrameSizeFits) {
 
   ASSERT_TRUE(FrameAt(*capture, 3.5, 640, 480));
   EXPECT_DOUBLE_EQ(fakes_.last().settings.chunk_s, 3.0);
+}
+
+// An encoder for frames whose replay overflows replay_max_mb starts with a bitrate cap sized to its
+// chunk; an operator's max_bitrate_kbps always wins, and a frame that fits gets none.
+TEST_F(MediaTest, AFrameSizeTheReplayStoreCannotHoldStartsWithABitrateCap) {
+  CameraConfig config = Front();
+  config.rate_hz = 30.0;
+  config.replay_max_mb = 1;
+  auto capped = OnFakes(config);
+  ASSERT_TRUE(FrameAt(*capped, 0.0, 640, 480));
+  EXPECT_EQ(fakes_.last().settings.max_bitrate_kbps, DefaultCameraBitrateKbps(3.0));
+  capped->StopEncoder();
+
+  config.max_bitrate_kbps = 800;
+  auto explicit_cap = OnFakes(config);
+  ASSERT_TRUE(FrameAt(*explicit_cap, 1.0, 640, 480));
+  EXPECT_EQ(fakes_.last().settings.max_bitrate_kbps, 800);
+  explicit_cap->StopEncoder();
+
+  auto uncapped = OnFakes(Front());
+  ASSERT_TRUE(FrameAt(*uncapped, 2.0, 640, 480));
+  EXPECT_EQ(fakes_.last().settings.max_bitrate_kbps, 0);
+}
+
+// A camera whose chunks keep reaching the byte cap escalates every 3 size restarts in a session:
+// the next encoder's chunk is half the last, down to 1 s, and after that its bitrate is capped. It
+// is said once, and a new session starts from the full length again.
+TEST_F(MediaTest, RepeatedSizeRestartsHalveTheChunkThenCapTheBitrate) {
+  fakes_.next.unit_bytes = [](int) { return std::size_t{3} << 20; };
+  auto capture = OnFakes(Front());
+  std::vector<double> chunks;
+  std::vector<int> bitrates;
+  double t = 0.0;
+  while (fakes_.built() < 11) {
+    ASSERT_TRUE(FrameAt(*capture, t));
+    t += 0.01;
+    ASSERT_LT(t, 10.0) << "the restarts stopped coming";
+  }
+  for (std::size_t i = 0; i < fakes_.built(); ++i) {
+    chunks.push_back(fakes_.record(i).settings.chunk_s);
+    bitrates.push_back(fakes_.record(i).settings.max_bitrate_kbps);
+  }
+  EXPECT_EQ(chunks, (std::vector<double>{3, 3, 3, 1.5, 1.5, 1.5, 1, 1, 1, 1, 1}));
+  EXPECT_EQ(bitrates, (std::vector<int>{0, 0, 0, 0, 0, 0, 0, 0, 0, 50331, 50331}));
+  EXPECT_EQ(capture->stats().size_restarts, 10u);
+  std::size_t said = 0;
+  for (const std::string& warning : warnings_) {
+    if (warning.find("3 times this session") != std::string::npos) {
+      ++said;
+      EXPECT_NE(warning.find("its chunks are now 1.5 seconds"), std::string::npos) << warning;
+    }
+  }
+  EXPECT_EQ(said, 1u);
+
+  capture->Reset();
+  ASSERT_TRUE(FrameAt(*capture, t));
+  EXPECT_EQ(fakes_.last().settings.chunk_s, 3.0) << "the escalation outlived Reset";
+  EXPECT_EQ(fakes_.last().settings.max_bitrate_kbps, 0);
 }
 
 // A frame size at which not even a 1-second chunk fits refuses the camera at its first frame: no
