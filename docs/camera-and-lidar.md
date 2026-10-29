@@ -223,7 +223,7 @@ an `intensity` field (`FLOAT32`, `UINT8` or `UINT16`). Then:
 With `int16_mm` positions and a `zstd_level` above 0, each position plane is delta coded and byte
 shuffled before zstd, which leaves about two thirds of the bytes of the plain planar block. Clouds are packed into objects:
 an object closes at 2 MiB or 5 seconds of clouds, whichever comes first, and a cloud larger than
-2 MiB is an object of its own. `float32` positions are compressed without the delta.
+2 MiB is an object of its own, at most 8 MiB because `max_points` is bounded to that. `float32` positions are compressed without the delta.
 
 A cloud the node cannot read, such as a big-endian one or one whose `x`, `y` and `z` are not
 `FLOAT32`, is refused and counted in `refused`, with one warning naming the reason.
@@ -442,7 +442,9 @@ Configure refuses, naming the parameter:
   [How a camera is encoded](#how-a-camera-is-encoded)
 - a camera configured while the binary named by `ffmpeg_path` cannot run, or lists no `libx264`
   encoder: the refusal names the binary and says `sudo apt install ffmpeg`
-- a `pointcloud.voxel_leaf_m` below 0 or above 65 meters, a `pointcloud.max_points` below 1, or a
+- a `pointcloud.voxel_leaf_m` below 0 or above 65 meters, a `pointcloud.max_points` below 1 or
+  above the most points whose worst case encoding stays under 8 MiB, so that one cloud never
+  makes an object the platform refuses (about 1.39 million at the defaults), or a
   `pointcloud.zstd_level` outside 0 to 22
 - a `pointcloud.position`, `pointcloud.color` or `pointcloud.intensity` that is not one of the values
   above

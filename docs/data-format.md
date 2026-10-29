@@ -274,7 +274,7 @@ followed by exactly one of `scans`, a `ScanBlock`, or `clouds`, a `CloudBlock`.
 ### Laser scan blocks
 
 A `ScanBlock` holds the scans of one `LaserScan` sensor over about 3 seconds of stamps. A block
-also closes before its codes, 2 bytes a ray and twice that with intensities, would pass 32 MiB, so a
+also closes before its codes, 2 bytes a ray and twice that with intensities, would pass 8 MiB, so a
 lidar whose stamps stop advancing still makes bounded blocks. Its header is the scans' geometry,
 which every scan in the block shares; a scan with different geometry, or with a different number
 of rays, starts a new block:
@@ -342,7 +342,7 @@ that is not finite stored as 0; there is no sentinel.
 
 A `CloudBlock` holds one `PointCloud2` sensor's clouds, packed into one object that closes at 2 MiB
 of data or 5 seconds of stamps, whichever comes first. A cloud larger than 2 MiB is an object of
-its own. The header describes every cloud in the object as written:
+its own, and its data is at most 8 MiB. The header describes every cloud in the object as written:
 
 | field | type | what |
 | -- | -- | -- |

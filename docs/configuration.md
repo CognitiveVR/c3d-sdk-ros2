@@ -289,7 +289,7 @@ what is refused.
 | `lidar.<name>.pointcloud.position` | string | `"int16_mm"` | — | `int16_mm` or `float32`. `int16_mm` reaches 32.767 meters from the sensor's frame; a point beyond that is dropped and counted in `c3d.lidar.<name>.dropped_range`. Use `float32` for a long-range lidar. |
 | `lidar.<name>.pointcloud.color` | string | `"none"` | — | `none`, `rgb565`, `rgb332` or `rgb888`. |
 | `lidar.<name>.pointcloud.intensity` | string | `"none"` | — | `none` or `uint8`. |
-| `lidar.<name>.pointcloud.max_points` | int | `100000` | points | A cloud still larger than this after downsampling is dropped whole, and counted in `c3d.lidar.<name>.dropped_oversize`. At least 1. |
+| `lidar.<name>.pointcloud.max_points` | int | `100000` | points | A cloud still larger than this after downsampling is dropped whole, and counted in `c3d.lidar.<name>.dropped_oversize`. At least 1, and at most the points whose worst case encoding stays under 8 MiB at the configured `position`, `color`, `intensity` and `zstd_level`: about 1.39 million at the defaults, about 522,000 at `float32` with `rgb888` and an intensity. |
 | `lidar.<name>.pointcloud.zstd_level` | int | `3` | — | The compression level, from 0 to 22; `0` sends the points uncompressed. |
 | `ffmpeg_path` | string | `"ffmpeg"` | — | The camera encoder binary, searched on `PATH` unless it contains a `/`. With a camera configured, configure refuses when it cannot run or lists no `libx264` encoder. |
 

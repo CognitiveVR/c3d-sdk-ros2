@@ -161,6 +161,16 @@ std::string ValidateLidarConfig(const LidarConfig& lidar) {
   if (cloud.max_points == 0) {
     return where + "pointcloud.max_points must be positive; 0 would drop every cloud";
   }
+  const std::size_t ceiling = c3d::pointcloud::MaxPointsWithin(c3d::kMaxCloudBytes, cloud);
+  if (cloud.max_points > ceiling) {
+    return where + "pointcloud.max_points is " + std::to_string(cloud.max_points) +
+           ", but at this position, color, intensity and zstd_level a cloud of more than " +
+           std::to_string(ceiling) + " points can encode to more than " +
+           std::to_string(c3d::kMaxCloudBytes / (1024 * 1024)) +
+           " MiB, and the platform refuses an object over " +
+           std::to_string(c3d::kMaxObjectBytes / (1024 * 1024)) + " MiB. Set it to at most " +
+           std::to_string(ceiling) + ", or raise voxel_leaf_m to send fewer points";
+  }
   if (cloud.zstd_level < 0 || cloud.zstd_level > 22) {
     return where + "pointcloud.zstd_level must be between 0 (uncompressed) and 22";
   }

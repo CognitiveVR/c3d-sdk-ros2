@@ -30,6 +30,8 @@ marks as provisional may change in a minor release, and its entry here says how 
   default, runs with a bitrate cap of 6 MiB over its chunk length. A camera whose chunks reach
   8 MiB 3 times in a session gets chunks half as long, down to 1 second, then that cap.
   `doctor` names the cap a camera would run with.
+- `lidar.<name>.pointcloud.max_points` is bounded so one cloud encodes to at most 8 MiB, about
+  1.39 million points at the defaults: configure refuses a larger value, naming the bound.
 - `doctor`'s `camera encoder` check, which is FATAL when a camera is configured and `ffmpeg` cannot
   run. Its `camera/<name>` check reports an estimated size and rate.
 

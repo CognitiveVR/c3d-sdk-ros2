@@ -184,6 +184,11 @@ namespace pointcloud {
 // it is also what makes the output testable byte for byte.
 EncodedPointCloud Encode(const PointCloudInput& input, const PointCloudOptions& options);
 
+// The most points a cloud may have for Encode's output under `options` never to pass `bytes`,
+// whatever the points are: zstd's worst case over the planar block of 2 or 4 bytes a position
+// axis, the colour's bytes and the intensity's, or the block itself at zstd level 0.
+std::size_t MaxPointsWithin(std::uint64_t bytes, const PointCloudOptions& options);
+
 // The encoding Encode writes under `options`: planarDeltaShuffleZstd only for int16_mm positions
 // compressed at a zstd level above 0, whatever `options.encoding` asks for; planarZstd otherwise.
 PointCloudEncoding EffectiveEncoding(const PointCloudOptions& options);

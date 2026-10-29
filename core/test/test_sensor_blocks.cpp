@@ -366,7 +366,7 @@ TEST(ScanBlockAssembler, ABlockClosesBeforeItsCodesWouldPassTheCap) {
     // 32 KiB of codes a scan either way: 16,384 rays, or 8,192 with as many intensities.
     const LaserScanData scan = ScanOf(intensities ? 8192 : 16384, intensities);
     const std::uint32_t fit = static_cast<std::uint32_t>(kMaxScanBlockCodeBytes / (32 * 1024));
-    ASSERT_EQ(fit, 1024u);
+    ASSERT_EQ(fit, 256u);
     for (std::uint32_t i = 0; i < fit; ++i) {
       ASSERT_TRUE(blocks.Append(EntryAt(5000, i), "laser", scan, 1.0).empty())
           << "closed at scan " << i << ", short of the cap";

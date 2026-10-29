@@ -31,8 +31,12 @@ constexpr std::uint64_t kMaxVideoChunkBytes = 8ull * 1024 * 1024;
 // again. One up to this is kept as a chunk of its own; a larger one is dropped.
 constexpr std::uint64_t kMaxVideoFirstUnitBytes = 9ull * 1024 * 1024;
 // The most an open scan block's codes hold before it is closed, whatever the stamps do: a lidar
-// whose stamp stops advancing would otherwise grow one without bound.
-constexpr std::uint64_t kMaxScanBlockCodeBytes = 32ull * 1024 * 1024;
+// whose stamp stops advancing would otherwise grow one without bound. zstd's worst case barely
+// passes its input, so the encoded block stays under kMaxObjectBytes with the envelope.
+constexpr std::uint64_t kMaxScanBlockCodeBytes = 8ull * 1024 * 1024;
+// The most one encoded cloud may hold, which a lidar's pointcloud.max_points is bounded to by
+// pointcloud::MaxPointsWithin: a cloud this large is an object of its own.
+constexpr std::uint64_t kMaxCloudBytes = 8ull * 1024 * 1024;
 // The idle closes have no constant here: the caller passes them in from its configuration.
 
 struct SensorEntry {

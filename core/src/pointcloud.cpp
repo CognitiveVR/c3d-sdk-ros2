@@ -161,6 +161,24 @@ std::size_t BytesPerColor(PointColor c) {
 
 }  // namespace
 
+std::size_t MaxPointsWithin(std::uint64_t bytes, const PointCloudOptions& options) {
+  const std::uint64_t per_point =
+      (options.position == PointPosition::kFloat32 ? 12u : 6u) + BytesPerColor(options.color) +
+      (options.intensity == PointIntensity::kUint8 ? 1u : 0u);
+  if (options.zstd_level <= 0) return static_cast<std::size_t>(bytes / per_point);
+  // The largest n whose block's bound fits; the bound grows with n.
+  std::uint64_t low = 0, high = bytes / per_point;
+  while (low < high) {
+    const std::uint64_t mid = low + (high - low + 1) / 2;
+    if (ZSTD_compressBound(static_cast<std::size_t>(mid * per_point)) <= bytes) {
+      low = mid;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return static_cast<std::size_t>(low);
+}
+
 std::string DeltaShufflePositionPlanes(const std::string& planar, std::size_t n,
                                        std::size_t position_bytes) {
   if (position_bytes != 2 || planar.size() < 3 * n * 2) return planar;

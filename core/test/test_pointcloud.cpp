@@ -74,6 +74,56 @@ void DecodeRgb332(std::uint8_t v, int* r, int* g, int* b) {
 
 }  // namespace
 
+// The ceiling on max_points is the most points whose worst case encoding stays within the bytes
+// given: the planar block at zstd level 0, zstd's bound over it otherwise.
+TEST(PointCloudEncoder, MaxPointsWithinIsTheLargestCountWhoseWorstCaseFits) {
+  const std::uint64_t bytes = 8ull * 1024 * 1024;
+  PointCloudOptions options;
+  options.zstd_level = 0;
+  EXPECT_EQ(pointcloud::MaxPointsWithin(bytes, options), bytes / 6);
+  options.position = PointPosition::kFloat32;
+  options.color = PointColor::kRgb888;
+  options.intensity = PointIntensity::kUint8;
+  EXPECT_EQ(pointcloud::MaxPointsWithin(bytes, options), bytes / 16);
+  for (const PointPosition position : {PointPosition::kInt16Mm, PointPosition::kFloat32}) {
+    options.position = position;
+    options.zstd_level = 3;
+    const std::size_t n = pointcloud::MaxPointsWithin(bytes, options);
+    const std::size_t per_point = position == PointPosition::kFloat32 ? 16 : 10;
+    EXPECT_LE(ZSTD_compressBound(n * per_point), bytes);
+    EXPECT_GT(ZSTD_compressBound((n + 1) * per_point), bytes);
+  }
+}
+
+// A cloud at the ceiling, of points zstd cannot shrink, encodes within the bytes the ceiling was
+// taken for.
+TEST(PointCloudEncoder, ACloudAtTheCeilingEncodesWithinItsBytes) {
+  const std::uint64_t bytes = 8ull * 1024 * 1024;
+  PointCloudOptions options = RawOptions();
+  options.position = PointPosition::kFloat32;
+  options.color = PointColor::kRgb888;
+  options.intensity = PointIntensity::kUint8;
+  options.zstd_level = 3;
+  const std::size_t n = pointcloud::MaxPointsWithin(bytes, options);
+  options.max_points = n;
+  std::mt19937 random(7);
+  std::uniform_real_distribution<float> metres(-30.0f, 30.0f);
+  PointCloudInput input;
+  for (std::size_t i = 0; i < n; ++i) {
+    for (int axis = 0; axis < 3; ++axis) input.xyz.push_back(metres(random));
+    for (int channel = 0; channel < 3; ++channel) {
+      input.rgb.push_back(static_cast<std::uint8_t>(random()));
+    }
+    input.intensity.push_back(static_cast<float>(random() % 256));
+  }
+  input.intensity_is_integral = true;
+  const EncodedPointCloud cloud = pointcloud::Encode(input, options);
+  ASSERT_TRUE(cloud.ok) << cloud.reason;
+  EXPECT_EQ(cloud.point_count, n);
+  EXPECT_GT(cloud.data.size(), bytes * 9 / 10) << "the points compressed; the test proves nothing";
+  EXPECT_LE(cloud.data.size(), bytes);
+}
+
 TEST(PointCloudEncoder, VoxelCellCollapsesToItsCentroid) {
   PointCloudInput input;
   // Three points inside one 10 cm cell and one well outside it.

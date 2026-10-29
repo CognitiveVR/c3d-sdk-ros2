@@ -610,6 +610,31 @@ TEST(MediaConfig, AFieldOfViewIsBothAnglesStrictlyBetween0And180OrNeither) {
   EXPECT_EQ(refusal(179.99, 0.01), "");
 }
 
+// One cloud is an object of its own when it is large, so max_points is bounded to the most points
+// whose worst case encoding stays under 8 MiB at the configured layout: refused above it, naming it.
+TEST(MediaConfig, ALidarsMaxPointsIsBoundedSoOneCloudStaysUnderTheObjectLimit) {
+  LidarConfig lidar;
+  lidar.name = "front";
+  lidar.topic = "/points";
+  const std::size_t ceiling =
+      c3d::pointcloud::MaxPointsWithin(c3d::kMaxCloudBytes, lidar.pointcloud);
+  EXPECT_GT(ceiling, 1000000u);
+  lidar.pointcloud.max_points = ceiling;
+  EXPECT_EQ(ValidateLidarConfig(lidar), "");
+  lidar.pointcloud.max_points = ceiling + 1;
+  const std::string refusal = ValidateLidarConfig(lidar);
+  EXPECT_EQ(refusal.rfind("lidar.front.pointcloud.max_points is " + std::to_string(ceiling + 1), 0),
+            0u)
+      << refusal;
+  EXPECT_NE(refusal.find("at most " + std::to_string(ceiling)), std::string::npos) << refusal;
+
+  lidar.pointcloud.position = c3d::PointPosition::kFloat32;
+  lidar.pointcloud.color = c3d::PointColor::kRgb888;
+  lidar.pointcloud.intensity = c3d::PointIntensity::kUint8;
+  lidar.pointcloud.max_points = 600000;
+  EXPECT_NE(ValidateLidarConfig(lidar), "") << "16 bytes a point allow about 524,000";
+}
+
 TEST(MediaConfig, ALidarsPointCloudOptionsAreBoundedWhereTheWireIs) {
   LidarConfig lidar;
   lidar.name = "depth";
