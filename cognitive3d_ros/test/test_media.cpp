@@ -2785,6 +2785,50 @@ TEST(PointCloudExtract, ABufferLongerThanTheCloudItDescribesContributesNothingEx
 // Lidar capture
 // ---------------------------------------------------------------------------
 
+// A camera frame or a scan whose time is earlier than the one before it is counted per sensor and
+// recorded as it came, in arrival order and with its own time: never sorted, never clamped.
+TEST_F(MediaTest, AStampThatStepsBackIsCountedAndRecordedAsItCame) {
+  environment_.wire_time = [](const rclcpp::Time& stamp) { return 1788383000.0 + stamp.seconds(); };
+  auto camera = OnFakes(Front());
+  for (const double stamp : {100.0, 99.5, 100.2, 99.0}) {
+    ASSERT_TRUE(camera->Handle("sensor_msgs/msg/Image",
+                               Serialize(MakeImage(32, 24, "rgb8", "camera_link", stamp)),
+                               environment_, *runner_))
+        << stamp;
+  }
+  EXPECT_EQ(camera->stats().backward_stamps, 2u);
+  std::vector<std::uint64_t> times;
+  for (const auto& call : runner_->calls()) times.push_back(call.time_ms);
+  EXPECT_EQ(times, (std::vector<std::uint64_t>{1788383100000ull, 1788383099500ull,
+                                              1788383100200ull, 1788383099000ull}));
+  camera->Reset();
+  EXPECT_EQ(camera->stats().backward_stamps, 0u);
+  ASSERT_TRUE(camera->Handle("sensor_msgs/msg/Image",
+                             Serialize(MakeImage(32, 24, "rgb8", "camera_link", 50.0)),
+                             environment_, *runner_));
+  EXPECT_EQ(camera->stats().backward_stamps, 0u) << "a new session's first frame is backward";
+
+  LidarConfig config;
+  config.name = "scan";
+  config.topic = "/scan";
+  config.rate_hz = 1000.0;
+  LidarCapture lidar(config);
+  for (const int stamp : {200, 199, 201}) {
+    sensor_msgs::msg::LaserScan scan;
+    scan.header.frame_id = "base_scan";
+    scan.header.stamp.sec = stamp;
+    scan.angle_min = -3.14f;
+    scan.angle_max = 3.14f;
+    scan.angle_increment = 0.01f;
+    scan.range_min = 0.1f;
+    scan.range_max = 12.0f;
+    scan.ranges.assign(64, 1.5f);
+    ASSERT_TRUE(lidar.Handle("sensor_msgs/msg/LaserScan", Serialize(scan), environment_, *runner_))
+        << stamp;
+  }
+  EXPECT_EQ(lidar.stats().backward_stamps, 1u);
+}
+
 TEST_F(MediaTest, LaserScanIntensitiesAreDroppedUnlessAskedFor) {
   sensor_msgs::msg::LaserScan scan;
   scan.header.frame_id = "base_scan";

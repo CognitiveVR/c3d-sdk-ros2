@@ -86,6 +86,7 @@ std::vector<CameraChunkRecord> VideoChunkAssembler::Append(const SensorEntry& en
   frame.keyframe = keyframe;
   open_->frames.push_back(frame);
   open_->data += access_unit;
+  open_->start_ms = std::min(open_->start_ms, entry.time_ms);
   open_->end_ms = std::max(open_->end_ms, entry.time_ms);
   result = VideoUnitFate::kAppended;
   return out;
@@ -135,6 +136,7 @@ std::vector<ScanBlockRecord> ScanBlockAssembler::Append(const SensorEntry& entry
   }
   open_->entries.push_back(entry);
   open_->scans.push_back(scan);
+  open_->start_ms = std::min(open_->start_ms, entry.time_ms);
   open_->end_ms = std::max(open_->end_ms, entry.time_ms);
   last_append_steady_ = now_steady;
   return out;
@@ -182,6 +184,7 @@ std::vector<CloudObjectRecord> CloudObjectAssembler::Append(const SensorEntry& e
   open_->point_counts.push_back(cloud.point_count);
   open_->blocks.push_back(cloud.data);
   open_->bytes += cloud.data.size();
+  open_->start_ms = std::min(open_->start_ms, entry.time_ms);
   open_->end_ms = std::max(open_->end_ms, entry.time_ms);
   last_append_steady_ = now_steady;
   if (open_->bytes >= kCloudObjectMaxBytes) {

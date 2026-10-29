@@ -133,6 +133,9 @@ struct CameraStats {
   // Frames a size restart could not re-encode: not kept for want of replay_max_mb, or the
   // replacement could not take them.
   std::uint64_t dropped_replay = 0;
+  // Frames whose time is earlier than the frame before them: kept in the order they came and with
+  // the time they were given, never sorted or clamped.
+  std::uint64_t backward_stamps = 0;
   // Access units that arrived with no session to take them.
   //
   // This and dropped_at_stop count for the life of the capture, not per session: the stop that
@@ -149,6 +152,8 @@ struct LidarStats {
   std::uint64_t dropped_range = 0;
   // Clouds whose layout we cannot read, and LaserScans with more rays than a scan block holds.
   std::uint64_t refused = 0;
+  // Scans or clouds whose time is earlier than the one before them, as CameraStats counts frames.
+  std::uint64_t backward_stamps = 0;
 };
 
 // The header of whichever of the four message types these two streams take.
@@ -336,6 +341,8 @@ class CameraCapture {
   std::string ffmpeg_path_;
   H264EncoderFactory factory_;
   std::uint32_t seq_ = 0;
+  // The time of the last frame given a seq, for backward_stamps.
+  std::uint64_t last_time_ms_ = 0;
   RateGate gate_;
   // One per warning: a warning that shared another's flag would be silenced by it.
   bool frame_id_warned_ = false;
@@ -451,6 +458,7 @@ class LidarCapture {
   LidarConfig config_;
   LidarStats stats_;
   std::uint32_t seq_ = 0;
+  std::uint64_t last_time_ms_ = 0;
   RateGate gate_;
   // One per warning, as the camera's are.
   bool frame_id_warned_ = false;

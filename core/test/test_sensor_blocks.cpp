@@ -294,6 +294,45 @@ TEST(VideoChunkAssembler, AKeyframeIsNeverRefusedKeptUpToItsCapAndDroppedAbove) 
   EXPECT_EQ(video.buffered_frames(), 0u);
 }
 
+// An entry's time is kept as given and where it came: one earlier than the entry before it is
+// neither sorted nor clamped, and a unit's start and end are its least and greatest entry time.
+TEST(SensorBlocks, AnEarlierTimeKeepsItsPlaceAndTheUnitSpansTheLeastToTheGreatest) {
+  VideoChunkAssembler video("front");
+  const VideoChunkContext context = CameraContext();
+  video.Append(EntryAt(1000, 0), context, "I0", true);
+  video.Append(EntryAt(900, 1), context, "p1", false);
+  video.Append(EntryAt(1100, 2), context, "p2", false);
+  const std::vector<CameraChunkRecord> chunks = video.Close();
+  ASSERT_EQ(chunks.size(), 1u);
+  EXPECT_EQ(chunks[0].start_ms, 900u);
+  EXPECT_EQ(chunks[0].end_ms, 1100u);
+  ASSERT_EQ(chunks[0].frames.size(), 3u);
+  EXPECT_EQ(chunks[0].frames[1].time_ms, 900u);
+  EXPECT_EQ(chunks[0].frames[1].seq, 1u);
+
+  ScanBlockAssembler scans("scan");
+  for (const auto& [time, seq] : {std::pair<std::uint64_t, std::uint32_t>{1000, 0}, {900, 1},
+                                  {1100, 2}}) {
+    EXPECT_TRUE(scans.Append(EntryAt(time, seq), "laser", ScanOf(8), 1.0).empty());
+  }
+  const std::vector<ScanBlockRecord> blocks = scans.Close();
+  ASSERT_EQ(blocks.size(), 1u);
+  EXPECT_EQ(blocks[0].start_ms, 900u);
+  EXPECT_EQ(blocks[0].end_ms, 1100u);
+  EXPECT_EQ(blocks[0].entries[1].time_ms, 900u);
+
+  CloudObjectAssembler clouds("points");
+  for (const auto& [time, seq] : {std::pair<std::uint64_t, std::uint32_t>{1000, 0}, {900, 1},
+                                  {1100, 2}}) {
+    EXPECT_TRUE(clouds.Append(EntryAt(time, seq), "lidar", CloudOf(16), 1.0).empty());
+  }
+  const std::vector<CloudObjectRecord> objects = clouds.Close();
+  ASSERT_EQ(objects.size(), 1u);
+  EXPECT_EQ(objects[0].start_ms, 900u);
+  EXPECT_EQ(objects[0].end_ms, 1100u);
+  EXPECT_EQ(objects[0].entries[1].time_ms, 900u);
+}
+
 TEST(VideoChunkAssembler, TheChunkCarriesTheFirstFramesContext) {
   VideoChunkAssembler video("front");
   const VideoChunkContext first = CameraContext();

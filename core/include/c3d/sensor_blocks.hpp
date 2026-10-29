@@ -45,8 +45,9 @@ struct SensorEntry {
   Pose pose;
 };
 
-// `start_ms` is the first entry's time and `end_ms` the largest; entries keep append order; each
-// assembler numbers the units it closes from 0.
+// `start_ms` is the least entry time and `end_ms` the largest. Entries keep append order and their
+// times are kept as given: a time earlier than the one before it is neither sorted nor clamped.
+// Each assembler numbers the units it closes from 0.
 
 struct FrameMeta {
   std::uint64_t time_ms = 0;

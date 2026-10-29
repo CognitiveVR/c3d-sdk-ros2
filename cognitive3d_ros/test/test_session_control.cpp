@@ -3457,7 +3457,8 @@ TEST(NodeRateGates, AZeroStampedCameraAndAnOdometryTopicAreGatedOnArrival) {
   const double frames = SeriesMaximum(bodies, "c3d.camera.front.frames");
   EXPECT_GE(frames, 4.0) << "a zero-stamped camera at 20 Hz into a 2 Hz gate froze";
   EXPECT_LE(frames, 13.0) << "a 2 Hz gate over about five seconds";
-  for (const char* series : {"size_restarts", "dropped_replay", "rejected_too_large"}) {
+  for (const char* series :
+       {"size_restarts", "dropped_replay", "rejected_too_large", "backward_stamps"}) {
     EXPECT_EQ(SeriesMaximum(bodies, std::string("c3d.camera.front.") + series), 0.0) << series;
   }
   std::size_t speeds = 0;

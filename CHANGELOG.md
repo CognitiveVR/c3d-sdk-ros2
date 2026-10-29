@@ -30,6 +30,9 @@ marks as provisional may change in a minor release, and its entry here says how 
   default, runs with a bitrate cap of 6 MiB over its chunk length. A camera whose chunks reach
   8 MiB 3 times in a session gets chunks half as long, down to 1 second, then that cap.
   `doctor` names the cap a camera would run with.
+- Per camera and lidar, `backward_stamps` counts records whose time is earlier than the one
+  before; they are stored as they came, and a chunk's or block's `startMs` and `endMs` are its
+  least and greatest time.
 - Per camera, `c3d.camera.<name>.rejected_too_large` counts chunks the platform refused with a 413
   as larger than its 10 MiB, which are deleted; the first in a session is logged.
 - `lidar.<name>.pointcloud.max_points` is bounded so one cloud encodes to at most 8 MiB, about

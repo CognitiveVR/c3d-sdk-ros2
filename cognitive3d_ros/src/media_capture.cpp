@@ -320,6 +320,7 @@ void CameraCapture::Reset() {
     stats_ = fresh;
   }
   seq_ = 0;
+  last_time_ms_ = 0;
   gate_.Reset();
   held_.Clear();
   frame_id_warned_ = false;
@@ -440,6 +441,8 @@ bool CameraCapture::Emit(const std_msgs::msg::Header& header, PreparedFrame fram
     // Every posed frame takes a seq, fed or not, so a frame the encoder dropped is a gap in seq
     // rather than a hole in the chunk.
     entry.seq = seq_++;
+    if (entry.seq > 0 && time_ms < last_time_ms_) AddToStats(&CameraStats::backward_stamps);
+    last_time_ms_ = time_ms;
     entry.pose = c3d::Pose{position, rotation};
     c3d::VideoChunkContext context;
     context.frame_id = frame_id;
@@ -1122,6 +1125,7 @@ LidarCapture::LidarCapture(LidarConfig config) : config_(std::move(config)) {}
 void LidarCapture::Reset() {
   stats_ = LidarStats{};
   seq_ = 0;
+  last_time_ms_ = 0;
   gate_.Reset();
   held_.Clear();
   frame_id_warned_ = false;
@@ -1266,6 +1270,8 @@ bool LidarCapture::Handle(const std::string& type, const rclcpp::SerializedMessa
     auto record = [this, frame_id, time_ms, data = std::move(data)](
                       const c3d::Vec3& position, const c3d::Quat& rotation,
                       const MediaEnvironment&, SessionRunner& runner) {
+      if (seq_ > 0 && time_ms < last_time_ms_) ++stats_.backward_stamps;
+      last_time_ms_ = time_ms;
       runner.RecordLaserScan(config_.name, time_ms, seq_++, frame_id, position, rotation, data);
       ++stats_.scans;
       stats_.bytes += (data.ranges.size() + data.intensities.size()) * sizeof(float);
@@ -1333,6 +1339,8 @@ bool LidarCapture::Handle(const std::string& type, const rclcpp::SerializedMessa
       return false;
     }
 
+    if (seq_ > 0 && time_ms < last_time_ms_) ++stats_.backward_stamps;
+    last_time_ms_ = time_ms;
     runner.RecordPointCloud(config_.name, time_ms, seq_++, frame_id, position, rotation, encoded);
     ++stats_.scans;
     stats_.bytes += encoded.data.size();

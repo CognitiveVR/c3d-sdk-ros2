@@ -203,7 +203,7 @@ first frame is always a keyframe. The record is a `CameraPayload`:
 | `userId`, `sessionId`, `sceneId`, `sceneVersion`, `formatVersion`, `sessionStartMs`, `sdkVersion` | | The session the chunk belongs to, the scene version number, `"2.0"` and the SDK version |
 | `cameraId` | text | The camera's name from `cameras` |
 | `seq` | UInt32 | The camera's chunk counter: 0 for the first chunk stored in the session, then 1, 2 and so on |
-| `startMs`, `endMs` | UInt64 | The first and the last frame's `time`, in epoch milliseconds |
+| `startMs`, `endMs` | UInt64 | The least and the greatest of the frames' `time`, in epoch milliseconds |
 | `codec` | text | `h264` |
 | `codecParams` | bytes | The stream's SPS and PPS as an avcC record |
 | `width`, `height` | UInt16 | The stored image's size in pixels, after any scaling |
@@ -227,7 +227,9 @@ A `FrameMeta` is one frame and the pose it was taken from:
 The stream is Annex-B: each access unit starts with an access unit delimiter and its NAL units carry
 start codes. The SPS and PPS are in-band, before every IDR, so the chunk's first access unit carries
 them and a chunk is self-contained. A chunk's frames are decoded in the order of
-`frames`, which is the order of `time`.
+`frames`, the order they were taken in. `time` is usually increasing in that order but need not
+be: a stamp can step back, and the SDK keeps each frame's own time rather than sort or clamp it,
+so a reader that sorts the frames by `time` decodes them out of order.
 
 `codecParams` is the avcC record for the stream's parameter sets. It gives a reader the codec
 string, `avc1.` followed by the record's profile, constraint and level bytes as six hexadecimal
@@ -270,7 +272,7 @@ A lidar record is one block of one sensor's scans or clouds. It is a `LidarPaylo
 | `userId`, `sessionId`, `sceneId`, `sceneVersion`, `formatVersion`, `sessionStartMs`, `sdkVersion` | | As for a camera chunk |
 | `sensorId` | text | The lidar's name from `lidars` |
 | `seq` | UInt32 | The lidar's block counter, from 0 in each session |
-| `startMs`, `endMs` | UInt64 | The first and the last record's `time`, in epoch milliseconds |
+| `startMs`, `endMs` | UInt64 | The least and the greatest of the records' `time`, in epoch milliseconds |
 | `frameId` | text | The tf frame the poses are for; the same for every record in the block |
 
 followed by exactly one of `scans`, a `ScanBlock`, or `clouds`, a `CloudBlock`.
@@ -291,7 +293,7 @@ of rays, starts a new block:
 | `rays` | UInt16 | The number of rays in each scan |
 | `rangeUnit` | enum | `millimetre` or `centimetre`: the size of one range code |
 | `encoding` | enum | `deltaShuffleZstd`, or `uint16` for the same codes with no transform |
-| `entries` | list of `ScanEntry` | One per scan, in time order |
+| `entries` | list of `ScanEntry` | One per scan, in the order they arrived, which is time order unless a stamp stepped back |
 | `ranges` | bytes | K x `rays` uint16 codes for K entries, laid out as `encoding` says |
 | `intensities` | bytes | Empty unless the lidar is configured to store them; otherwise the same layout as `ranges` |
 
@@ -356,7 +358,7 @@ its own, and its data is at most 8 MiB. The header describes every cloud in the 
 | `voxelLeafMm` | UInt16 | The downsampling cube's size in millimeters; 0 when the clouds were not downsampled |
 | `encoding` | enum | `planarDeltaShuffleZstd` or `planarZstd` |
 | `zstdLevel` | UInt8 | 0 when each cloud's block is stored as it is; above 0, each is zstd-compressed at that level |
-| `entries` | list of `CloudEntry` | One per cloud, in time order |
+| `entries` | list of `CloudEntry` | One per cloud, in the order they arrived, which is time order unless a stamp stepped back |
 | `data` | bytes | The clouds' blocks, back to back |
 
 A `CloudEntry` is one cloud and the pose it was taken from:

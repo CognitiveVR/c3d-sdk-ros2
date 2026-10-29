@@ -2977,6 +2977,8 @@ void Cognitive3DNode::RecordSelfTelemetry(double wire_time) {
                           static_cast<double>(stats.size_restarts));
     session->RecordSensor(prefix + "dropped_replay", wire_time,
                           static_cast<double>(stats.dropped_replay));
+    session->RecordSensor(prefix + "backward_stamps", wire_time,
+                          static_cast<double>(stats.backward_stamps));
     const auto rejected = too_large.find(capture->config().name);
     session->RecordSensor(prefix + "rejected_too_large", wire_time,
                           rejected == too_large.end() ? 0.0
@@ -2994,6 +2996,8 @@ void Cognitive3DNode::RecordSelfTelemetry(double wire_time) {
     session->RecordSensor(prefix + "pose_failures", wire_time,
                           static_cast<double>(stats.pose_failures));
     session->RecordSensor(prefix + "refused", wire_time, static_cast<double>(stats.refused));
+    session->RecordSensor(prefix + "backward_stamps", wire_time,
+                          static_cast<double>(stats.backward_stamps));
   }
 }
 
