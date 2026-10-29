@@ -404,13 +404,13 @@ whether a gap in the data is real. Counts marked "since configure" run across ev
 the node was configured; the others start over with each session.
 
 The camera series that count encoder events are `dropped_backlog`, `dropped_at_stop`,
-`encoder_restarts`, `gap_restarts` and `dropped_no_session`, each as
+`encoder_restarts`, `gap_restarts`, `size_restarts`, `dropped_replay` and `dropped_no_session`, each as
 `c3d.camera.<name>.<series>`. `dropped_at_stop` and `dropped_no_session` count since the node was
 configured, because the stop that ends a session comes after that session's last sample, so a drop
 there shows in the next session's series. `gap_restarts` climbs once per frame on a time-lapse
 camera, one slower than a frame every 3 seconds, and means nothing is wrong. An encoder restarted
 after a resolution or tf frame change, after a wall-clock step, at a session's start or at a stop
-counts in neither restart series.
+counts in none of the restart series.
 [Camera and lidar](camera-and-lidar.md#what-the-session-records) says what each counts.
 
 | series | meaning | counts |
@@ -428,7 +428,7 @@ counts in neither restart series.
 | `c3d.chunks_deferred` | chunks waiting behind the rest of the spool after failing on their own | current |
 | `c3d.upload_deferred_streams` | how many streams wait behind the rest of the spool after their chunks kept failing on their own | current |
 | `c3d.thread_exceptions` | exceptions caught on the session's own threads | since configure |
-| `c3d.camera_access_units_dropped` | encoded camera frames no video chunk could take: those after a chunk closed at its 32 MiB cap, until the encoder's next keyframe, and any that changed the image size, the tf frame or the stream's parameter sets without one. 0 on a healthy run | since configure |
+| `c3d.camera_access_units_dropped` | encoded camera frames no video chunk could take: those after a chunk closed early, until the encoder's next keyframe, a keyframe larger than 9 MiB, and any that changed the image size, the tf frame or the stream's parameter sets without one. 0 on a healthy run | since configure |
 | `c3d.pose_failures` | pose samples with no transform, or a stale one | this session |
 | `c3d.stale_poses` | pose samples skipped because the transform stopped advancing | this session |
 | `c3d.localisation_jumps` | localization jumps | this session |

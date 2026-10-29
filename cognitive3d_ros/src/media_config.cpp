@@ -45,6 +45,10 @@ std::string ValidateCameraConfig(const CameraConfig& camera) {
            std::to_string(kMaxCameraBitrateKbps) + ", got " +
            std::to_string(camera.max_bitrate_kbps);
   }
+  if (camera.replay_max_mb < 1 || camera.replay_max_mb > kMaxCameraReplayMb) {
+    return where + "replay_max_mb must be from 1 to " + std::to_string(kMaxCameraReplayMb) +
+           " MiB, got " + std::to_string(camera.replay_max_mb);
+  }
   if (camera.max_width_px < 0) {
     return where + "max_width_px must be 0 (never resize) or a positive width";
   }

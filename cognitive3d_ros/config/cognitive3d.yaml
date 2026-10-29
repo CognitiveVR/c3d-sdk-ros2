@@ -134,6 +134,7 @@
     #     preset: "ultrafast"           # or veryfast
     #     crf: 28                       # 24 to 32; lower is higher quality and more bytes
     #     max_bitrate_kbps: 0           # 0 is no cap
+    #     replay_max_mb: 192            # MiB of frames kept to encode again at a chunk's 8 MiB cap
     #     max_width_px: 640             # 0 never resizes
     #     frame: ""                     # empty uses header.frame_id
     #     hfov_degrees: 0.0             # full angles in degrees, sent with every chunk;

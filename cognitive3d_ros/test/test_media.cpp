@@ -135,6 +135,8 @@ struct FakeRecord {
   bool started = false;
   int feed_calls = 0;
   std::vector<std::size_t> fed_sizes;  // the frames Feed took, in bytes
+  std::vector<std::uint64_t> fed_tokens;
+  std::vector<std::uint64_t> refed_tokens;
   std::vector<double> finish_timeouts;
 };
 
@@ -148,6 +150,11 @@ struct FakeBehaviour {
   bool hold_units = false;
   // Units the reader was already delivering when a kill came: Finish(0) delivers them too.
   bool deliver_held_at_kill = false;
+  // Each unit is delivered only once this many more frames have been fed, as the real encoder's
+  // splitter holds a unit until the next one begins.
+  std::size_t lag_units = 0;
+  // The size of the unit for the encoder's n-th frame, fed or refed; unset is "unit-<n>".
+  std::function<std::size_t(int unit)> unit_bytes;
   // Reported once, from Finish, in place of what Finish would report itself.
   std::optional<c3d::EncoderFailure> finish_failure;
   double finish_sleep_s = 0.0;
@@ -184,22 +191,14 @@ class FakeH264Encoder : public c3d::IH264Encoder {
     if (!started_ || finished_ || dead_) return false;
     const int call = record_->feed_calls++;
     if (behaviour_.accept && !behaviour_.accept(call)) return false;
-    // The encoder's contract: exactly one frame of its own size.
-    EXPECT_EQ(bgr24.size(), static_cast<std::size_t>(settings_.width) * settings_.height * 3u);
-    record_->fed_sizes.push_back(bgr24.size());
-    c3d::EncodedAccessUnit unit;
-    unit.token = token;
-    unit.bytes = "unit-" + std::to_string(accepted_);
-    unit.keyframe = clock_() - started_at_ >= settings_.chunk_s * keyframes_;
-    if (unit.keyframe) ++keyframes_;
-    ++accepted_;
-    unit.codec_params = "\x01" "fake";
-    unit.encoder_settings = "fake " + settings_.preset + " crf=" + std::to_string(settings_.crf);
-    if (behaviour_.hold_units) {
-      held_.push_back(std::move(unit));
-    } else {
-      on_access_unit_(std::move(unit));
-    }
+    record_->fed_tokens.push_back(token);
+    Encode(bgr24, token);
+    return true;
+  }
+  bool Refeed(std::string bgr24, std::uint64_t token) override {
+    if (!started_ || finished_ || dead_) return false;
+    record_->refed_tokens.push_back(token);
+    Encode(bgr24, token);
     return true;
   }
   void Finish(double timeout_s) override {
@@ -228,6 +227,27 @@ class FakeH264Encoder : public c3d::IH264Encoder {
       failure.killed = true;
       failure.abandoned = abandoned;
       on_failure_(failure);
+    }
+  }
+  void Encode(const std::string& bgr24, std::uint64_t token) {
+    // The encoder's contract: exactly one frame of its own size.
+    EXPECT_EQ(bgr24.size(), static_cast<std::size_t>(settings_.width) * settings_.height * 3u);
+    record_->fed_sizes.push_back(bgr24.size());
+    c3d::EncodedAccessUnit unit;
+    unit.token = token;
+    unit.bytes = behaviour_.unit_bytes ? std::string(behaviour_.unit_bytes(accepted_), 'u')
+                                       : "unit-" + std::to_string(accepted_);
+    unit.keyframe = clock_() - started_at_ >= settings_.chunk_s * keyframes_;
+    if (unit.keyframe) ++keyframes_;
+    ++accepted_;
+    unit.codec_params = "\x01" "fake";
+    unit.encoder_settings = "fake " + settings_.preset + " crf=" + std::to_string(settings_.crf);
+    held_.push_back(std::move(unit));
+    if (behaviour_.hold_units) return;
+    while (held_.size() > behaviour_.lag_units) {
+      c3d::EncodedAccessUnit next = std::move(held_.front());
+      held_.erase(held_.begin());
+      on_access_unit_(std::move(next));
     }
   }
   // The child dying while the encoder runs: reported at once, from the caller's thread, which is
@@ -295,6 +315,7 @@ struct AccessUnitCall {
   c3d::VideoChunkContext context;
   std::string bytes;
   bool keyframe = false;
+  c3d::VideoUnitFate fate = c3d::VideoUnitFate::kDropped;
 };
 
 // A real runner, which also keeps every access unit it is handed: test_media cannot decode what the
@@ -302,19 +323,21 @@ struct AccessUnitCall {
 class RecordingRunner : public SessionRunner {
  public:
   using SessionRunner::SessionRunner;
-  void RecordCameraAccessUnit(const std::string& camera_id, std::uint64_t time_ms,
-                              std::uint32_t seq, const std::string& frame_id,
-                              const c3d::Vec3& ros_position, const c3d::Quat& ros_rotation,
-                              c3d::VideoChunkContext context, std::string access_unit,
-                              bool keyframe) override {
-    {
-      std::lock_guard<std::mutex> lock(mu_);
-      calls_.push_back(AccessUnitCall{camera_id, time_ms, seq, frame_id, ros_position,
-                                      ros_rotation, context, access_unit, keyframe});
-    }
-    SessionRunner::RecordCameraAccessUnit(camera_id, time_ms, seq, frame_id, ros_position,
-                                          ros_rotation, std::move(context),
-                                          std::move(access_unit), keyframe);
+  c3d::VideoUnitFate RecordCameraAccessUnit(const std::string& camera_id, std::uint64_t time_ms,
+                                            std::uint32_t seq, const std::string& frame_id,
+                                            const c3d::Vec3& ros_position,
+                                            const c3d::Quat& ros_rotation,
+                                            c3d::VideoChunkContext context,
+                                            std::string access_unit, bool keyframe) override {
+    AccessUnitCall call{camera_id, time_ms, seq, frame_id, ros_position, ros_rotation,
+                        context,   access_unit, keyframe};
+    call.fate = SessionRunner::RecordCameraAccessUnit(camera_id, time_ms, seq, frame_id,
+                                                      ros_position, ros_rotation,
+                                                      std::move(context), std::move(access_unit),
+                                                      keyframe);
+    std::lock_guard<std::mutex> lock(mu_);
+    calls_.push_back(std::move(call));
+    return calls_.back().fate;
   }
   std::vector<AccessUnitCall> calls() const {
     std::lock_guard<std::mutex> lock(mu_);
@@ -1408,6 +1431,120 @@ TEST_F(MediaTest, AResolutionOrFrameChangeRestartsTheEncoder) {
   EXPECT_EQ(calls[4].context.frame_id, "other_link");
   EXPECT_EQ(capture->stats().encoder_restarts, 0u);
   EXPECT_EQ(capture->stats().gap_restarts, 0u);
+}
+
+// A unit that would take its chunk past c3d::kMaxVideoChunkBytes is refused by the session. The next
+// frame kills that encoder at once -- no backoff, nothing counted as dropped or failed -- and a
+// replacement re-encodes the refused frame under its own token, so it keeps its seq, time and pose,
+// as the keyframe that opens the next chunk; the frame that triggered the restart follows it.
+TEST_F(MediaTest, AChunkAtItsByteCapRestartsTheEncoderAndReEncodesTheRefusedFrame) {
+  fakes_.next.unit_bytes = [](int) { return std::size_t{3} << 20; };
+  auto capture = OnFakes(Front());
+  ASSERT_TRUE(FrameAt(*capture, 0.0));
+  ASSERT_TRUE(FrameAt(*capture, 0.1));
+  ASSERT_TRUE(FrameAt(*capture, 0.2)) << "the frame whose unit is refused was fed";
+  EXPECT_EQ(fakes_.built(), 1u) << "restarted on the reader's delivery, not on the next frame";
+  ASSERT_TRUE(FrameAt(*capture, 0.3));
+  ASSERT_EQ(fakes_.built(), 2u);
+  EXPECT_EQ(fakes_.record(0).finish_timeouts, std::vector<double>{0.0});
+  EXPECT_EQ(fakes_.record(1).refed_tokens, std::vector<std::uint64_t>{2});
+  EXPECT_EQ(fakes_.record(1).fed_tokens, std::vector<std::uint64_t>{3});
+
+  const auto calls = runner_->calls();
+  ASSERT_EQ(calls.size(), 5u);
+  std::vector<std::uint32_t> seqs;
+  std::vector<bool> keyframes;
+  std::vector<c3d::VideoUnitFate> fates;
+  for (const auto& call : calls) {
+    seqs.push_back(call.seq);
+    keyframes.push_back(call.keyframe);
+    fates.push_back(call.fate);
+  }
+  EXPECT_EQ(seqs, (std::vector<std::uint32_t>{0, 1, 2, 2, 3}));
+  EXPECT_EQ(keyframes, (std::vector<bool>{true, false, false, true, false}));
+  EXPECT_EQ(fates[2], c3d::VideoUnitFate::kRefused);
+  EXPECT_EQ(fates[3], c3d::VideoUnitFate::kAppended);
+  EXPECT_EQ(calls[3].time_ms, calls[2].time_ms);
+  EXPECT_EQ(calls[3].position.x, calls[2].position.x);
+
+  const CameraStats stats = capture->stats();
+  EXPECT_EQ(stats.size_restarts, 1u);
+  EXPECT_EQ(stats.encoder_restarts + stats.gap_restarts, 0u);
+  EXPECT_EQ(stats.dropped_backlog + stats.dropped_at_stop + stats.dropped_replay, 0u);
+  EXPECT_EQ(stats.frames, 4u) << "a refused unit was counted as recorded";
+  ASSERT_EQ(warnings_.size(), 1u);
+  EXPECT_NE(warnings_[0].find("c3d.camera.front.size_restarts"), std::string::npos)
+      << warnings_[0];
+
+  ASSERT_TRUE(FrameAt(*capture, 0.4));
+  EXPECT_EQ(fakes_.built(), 2u);
+  EXPECT_EQ(warnings_.size(), 1u);
+}
+
+// The encoder hands a unit back only once the next has begun, so units after the refused one can
+// arrive before the restart, a keyframe among them: they are held, not recorded, and re-encoded
+// after it in order, with the frames the kill abandoned, so the chunks keep the frames' order.
+TEST_F(MediaTest, UnitsAfterTheRefusedOneAreHeldAndReEncodedInOrder) {
+  for (const bool delivered_at_kill : {true, false}) {
+    SCOPED_TRACE(delivered_at_kill ? "the last unit delivered at the kill" : "abandoned at it");
+    const std::size_t first = fakes_.built();
+    const std::size_t first_call = runner_->calls().size();
+    fakes_.next.unit_bytes = [](int) { return std::size_t{3} << 20; };
+    fakes_.next.lag_units = 1;
+    fakes_.next.deliver_held_at_kill = delivered_at_kill;
+    auto capture = OnFakes(Front());
+    // The fourth frame comes 3 s after the first, so the encoder makes it a keyframe.
+    for (const double t : {0.0, 0.1, 0.2, 3.1, 3.2}) ASSERT_TRUE(FrameAt(*capture, t)) << t;
+    ASSERT_EQ(fakes_.built(), first + 2);
+    EXPECT_EQ(fakes_.record(first + 1).refed_tokens, (std::vector<std::uint64_t>{2, 3}));
+    EXPECT_EQ(fakes_.record(first + 1).fed_tokens, std::vector<std::uint64_t>{4});
+    std::vector<std::uint32_t> recorded;
+    const auto calls = runner_->calls();
+    for (std::size_t k = first_call; k < calls.size(); ++k) {
+      if (calls[k].fate == c3d::VideoUnitFate::kAppended) recorded.push_back(calls[k].seq);
+    }
+    EXPECT_EQ(recorded, (std::vector<std::uint32_t>{0, 1, 2, 3}));
+    const CameraStats stats = capture->stats();
+    EXPECT_EQ(stats.size_restarts, 1u);
+    EXPECT_EQ(stats.dropped_at_stop + stats.dropped_replay, 0u);
+    capture->StopEncoder();
+    capture->Reset();
+  }
+}
+
+// A frame the replay store had no room for cannot be re-encoded: it is dropped and counted, and the
+// replacement starts from the next frame.
+TEST_F(MediaTest, AFrameTheReplayStoreCouldNotKeepIsDroppedAndCounted) {
+  fakes_.next.unit_bytes = [](int) { return std::size_t{3} << 20; };
+  CameraConfig config = Front();
+  config.max_width_px = 0;
+  config.replay_max_mb = 1;
+  auto capture = OnFakes(config);
+  // 1024 x 768 is 1.125 MiB as yuv420p, more than the whole store.
+  for (int i = 0; i < 4; ++i) ASSERT_TRUE(FrameAt(*capture, 0.1 * i, 1024, 768)) << "frame " << i;
+  ASSERT_EQ(fakes_.built(), 2u);
+  EXPECT_TRUE(fakes_.record(1).refed_tokens.empty());
+  const CameraStats stats = capture->stats();
+  EXPECT_EQ(stats.dropped_replay, 1u);
+  EXPECT_EQ(stats.size_restarts, 1u);
+  const auto calls = runner_->calls();
+  ASSERT_EQ(calls.size(), 4u);
+  EXPECT_EQ(calls[3].seq, 3u);
+  EXPECT_TRUE(calls[3].keyframe);
+}
+
+// A stop that ends the session before the restart loses the held units: counted in dropped_at_stop,
+// with no restart.
+TEST_F(MediaTest, AStopBeforeTheSizeRestartCountsTheHeldUnitsAsDroppedAtStop) {
+  fakes_.next.unit_bytes = [](int) { return std::size_t{3} << 20; };
+  auto capture = OnFakes(Front());
+  for (int i = 0; i < 3; ++i) ASSERT_TRUE(FrameAt(*capture, 0.1 * i));
+  capture->StopEncoder();
+  EXPECT_EQ(capture->stats().dropped_at_stop, 1u);
+  EXPECT_EQ(capture->stats().size_restarts, 0u);
+  ASSERT_TRUE(FrameAt(*capture, 0.3));
+  EXPECT_EQ(fakes_.built(), 2u);
+  EXPECT_TRUE(fakes_.record(1).refed_tokens.empty()) << "a stop kept the refused frame";
 }
 
 // The encoder stamps frames by the wall clock, so a step in it -- NTP correcting a clock that booted

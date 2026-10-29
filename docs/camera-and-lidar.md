@@ -60,6 +60,17 @@ chunk's first frame. The encoder times a chunk's 3 seconds by the wall clock, so
 clock steps by more than a second while a camera records, as when NTP corrects a stale clock, the
 node restarts that camera's encoder, which starts a new chunk, and logs it once per session.
 
+A chunk also ends before its encoded frames would pass 8 MiB, because the platform refuses an
+object larger than 10 MiB, and an object it refuses is deleted. The node then restarts the
+camera's encoder and encodes again, from a keyframe that opens the next chunk, every frame from the
+one that did not fit on, so no frame is lost and each keeps its `time`, `seq` and pose. Each such
+restart counts in `size_restarts` and is logged once per session. To do this the node keeps every
+frame it feeds the encoder until that frame is in a chunk, as yuv420p at 1.5 bytes a pixel, in up
+to `replay_max_mb` of memory per camera, 192 MiB by default: a frame that finds that memory full is
+not kept, and is dropped and counted in `dropped_replay` if it has to be encoded again. A chunk's
+first frame, a keyframe, is never encoded again: up to 9 MiB it is kept as a chunk of its own, and
+a larger one is dropped and counted in `c3d.camera_access_units_dropped`.
+
 Three parameters set the encoder's trade of bytes against quality and CPU:
 
 | parameter | default | what |
@@ -472,13 +483,15 @@ series, except where a row says otherwise:
 | `c3d.camera.<name>.dropped_no_session` | Encoded frames that arrived when no session was open. Counted since the node was configured, for the same reason. It reads 0 when the node stops the encoder before it ends a session, as it does on every path |
 | `c3d.camera.<name>.encoder_restarts` | Encoders replaced after one died, or after a wedged one was killed |
 | `c3d.camera.<name>.gap_restarts` | Encoders replaced after the camera was quiet for 3 seconds or more. A time-lapse camera, slower than a frame every 3 seconds, adds one for every frame, and that means nothing is wrong |
+| `c3d.camera.<name>.size_restarts` | Encoders replaced because a chunk reached 8 MiB before its time was up; see [How a camera is encoded](#how-a-camera-is-encoded) |
+| `c3d.camera.<name>.dropped_replay` | Frames a size restart could not encode again, because `replay_max_mb` had no room for them or the replacement encoder could not start |
 | `c3d.lidar.<name>.dropped_oversize` | Clouds dropped whole for exceeding `max_points` |
 | `c3d.lidar.<name>.dropped_range` | Points dropped for being out of `int16_mm` range |
 
 Messages the rate limit drops are not counted. A low frame count with `refused` at zero is the rate
 limit doing its job; a rising `refused` is a configuration to fix. A restart after a change of image
 size or of the camera's tf frame, after a wall-clock step, at a session's start or at a stop counts in
-neither `encoder_restarts` nor `gap_restarts`.
+none of `encoder_restarts`, `gap_restarts` and `size_restarts`.
 
 These counts reach the session only. The report line and `~/diagnostics` carry nothing for a camera
 or lidar; see [The report line](sessions.md#the-report-line).

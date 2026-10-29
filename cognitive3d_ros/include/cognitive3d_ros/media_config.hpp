@@ -25,6 +25,10 @@ struct CameraConfig {
   // A bitrate cap in kilobits per second, passed as -maxrate with a buffer of
   // twice that. 0 is no cap; at most kMaxCameraBitrateKbps.
   int max_bitrate_kbps = 0;
+  // The memory, in MiB, that holds the frames fed to the encoder whose access units are not yet in
+  // a chunk, so that a chunk that reaches its byte cap can be ended and those frames re-encoded
+  // from a new keyframe. 1 to kMaxCameraReplayMb.
+  int replay_max_mb = 192;
   // 0 means never resize. Above 0, a wider frame is scaled down with the aspect
   // ratio kept -- and the width that reaches the wire is the one that was sent,
   // cropped to even, not the one that was configured.
@@ -55,6 +59,7 @@ constexpr int kMinCameraCrf = 24;
 constexpr int kMaxCameraCrf = 32;
 // 1 Gbit/s: far past anything a robot's camera needs, and short of where twice it overflows an int.
 constexpr int kMaxCameraBitrateKbps = 1000000;
+constexpr int kMaxCameraReplayMb = 16384;
 
 struct LidarConfig {
   std::string name;

@@ -506,6 +506,47 @@ TEST(H264Encoder, AFullQueueDropsTheFrameAndCounts) {
   EXPECT_EQ(c.FailureCount(), 1u);
 }
 
+// A replacement encoder re-encodes every frame its predecessor's chunk refused, which can be more
+// than the queue holds: Refeed takes them all, and none is counted as dropped.
+TEST(H264Encoder, RefeedTakesMoreFramesThanTheQueueHolds) {
+  ScratchDir dir;
+  H264EncoderSettings settings = Small(30.0, 3.0);
+  settings.ffmpeg_path = dir.Script("never_reads.sh", "exec sleep 30");
+  Collector c;
+  auto encoder = NewEncoder(settings, &c);
+  std::string error;
+  ASSERT_TRUE(encoder->Start(&error)) << error;
+  for (std::uint64_t i = 0; i < 3 * kH264QueueFrames; ++i) {
+    EXPECT_TRUE(encoder->Refeed(Frame(64, 48, static_cast<int>(i)), i)) << "frame " << i;
+  }
+  const H264EncoderStats stats = encoder->stats();
+  EXPECT_EQ(stats.fed, 3 * kH264QueueFrames);
+  EXPECT_EQ(stats.dropped_queue_full, 0u);
+  encoder->Finish(0.0);
+  EXPECT_FALSE(encoder->Refeed(Frame(64, 48, 0), 99)) << "taken after Finish";
+}
+
+TEST(H264Encoder, RefedFramesComeBackInOrderBeforeTheNextFed) {
+  REQUIRE_FFMPEG();
+  Collector c;
+  auto encoder = NewEncoder(Small(30.0, 3.0), &c);
+  std::string error;
+  ASSERT_TRUE(encoder->Start(&error)) << error;
+  const std::uint64_t refed = 3 * kH264QueueFrames;
+  for (std::uint64_t i = 0; i < refed; ++i) {
+    ASSERT_TRUE(encoder->Refeed(Frame(64, 48, static_cast<int>(i)), i)) << "frame " << i;
+  }
+  ASSERT_TRUE(WaitUntil([&] { return c.UnitCount() + 2 >= refed; }, 10000ms));
+  ASSERT_TRUE(encoder->Feed(Frame(64, 48, 99), refed));
+  encoder->Finish(5.0);
+  EXPECT_EQ(c.FailureCount(), 0u) << c.FirstFailure();
+  std::vector<std::uint64_t> expected;
+  for (std::uint64_t i = 0; i <= refed; ++i) expected.push_back(i);
+  EXPECT_EQ(c.Tokens(), expected);
+  ASSERT_FALSE(c.KeyframeIndices().empty());
+  EXPECT_EQ(c.KeyframeIndices().front(), 0u) << "the first refed frame is not a keyframe";
+}
+
 TEST(H264Encoder, AMissingBinaryFailsStartWithTheReason) {
   H264EncoderSettings settings = Small(30.0, 3.0);
   settings.ffmpeg_path = "/nonexistent/ffmpeg";

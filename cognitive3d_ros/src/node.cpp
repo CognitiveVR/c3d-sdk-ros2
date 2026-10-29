@@ -1001,6 +1001,8 @@ bool Cognitive3DNode::LoadMediaConfig(std::string* error) {
     if (!has_parameter(key + ".crf")) declare_parameter<int>(key + ".crf", defaults.crf);
     if (!has_parameter(key + ".max_bitrate_kbps"))
       declare_parameter<int>(key + ".max_bitrate_kbps", defaults.max_bitrate_kbps);
+    if (!has_parameter(key + ".replay_max_mb"))
+      declare_parameter<int>(key + ".replay_max_mb", defaults.replay_max_mb);
     if (!has_parameter(key + ".max_width_px")) declare_parameter<int>(key + ".max_width_px", 640);
     if (!has_parameter(key + ".frame")) declare_parameter<std::string>(key + ".frame", "");
     DeclareDouble(key + ".hfov_degrees", 0.0);
@@ -1083,6 +1085,8 @@ bool Cognitive3DNode::LoadMediaConfig(std::string* error) {
       return false;
     }
     camera.max_bitrate_kbps = static_cast<int>(narrowed);
+    if (!ReadInt(key + ".replay_max_mb", 1, kMaxCameraReplayMb, &narrowed, error)) return false;
+    camera.replay_max_mb = static_cast<int>(narrowed);
     if (!ReadInt(key + ".max_width_px", 0, std::numeric_limits<int>::max(), &narrowed, error)) {
       return false;
     }
@@ -2968,6 +2972,10 @@ void Cognitive3DNode::RecordSelfTelemetry(double wire_time) {
                           static_cast<double>(stats.encoder_restarts));
     session->RecordSensor(prefix + "gap_restarts", wire_time,
                           static_cast<double>(stats.gap_restarts));
+    session->RecordSensor(prefix + "size_restarts", wire_time,
+                          static_cast<double>(stats.size_restarts));
+    session->RecordSensor(prefix + "dropped_replay", wire_time,
+                          static_cast<double>(stats.dropped_replay));
   }
   for (const auto& capture : lidars_) {
     const std::string prefix = "c3d.lidar." + capture->config().name + ".";

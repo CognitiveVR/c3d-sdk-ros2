@@ -95,8 +95,9 @@ class SessionRunner {
   //
   // One encoded frame. Called on a camera encoder's reader thread, which Session's own lock makes
   // safe. `context.frame_id` is set to `frame_id`. Virtual so a test can see what a camera hands
-  // the session, which no reader outside core can decode.
-  virtual void RecordCameraAccessUnit(const std::string& camera_id, std::uint64_t time_ms,
+  // the session, which no reader outside core can decode. The fate is Session's; kDropped with no
+  // session.
+  virtual c3d::VideoUnitFate RecordCameraAccessUnit(const std::string& camera_id, std::uint64_t time_ms,
                                       std::uint32_t seq, const std::string& frame_id,
                                       const c3d::Vec3& ros_position, const c3d::Quat& ros_rotation,
                                       c3d::VideoChunkContext context, std::string access_unit,

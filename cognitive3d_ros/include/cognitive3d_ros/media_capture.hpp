@@ -14,6 +14,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -124,10 +125,14 @@ struct CameraStats {
   std::uint64_t dropped_at_stop = 0;
   // Every restart counts in exactly one of these, when the replacement starts: encoder_restarts
   // after a failure or a wedge, gap_restarts after a quiet gap on a healthy encoder, which a
-  // paused or time-lapse camera makes. A restart after a size or frame change, a wall-clock step, a
-  // stop or a Reset counts in neither.
+  // paused or time-lapse camera makes, size_restarts after a chunk reached kMaxVideoChunkBytes. A
+  // restart after a size or frame change, a wall-clock step, a stop or a Reset counts in none.
   std::uint64_t encoder_restarts = 0;
   std::uint64_t gap_restarts = 0;
+  std::uint64_t size_restarts = 0;
+  // Frames a size restart could not re-encode: not kept for want of replay_max_mb, or the
+  // replacement could not take them.
+  std::uint64_t dropped_replay = 0;
   // Access units that arrived with no session to take them.
   //
   // This and dropped_at_stop count for the life of the capture, not per session: the stop that
@@ -184,6 +189,26 @@ struct PreparedFrame {
   std::uint16_t height = 0;
 };
 
+// The frames an encoder was fed whose access units are not yet in a chunk, as yuv420p, half of
+// bgr24, by token. Bounded in bytes: a frame that would take it past the budget is not kept.
+class ReplayStore {
+ public:
+  explicit ReplayStore(std::uint64_t budget_bytes) : budget_(budget_bytes) {}
+  // False, and nothing kept, past the budget.
+  bool Put(std::uint64_t token, std::string yuv420p);
+  // False when `token` is not kept.
+  bool Copy(std::uint64_t token, std::string* yuv420p) const;
+  void Release(std::uint64_t token);
+  void Clear();
+  std::size_t size() const { return frames_.size(); }
+  std::uint64_t bytes() const { return bytes_; }
+
+ private:
+  std::map<std::uint64_t, std::string> frames_;
+  std::uint64_t bytes_ = 0;
+  std::uint64_t budget_ = 0;
+};
+
 // One configured camera: the rate gate, the frame preparation, the encoder and the per-sensor
 // counters.
 //
@@ -191,8 +216,8 @@ struct PreparedFrame {
 // pairs each with the pose and time its frame was fed with, and records it into the session. The
 // node's one callback thread feeds, starts and stops the encoder; the encoder's reader thread
 // delivers. One encoder instance at a time, and a new one whenever the stream it makes could not
-// continue the old: a size or frame change, a wall-clock step, a quiet gap, a failure or a wedge --
-// see FeedFrame.
+// continue the old: a chunk that reached its byte cap, a size or frame change, a wall-clock step, a
+// quiet gap, a failure or a wedge -- see FeedFrame.
 class CameraCapture {
  public:
   CameraCapture(CameraConfig config, std::string ffmpeg_path,
@@ -269,7 +294,7 @@ class CameraCapture {
 
  private:
   // Why the next encoder will start, which decides what that start counts as.
-  enum class StartReason { kNone, kFailure, kWedge, kGap, kOther };
+  enum class StartReason { kNone, kFailure, kWedge, kGap, kSize, kOther };
   // What an access unit is recorded with: the frame's time, seq and pose in ROS axes, and its
   // chunk context without the parameter sets, which ride on the unit itself.
   struct Pending {
@@ -289,6 +314,15 @@ class CameraCapture {
   bool FeedFrame(PreparedFrame frame, const c3d::SensorEntry& entry,
                  const c3d::VideoChunkContext& context, const MediaEnvironment& environment,
                  SessionRunner& runner);
+  // A new instance for frames of this size and frame, counted by pending_start_reason_. False when
+  // it cannot start: the backoff is then set and the reason warned once.
+  bool StartEncoder(std::uint16_t width, std::uint16_t height, const std::string& frame_id,
+                    double wall_offset, double now, const MediaEnvironment& environment);
+  // The size row: kills the instance whose chunk refused a unit, starts another and re-encodes,
+  // in order, every frame from the refused one on.
+  void RestartForSize(double now, double wall_offset, const MediaEnvironment& environment);
+  // StopEncoder, keeping the pending frames and the replay store when `for_replay`.
+  void StopEncoder(double timeout_s, bool for_replay);
   void OnAccessUnit(c3d::EncodedAccessUnit unit);
   void OnEncoderFailure(const c3d::EncoderFailure& failure);
   void AddToStats(std::uint64_t CameraStats::*field, std::uint64_t amount = 1);
@@ -326,6 +360,14 @@ class CameraCapture {
   double encoder_wall_offset_ = 0.0;
   std::map<std::uint64_t, Pending> pending_;
   std::uint64_t next_token_ = 0;
+  ReplayStore replay_;
+  // The first token the session refused, and the units delivered since, held for the size row to
+  // re-encode; null when none is waiting.
+  std::optional<std::uint64_t> refused_from_;
+  std::uint64_t held_units_ = 0;
+  // The size row's own stop is under way: its kill is no failure.
+  bool size_stop_ = false;
+  bool size_warned_ = false;
   // Set by FeedFrame and cleared by StopEncoder; a unit that finds it null is counted in
   // dropped_no_session.
   SessionRunner* runner_ = nullptr;

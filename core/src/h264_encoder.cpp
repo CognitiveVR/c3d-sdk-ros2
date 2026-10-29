@@ -269,6 +269,7 @@ class FfmpegH264Encoder final : public IH264Encoder {
 
   bool Start(std::string* error) override;
   bool Feed(std::string bgr24, std::uint64_t token) override;
+  bool Refeed(std::string bgr24, std::uint64_t token) override;
   void Finish(double timeout_s) override;
   std::string codec_params() const override {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -389,6 +390,16 @@ bool FfmpegH264Encoder::Feed(std::string bgr24, std::uint64_t token) {
     ++stats_.dropped_queue_full;
     return false;
   }
+  queue_.push_back(std::move(bgr24));
+  tokens_.push_back(token);
+  ++stats_.fed;
+  frames_cv_.notify_one();
+  return true;
+}
+
+bool FfmpegH264Encoder::Refeed(std::string bgr24, std::uint64_t token) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!started_ || finishing_ || child_failed_) return false;
   queue_.push_back(std::move(bgr24));
   tokens_.push_back(token);
   ++stats_.fed;

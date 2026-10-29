@@ -965,6 +965,36 @@ TEST_F(BinaryStreamTest, AForcedCloseDropsTheFramesUntilTheNextKeyframe) {
   EXPECT_EQ(BytesOf(second.camera().getData()), "i5p6");
 }
 
+// A unit that would pass the chunk's cap is refused, not dropped: the session says so, so that the
+// caller re-encodes it from a keyframe, and counts it apart from the frames it kept.
+TEST_F(BinaryStreamTest, AUnitPastTheChunkCapIsRefusedAndCountedApart) {
+  Build();
+  const VideoChunkContext context = SomeContext();
+  EXPECT_EQ(session_->RecordCameraAccessUnit("front", EntryAt(100, 0), context,
+                                             std::string(kMaxVideoChunkBytes, 'i'), true),
+            VideoUnitFate::kAppended);
+  EXPECT_EQ(session_->RecordCameraAccessUnit("front", EntryAt(133, 1), context, "p1", false),
+            VideoUnitFate::kRefused);
+  EXPECT_EQ(session_->RecordCameraAccessUnit("front", EntryAt(166, 2), context, "p2", false),
+            VideoUnitFate::kRefused);
+  Stats stats = session_->stats();
+  EXPECT_EQ(stats.camera_access_units_refused, 2u);
+  EXPECT_EQ(stats.camera_access_units_dropped, 0u);
+  EXPECT_EQ(stats.camera_frames, 1u);
+  EXPECT_EQ(stats.camera_chunks, 1u) << "the full chunk was not closed";
+  EXPECT_EQ(session_->RecordCameraAccessUnit("front", EntryAt(133, 1), context, "i1", true),
+            VideoUnitFate::kAppended);
+  session_->End();
+  EXPECT_EQ(session_->RecordCameraAccessUnit("front", EntryAt(200, 3), context, "i3", true),
+            VideoUnitFate::kDropped)
+      << "a unit with no session reads as kept";
+  session_->PumpUploads();
+  auto chunks = CameraBodies("front");
+  ASSERT_EQ(chunks.size(), 2u);
+  PackedBody second(chunks[1]);
+  EXPECT_EQ(BytesOf(second.camera().getData()), "i1");
+}
+
 namespace {
 // A consumer's logger may call back into the Session it logs for on any line, including the one
 // Begin logs once the session is live and before Begin spools its first batch.

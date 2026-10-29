@@ -89,6 +89,9 @@ class IH264Encoder {
   // the frame dropped and counted; also false, and not counted, before Start, after Finish and
   // once the child has died.
   virtual bool Feed(std::string bgr24, std::uint64_t token) = 0;
+  // As Feed, without the kH264QueueFrames bound: for the frames a replacement encoder re-encodes,
+  // which can be more than the queue holds. False only when Feed would be false and not count.
+  virtual bool Refeed(std::string bgr24, std::uint64_t token) = 0;
   // One deadline, now + timeout_s, over the whole shutdown: no new Feed is accepted; the writer
   // keeps draining the frames already accepted until the deque is empty, then stdin is closed; the
   // reader keeps delivering access units until the child exits; at the deadline whatever is left is

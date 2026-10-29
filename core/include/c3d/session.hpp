@@ -82,6 +82,9 @@ struct Stats {
   // keyframes, until the encoder's next keyframe, and any that changed the stream's
   // size, frame or parameter sets without one.
   std::uint64_t camera_access_units_dropped = 0;
+  // Access units refused because they would have taken their chunk past
+  // kMaxVideoChunkBytes. The caller re-encodes them, so they are not lost.
+  std::uint64_t camera_access_units_refused = 0;
 };
 
 // A Cognitive3D session.
@@ -184,16 +187,19 @@ class Session {
   // `access_unit` is one encoded frame. A keyframe closes the camera's open chunk
   // and opens the next; any other frame joins the open chunk, or is dropped and
   // counted in Stats::camera_access_units_dropped when no chunk is open. One that
-  // would take the chunk past kMaxVideoChunkBytes closes it and is dropped.
+  // would take the chunk past kMaxVideoChunkBytes closes it and is refused, and so
+  // is every non-keyframe after it until a keyframe: the caller is to restart its
+  // encoder and re-encode them, from the refused one on (see VideoChunkAssembler).
+  // The fate is kDropped also when no session is active.
   //
   // `context.hfov_deg` and `vfov_deg` are the camera's field of view (see
   // CameraFov), and 0 by 0 records none; a chunk carries its first frame's. A field
   // of view IsKnownCameraFov refuses is recorded as 0 by 0 as well -- the frame is
   // kept, since losing a picture over its metadata is the worse failure -- and the
   // first such frame per camera in a session is logged as a warning.
-  void RecordCameraAccessUnit(const std::string& camera_id, const SensorEntry& entry,
-                              const VideoChunkContext& context, std::string access_unit,
-                              bool keyframe);
+  VideoUnitFate RecordCameraAccessUnit(const std::string& camera_id, const SensorEntry& entry,
+                                       const VideoChunkContext& context, std::string access_unit,
+                                       bool keyframe);
   // A scan with no ranges, or with more than scanblock::kMaxRaysPerScan, is refused
   // and counted in Stats::records_dropped.
   void RecordLaserScan(const std::string& sensor_id, std::uint64_t time_ms, std::uint32_t seq,

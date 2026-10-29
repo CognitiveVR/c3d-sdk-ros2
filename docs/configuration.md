@@ -270,6 +270,7 @@ what is refused.
 | `camera.<name>.preset` | string | `"ultrafast"` | — | x264's speed preset, `ultrafast` or `veryfast`. `veryfast` spends more CPU for fewer bytes. |
 | `camera.<name>.crf` | int | `28` | — | The constant rate factor, 24 to 32; lower is higher quality and more bytes. |
 | `camera.<name>.max_bitrate_kbps` | int | `0` | kilobits per second | A cap on the video's bitrate, at most 1,000,000 (1 Gbit/s). `0` sets no cap. Must not be negative. |
+| `camera.<name>.replay_max_mb` | int | `192` | MiB | Memory that keeps the frames fed to the encoder until they are in a chunk, so that a chunk that reaches 8 MiB can end and those frames be encoded again. 1 to 16,384. |
 | `camera.<name>.max_width_px` | int | `640` | pixels | Wider frames are scaled down to this width, keeping the aspect ratio. `0` never resizes. |
 | `camera.<name>.frame` | string | `""` | — | The tf frame each frame's pose is looked up for. Empty uses the message's `header.frame_id`. A frame whose pose cannot be looked up is dropped, so a frame that never resolves records nothing. |
 | `camera.<name>.hfov_degrees` | double | `0.0` | degrees | The camera's horizontal field of view, a full angle, sent with every chunk. `0` is unset. Set it with `vfov_degrees` or not at all; above 0 and below 180. Set, it wins over the CameraInfo. See [A camera's field of view](camera-and-lidar.md#a-cameras-field-of-view). |

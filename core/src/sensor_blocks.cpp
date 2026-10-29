@@ -42,23 +42,39 @@ VideoChunkAssembler::VideoChunkAssembler(std::string camera_id)
 
 std::vector<CameraChunkRecord> VideoChunkAssembler::Append(const SensorEntry& entry,
                                                           const VideoChunkContext& context,
-                                                          std::string access_unit,
-                                                          bool keyframe) {
+                                                          std::string access_unit, bool keyframe,
+                                                          VideoUnitFate* fate) {
   std::vector<CameraChunkRecord> out;
+  VideoUnitFate unused = VideoUnitFate::kAppended;
+  VideoUnitFate& result = fate ? *fate : unused;
+  result = VideoUnitFate::kDropped;
   if (keyframe) {
+    refusing_ = false;
     out = TakeOpen(open_);
+    if (access_unit.size() > kMaxVideoFirstUnitBytes) {
+      ++dropped_before_keyframe_;
+      return out;
+    }
     open_.emplace();
     open_->camera_id = camera_id_;
     open_->chunk_seq = next_seq_++;
     open_->start_ms = entry.time_ms;
     open_->end_ms = entry.time_ms;
     open_->context = context;
+  } else if (refusing_) {
+    result = VideoUnitFate::kRefused;
+    return out;
   } else if (!open_ || !SameStream(open_->context, context)) {
     ++dropped_before_keyframe_;
     return out;
   } else if (open_->data.size() + access_unit.size() > kMaxVideoChunkBytes) {
     out = TakeOpen(open_);
-    ++dropped_before_keyframe_;
+    if (fate) {
+      refusing_ = true;
+      result = VideoUnitFate::kRefused;
+    } else {
+      ++dropped_before_keyframe_;
+    }
     return out;
   }
   FrameMeta frame;
@@ -71,6 +87,7 @@ std::vector<CameraChunkRecord> VideoChunkAssembler::Append(const SensorEntry& en
   open_->frames.push_back(frame);
   open_->data += access_unit;
   open_->end_ms = std::max(open_->end_ms, entry.time_ms);
+  result = VideoUnitFate::kAppended;
   return out;
 }
 

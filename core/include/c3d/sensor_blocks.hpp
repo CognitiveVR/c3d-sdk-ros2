@@ -21,10 +21,17 @@ constexpr double kVideoChunkSeconds = 3.0;
 constexpr std::uint64_t kScanBlockMilliseconds = 3000;
 constexpr std::uint64_t kCloudObjectMaxBytes = 2ull * 1024 * 1024;
 constexpr std::uint64_t kCloudObjectMilliseconds = 5000;
-// The most an open video chunk's data, or an open scan block's codes, holds before it is closed,
-// whatever the keyframes or the stamps do: a stream with no keyframe, or a lidar whose stamp stops
-// advancing, would otherwise grow one without bound.
-constexpr std::uint64_t kMaxVideoChunkBytes = 32ull * 1024 * 1024;
+// The data gateway answers 413 to a request body larger than this, and an object it refuses is
+// deleted, so no object is built that could reach it.
+constexpr std::uint64_t kMaxObjectBytes = 10ull * 1024 * 1024;
+// The most an open video chunk's data holds; the rest of kMaxObjectBytes is the envelope, a
+// FrameMeta per frame and what packing adds.
+constexpr std::uint64_t kMaxVideoChunkBytes = 8ull * 1024 * 1024;
+// A chunk's first unit is never refused for size: its re-encode would be as large, and refused
+// again. One up to this is kept as a chunk of its own; a larger one is dropped.
+constexpr std::uint64_t kMaxVideoFirstUnitBytes = 9ull * 1024 * 1024;
+// The most an open scan block's codes hold before it is closed, whatever the stamps do: a lidar
+// whose stamp stops advancing would otherwise grow one without bound.
 constexpr std::uint64_t kMaxScanBlockCodeBytes = 32ull * 1024 * 1024;
 // The idle closes have no constant here: the caller passes them in from its configuration.
 
@@ -64,16 +71,30 @@ struct CameraChunkRecord {
   std::string data;
 };
 
+// What became of one access unit handed to VideoChunkAssembler::Append.
+enum class VideoUnitFate {
+  kAppended,
+  kDropped,  // counted in dropped_before_keyframe()
+  // Not kept and not counted: the caller is to re-encode it, and every unit after it, from a new
+  // keyframe.
+  kRefused,
+};
+
 class VideoChunkAssembler {
  public:
   explicit VideoChunkAssembler(std::string camera_id);
   // A chunk starts at a keyframe, which is what makes it decodable on its own. A keyframe closes
-  // the open chunk (returned) and opens the next. A non-keyframe with no open chunk, or one whose
-  // width, height, frame_id or codec_params differ from the open chunk's, is dropped and counted.
+  // the open chunk (returned) and opens the next; one larger than kMaxVideoFirstUnitBytes closes
+  // the open chunk and is dropped. A non-keyframe with no open chunk, or one whose width, height,
+  // frame_id or codec_params differ from the open chunk's, is dropped and counted.
+  //
   // A non-keyframe that would take the open chunk's data past kMaxVideoChunkBytes closes it
-  // (returned) and is dropped and counted, as is every non-keyframe after it until a keyframe.
+  // (returned). With `fate`, the unit is then refused, and so is every non-keyframe after it until
+  // a keyframe. Without, it is dropped and counted, as is every non-keyframe after it until a
+  // keyframe.
   std::vector<CameraChunkRecord> Append(const SensorEntry& entry, const VideoChunkContext& context,
-                                        std::string access_unit, bool keyframe);
+                                        std::string access_unit, bool keyframe,
+                                        VideoUnitFate* fate = nullptr);
   // 0 or 1; a closed chunk ends the GOP early and is still decodable.
   std::vector<CameraChunkRecord> Close();
   std::uint64_t dropped_before_keyframe() const;
@@ -85,6 +106,7 @@ class VideoChunkAssembler {
   std::uint32_t next_seq_ = 0;
   std::optional<CameraChunkRecord> open_;
   std::uint64_t dropped_before_keyframe_ = 0;
+  bool refusing_ = false;
 };
 
 struct ScanBlockRecord {

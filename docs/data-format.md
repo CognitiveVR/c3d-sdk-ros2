@@ -243,8 +243,10 @@ digits (`avc1.PPCCLL`), and the profile. It is not a decoder configuration for t
 
 Every frame in a chunk has the same size, and a change of image size or of the tf frame ends the
 chunk early and starts the next one. A camera whose field of view changes records a different angle
-in each chunk, not in each frame. A chunk also ends before its `data` would pass 32 MiB, and the
-camera's frames until the encoder's next keyframe are then dropped and counted in
+in each chunk, not in each frame. A chunk also ends before its `data` would pass 8 MiB, and the
+next chunk starts with that frame, encoded again as a keyframe, so a chunk can be shorter than its
+time without a frame missing. A chunk's first frame is never encoded again: a keyframe over 9 MiB is
+dropped, with the camera's frames until the next keyframe, and counted in
 `c3d.camera_access_units_dropped`.
 
 Camera and lidar objects upload one at a time, each naming its session id, device id, scene id,

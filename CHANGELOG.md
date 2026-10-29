@@ -18,6 +18,10 @@ marks as provisional may change in a minor release, and its entry here says how 
 - Health series per camera, `dropped_backlog`, `dropped_at_stop`, `encoder_restarts`,
   `gap_restarts` and `dropped_no_session`, as `c3d.camera.<name>.<series>`, and
   `c3d.camera_access_units_dropped`.
+- A camera's chunk ends before it would pass 8 MiB, under the platform's 10 MiB per object: the
+  encoder is restarted and the frames since encoded again from a keyframe, counted per camera in
+  `size_restarts`, with `dropped_replay` for any it could not keep. `camera.<name>.replay_max_mb`,
+  default 192, bounds the memory that keeps them.
 - `doctor`'s `camera encoder` check, which is FATAL when a camera is configured and `ffmpeg` cannot
   run. Its `camera/<name>` check reports an estimated size and rate.
 

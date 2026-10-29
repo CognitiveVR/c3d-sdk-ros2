@@ -2137,9 +2137,10 @@ void Session::RemoveDynamic(const std::string& id, double t, const Vec3& positio
   RecordDynamic(id, t, position, rotation, std::nullopt, props);
 }
 
-void Session::RecordCameraAccessUnit(const std::string& camera_id, const SensorEntry& entry,
-                                     const VideoChunkContext& context, std::string access_unit,
-                                     bool keyframe) {
+VideoUnitFate Session::RecordCameraAccessUnit(const std::string& camera_id,
+                                              const SensorEntry& entry,
+                                              const VideoChunkContext& context,
+                                              std::string access_unit, bool keyframe) {
   const CameraFov fov{context.hfov_deg, context.vfov_deg};
   const bool fov_known = IsKnownCameraFov(fov);
   // "Not recorded" is 0 by 0, the default, and is no fault; anything else refused is.
@@ -2152,22 +2153,28 @@ void Session::RecordCameraAccessUnit(const std::string& camera_id, const SensorE
   }
   const VideoChunkContext& recorded = without_fov ? *without_fov : context;
   bool warn_fov = false;
+  VideoUnitFate fate = VideoUnitFate::kDropped;
   {
     std::lock_guard<std::mutex> lock(impl_->mu);
-    if (!impl_->active) return;
+    if (!impl_->active) return fate;
     if (access_unit.empty()) {
       ++impl_->stats.records_dropped;
-      return;
+      return fate;
     }
     if (fov_refused) warn_fov = impl_->camera_fov_warned.insert(camera_id).second;
     VideoChunkAssembler& video =
         impl_->video_chunks.try_emplace(camera_id, camera_id).first->second;
     const std::uint64_t dropped_before = video.dropped_before_keyframe();
     const std::uint64_t bytes = access_unit.size();
-    impl_->QueueCameraChunks(video.Append(entry, recorded, std::move(access_unit), keyframe));
+    impl_->QueueCameraChunks(
+        video.Append(entry, recorded, std::move(access_unit), keyframe, &fate));
     impl_->stats.camera_access_units_dropped += video.dropped_before_keyframe() - dropped_before;
-    ++impl_->stats.camera_frames;
-    impl_->stats.camera_bytes += bytes;
+    if (fate == VideoUnitFate::kRefused) {
+      ++impl_->stats.camera_access_units_refused;
+    } else {
+      ++impl_->stats.camera_frames;
+      impl_->stats.camera_bytes += bytes;
+    }
   }
   // Outside the lock: a host's logger is not this file's to hold `mu` across.
   if (warn_fov) {
@@ -2176,6 +2183,7 @@ void Session::RecordCameraAccessUnit(const std::string& camera_id, const SensorE
                      " degrees, which is not two angles between 0 and 180; its frames are "
                      "recorded with none (0 x 0) until it is");
   }
+  return fate;
 }
 
 void Session::RecordLaserScan(const std::string& sensor_id, std::uint64_t time_ms,

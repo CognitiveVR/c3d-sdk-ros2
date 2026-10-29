@@ -233,6 +233,67 @@ TEST(VideoChunkAssembler, AChunkClosesAtItsByteCapAndTheFramesUntilTheNextKeyfra
   EXPECT_EQ(video.dropped_before_keyframe(), 2u);
 }
 
+// Asked for a fate, the assembler refuses the unit that would pass the cap instead of dropping it:
+// the chunk before it closes whole, and that unit and every one after it until a keyframe are left
+// to the caller to re-encode from a new keyframe. Nothing refused is counted as dropped.
+TEST(VideoChunkAssembler, AUnitPastTheCapIsRefusedAndSoIsEveryUnitUntilTheNextKeyframe) {
+  VideoChunkAssembler video("front");
+  const VideoChunkContext context = CameraContext();
+  VideoUnitFate fate = VideoUnitFate::kDropped;
+  EXPECT_TRUE(video.Append(EntryAt(0, 0), context, std::string(kMaxVideoChunkBytes - 10, 'I'),
+                           true, &fate)
+                  .empty());
+  EXPECT_EQ(fate, VideoUnitFate::kAppended);
+  EXPECT_TRUE(video.Append(EntryAt(33, 1), context, std::string(10, 'p'), false, &fate).empty());
+  EXPECT_EQ(fate, VideoUnitFate::kAppended) << "a unit that fills the chunk to the cap was refused";
+
+  const std::vector<CameraChunkRecord> closed =
+      video.Append(EntryAt(66, 2), context, "p", false, &fate);
+  EXPECT_EQ(fate, VideoUnitFate::kRefused);
+  ASSERT_EQ(closed.size(), 1u) << "the chunk before the refused unit stayed open";
+  EXPECT_EQ(closed[0].data.size(), kMaxVideoChunkBytes);
+  EXPECT_EQ(closed[0].frames.size(), 2u);
+  EXPECT_TRUE(video.Append(EntryAt(99, 3), context, "p", false, &fate).empty());
+  EXPECT_EQ(fate, VideoUnitFate::kRefused);
+  EXPECT_EQ(video.dropped_before_keyframe(), 0u);
+  EXPECT_EQ(video.buffered_frames(), 0u);
+
+  EXPECT_TRUE(video.Append(EntryAt(66, 2), context, "I2", true, &fate).empty());
+  EXPECT_EQ(fate, VideoUnitFate::kAppended);
+  EXPECT_TRUE(video.Append(EntryAt(99, 3), context, "p3", false, &fate).empty());
+  EXPECT_EQ(fate, VideoUnitFate::kAppended);
+  const std::vector<CameraChunkRecord> next = video.Close();
+  ASSERT_EQ(next.size(), 1u);
+  EXPECT_EQ(next[0].chunk_seq, 1u);
+  EXPECT_EQ(next[0].data, "I2p3");
+  EXPECT_EQ(video.dropped_before_keyframe(), 0u);
+}
+
+// A chunk's first unit is a keyframe, and its re-encode would be one as large, so it is never
+// refused: kept, as a chunk of one, up to kMaxVideoFirstUnitBytes, and dropped above it, the units
+// after it then dropped until the next keyframe.
+TEST(VideoChunkAssembler, AKeyframeIsNeverRefusedKeptUpToItsCapAndDroppedAbove) {
+  VideoChunkAssembler video("front");
+  const VideoChunkContext context = CameraContext();
+  VideoUnitFate fate = VideoUnitFate::kRefused;
+  EXPECT_TRUE(video.Append(EntryAt(0, 0), context, std::string(kMaxVideoFirstUnitBytes, 'I'), true,
+                           &fate)
+                  .empty());
+  EXPECT_EQ(fate, VideoUnitFate::kAppended);
+  EXPECT_EQ(video.buffered_bytes(), kMaxVideoFirstUnitBytes);
+
+  const std::vector<CameraChunkRecord> closed = video.Append(
+      EntryAt(33, 1), context, std::string(kMaxVideoFirstUnitBytes + 1, 'I'), true, &fate);
+  EXPECT_EQ(fate, VideoUnitFate::kDropped);
+  ASSERT_EQ(closed.size(), 1u);
+  EXPECT_EQ(closed[0].data.size(), kMaxVideoFirstUnitBytes);
+  EXPECT_EQ(video.dropped_before_keyframe(), 1u);
+  EXPECT_TRUE(video.Append(EntryAt(66, 2), context, "p", false, &fate).empty());
+  EXPECT_EQ(fate, VideoUnitFate::kDropped);
+  EXPECT_EQ(video.dropped_before_keyframe(), 2u);
+  EXPECT_EQ(video.buffered_frames(), 0u);
+}
+
 TEST(VideoChunkAssembler, TheChunkCarriesTheFirstFramesContext) {
   VideoChunkAssembler video("front");
   const VideoChunkContext first = CameraContext();
