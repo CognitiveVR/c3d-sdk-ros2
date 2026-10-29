@@ -44,14 +44,17 @@ row. The stored width and height are the frame's own, after any scaling and crop
 ### How a camera is encoded
 
 Frames are encoded as H.264 by the host's `ffmpeg`, which the node runs as a child process, using
-x264. The node never links the encoder. `ffmpeg` is a package the node's deb depends on, and the
-source build installs it by name: see [Install](install.md). `ffmpeg_path` names another binary
+x264. The node never links the encoder. `ffmpeg` is a package the node's deb recommends, installed
+by name on a robot with a camera: see [Install](install.md). `ffmpeg_path` names another binary
 when `ffmpeg` is not on the node's `PATH`; it defaults to `ffmpeg`. With a camera configured,
-configure refuses when that binary cannot run, naming the package to install, and `doctor`'s
-`camera encoder` check says the same before a session opens.
+configure refuses when that binary cannot run, or cannot encode two small frames with the
+arguments each camera's `preset`, `crf` and `max_bitrate_kbps` give it, naming the package to
+install, and `doctor`'s `camera encoder` check says the same before a session opens.
 
 A chunk is 3 seconds of real time, one closed group of pictures, whatever the camera delivers, and
-every chunk starts on a keyframe. A camera whose 3-second chunk the node estimates at more than
+every chunk starts on a keyframe. The node's own timing of the encoder, the quiet gap and wedge
+rules below and the 5-second wait after a crash, is real time too, so a paused simulation is a
+quiet gap. A camera whose 3-second chunk the node estimates at more than
 6 MiB gets shorter chunks: the longest length, in tenths of a second down to 1 second, whose
 estimate fits, chosen when its encoder starts from the size of the frame it starts on and logged
 once. The estimate is `doctor`'s, from the frame size, `crf` and `rate_hz`, capped by
@@ -440,8 +443,9 @@ Configure refuses, naming the parameter:
 - a `camera.<name>.format` or `camera.<name>.jpeg_quality`, which a camera no longer has
 - a camera with `max_width_px` set at which not even a 1-second chunk is estimated under 6 MiB; see
   [How a camera is encoded](#how-a-camera-is-encoded)
-- a camera configured while the binary named by `ffmpeg_path` cannot run, or lists no `libx264`
-  encoder: the refusal names the binary and says `sudo apt install ffmpeg`
+- a camera configured while the binary named by `ffmpeg_path` cannot run, lists no `libx264`
+  encoder, or cannot encode two frames with a camera's `preset`, `crf` and `max_bitrate_kbps`: the
+  refusal names the binary, the camera and what `ffmpeg` said, and says `sudo apt install ffmpeg`
 - a `pointcloud.voxel_leaf_m` below 0 or above 65 meters, a `pointcloud.max_points` below 1 or
   above the most points whose worst case encoding stays under 8 MiB, so that one cloud never
   makes an object the platform refuses (about 1.39 million at the defaults), or a

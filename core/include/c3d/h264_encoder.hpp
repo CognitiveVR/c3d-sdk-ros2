@@ -113,6 +113,11 @@ std::unique_ptr<IH264Encoder> NewFfmpegH264Encoder(const H264EncoderSettings& se
                                                    OnEncoderFailure on_failure);
 // "" when `ffmpeg_path` runs and its `-encoders` lists libx264; otherwise why not.
 std::string ProbeFfmpeg(const std::string& ffmpeg_path, std::string* version_out);
+// "" when `settings.ffmpeg_path` encodes two 16x16 frames through FfmpegArguments with the rest of
+// `settings` -- the preset, crf and bitrate cap a camera runs with -- into two access units;
+// otherwise why not. An ffmpeg that lists libx264 can still refuse one of the arguments, and would
+// then fail every start. Bounded like the other probes.
+std::string ProbeFfmpegEncode(H264EncoderSettings settings);
 // argv after the program name.
 std::vector<std::string> FfmpegArguments(const H264EncoderSettings& settings);
 

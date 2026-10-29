@@ -46,9 +46,14 @@
   <depend>tf2_ros</depend>
   <depend>cognitive3d_ros_msgs</depend>
 
-  <!-- Camera frames are decoded and resized here; the H.264 encoder is ffmpeg, run as a separate process. -->
+  <!--
+    Camera frames are decoded and resized here; the H.264 encoder is ffmpeg, run as a separate
+    process and needed only with a camera configured. So the deb recommends it rather than depends
+    on it (deb_recommends below, which tools/release/build_debs.sh writes into debian/control), and
+    the tests, which run it, declare it.
+  -->
   <depend>cv_bridge</depend>
-  <exec_depend>ffmpeg</exec_depend>
+  <test_depend>ffmpeg</test_depend>
 
   <!--
     Build-only. No installed header includes any of these, so a package building
@@ -77,5 +82,6 @@
 
   <export>
     <build_type>ament_cmake</build_type>
+    <deb_recommends>ffmpeg</deb_recommends>
   </export>
 </package>

@@ -761,6 +761,37 @@ std::string ProbeFfmpeg(const std::string& ffmpeg_path, std::string* version_out
   return std::string();
 }
 
+std::string ProbeFfmpegEncode(H264EncoderSettings settings) {
+  settings.width = 16;
+  settings.height = 16;
+  settings.fps = 30.0;
+  std::mutex mutex;
+  std::size_t units = 0;
+  std::string failure;
+  auto encoder = NewFfmpegH264Encoder(
+      settings,
+      [&](EncodedAccessUnit) {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++units;
+      },
+      [&](const EncoderFailure& reported) {
+        std::lock_guard<std::mutex> lock(mutex);
+        failure = reported.why;
+      });
+  std::string error;
+  if (!encoder->Start(&error)) return error;
+  const std::string black(16 * 16 * 3, '\0');
+  for (std::uint64_t token = 0; token < 2; ++token) encoder->Feed(black, token);
+  encoder->Finish(kProbeSeconds.count());
+  std::lock_guard<std::mutex> lock(mutex);
+  if (!failure.empty()) return failure;
+  if (units != 2) {
+    return settings.ffmpeg_path + " returned " + std::to_string(units) +
+           " access units for 2 frames";
+  }
+  return std::string();
+}
+
 std::vector<std::string> FfmpegArguments(const H264EncoderSettings& s) {
   std::vector<std::string> args = {
       "-hide_banner", "-loglevel", "error", "-nostats",

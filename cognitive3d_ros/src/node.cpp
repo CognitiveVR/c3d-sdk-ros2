@@ -1189,7 +1189,7 @@ bool Cognitive3DNode::LoadMediaConfig(std::string* error) {
   // every frame is dropped while the run looks configured.
   if (!camera_configs_.empty()) {
     std::string version;
-    const std::string unusable = c3d::ProbeFfmpeg(ffmpeg_path_, &version);
+    const std::string unusable = ProbeCameraEncoders(ffmpeg_path_, camera_configs_, &version);
     if (!unusable.empty()) {
       if (error) *error = FfmpegProblem(ffmpeg_path_, unusable) + ". " + kFfmpegRemedy;
       return false;

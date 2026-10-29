@@ -7,7 +7,11 @@
 
 #include <gtest/gtest.h>
 
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <fstream>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -160,6 +164,34 @@ TEST_F(ConfigureRefusals, ACameraWithNoUsableFfmpegRefusesConfigureNamingThePack
   // Without a camera nothing runs it, so nothing is asked.
   auto no_camera = MakeNode(DryRun({{"ffmpeg_path", std::string("/nonexistent/ffmpeg")}}));
   EXPECT_EQ(Configure(*no_camera), "");
+}
+
+// An ffmpeg that runs and lists libx264 can still refuse one of the arguments a camera runs it
+// with, and would then fail at every start. Configure encodes two frames with each camera's own
+// preset and crf, and refuses naming the binary, the camera and what ffmpeg said.
+TEST_F(ConfigureRefusals, AnFfmpegThatCannotEncodeWithTheCamerasSettingsRefusesConfigure) {
+  char directory[] = "/tmp/c3d_ffmpeg_XXXXXX";
+  ASSERT_NE(::mkdtemp(directory), nullptr);
+  const std::string script = std::string(directory) + "/ffmpeg";
+  {
+    std::ofstream out(script);
+    out << "#!/bin/sh\n"
+           "case \"$*\" in\n"
+           "  *-version*) echo 'ffmpeg version 99'; exit 0 ;;\n"
+           "  *-encoders*) echo ' V....D libx264'; exit 0 ;;\n"
+           "esac\n"
+           "echo \"Unrecognized option 'vsync'.\" >&2\n"
+           "exit 8\n";
+  }
+  ::chmod(script.c_str(), 0755);
+  const std::string refusal = RefusalWith({"ffmpeg_path", script});
+  ::unlink(script.c_str());
+  ::rmdir(directory);
+  EXPECT_EQ(refusal.rfind("ffmpeg_path '" + script + "'", 0), 0u) << refusal;
+  EXPECT_NE(refusal.find("cannot encode camera 'front' (preset ultrafast, crf 28)"),
+            std::string::npos)
+      << refusal;
+  EXPECT_NE(refusal.find("Unrecognized option 'vsync'"), std::string::npos) << refusal;
 }
 
 // A camera has no `jpeg_quality` or `format` field: a params file that carries one is refused as a

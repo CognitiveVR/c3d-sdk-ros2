@@ -117,6 +117,11 @@ std::string ValidateCameraConfig(const CameraConfig& camera);
 // check says the same, and reads a refusal back into the two.
 std::string FfmpegProblem(const std::string& ffmpeg_path, const std::string& why);
 extern const char* const kFfmpegRemedy;
+// c3d::ProbeFfmpeg, then c3d::ProbeFfmpegEncode once for each preset, crf and bitrate cap among
+// `cameras`: "" when every camera's settings encode, otherwise why not, naming the camera. Configure
+// and doctor both ask this.
+std::string ProbeCameraEncoders(const std::string& ffmpeg_path,
+                                const std::vector<CameraConfig>& cameras, std::string* version);
 
 // The CameraInfo topic beside an image topic, by image_transport's convention: a
 // transport publishes under the base topic (`/cam/image_raw/compressed` is the

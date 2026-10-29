@@ -64,7 +64,8 @@ struct MediaEnvironment {
   std::function<double()> pose_clock;
   // The real clocks, whatever the clock policy: epoch seconds by the system clock, and seconds by
   // the steady clock. The camera encoder stamps frames by the first, so the two moving apart is a
-  // wall-clock step it must restart for; see CameraCapture::FeedFrame. Unset is the real clock.
+  // wall-clock step it must restart for, and its restart rules and backoff run on the second; see
+  // CameraCapture::FeedFrame. Unset is the real clock.
   std::function<double()> wall_time;
   std::function<double()> steady_time;
 };
@@ -290,7 +291,7 @@ class CameraCapture {
   void StopEncoder(double timeout_s = c3d::kH264FinishTimeoutSeconds);
   bool has_encoder() const;
 
-  // How long after a crash, a kill or a start that failed no encoder is started, on the arrival
+  // How long after a crash, a kill or a start that failed no encoder is started, on the steady
   // clock: one spawn per 5 s at most, whatever the cause.
   static constexpr double kEncoderRestartMinSeconds = 5.0;
   // How far the wall clock may move against the steady clock under a running encoder before the
@@ -399,8 +400,8 @@ class CameraCapture {
   // dropped_no_session.
   SessionRunner* runner_ = nullptr;
   std::function<void(const std::string&)> warn_once_;
-  // The arrival clock on_failure reads its backoff from, so every time here is on one clock.
-  std::function<double()> arrival_time_;
+  // The steady clock on_failure reads its backoff from, so every time here is on one clock.
+  std::function<double()> steady_time_;
   bool failed_ = false;  // set by on_failure; cleared by StopEncoder and Reset
   // The last stop's Finish had to kill. Cleared by the replacement's first delivered unit: an
   // encoder that delivers is healthy, and its drain owes nothing to the one before it.

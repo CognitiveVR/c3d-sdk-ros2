@@ -460,6 +460,17 @@ frame.
   session is closed as `abnormalEnd` at the next start. Allow at least 5 seconds between the stop
   signal and SIGKILL. For a robot whose stack you can reach only with `docker exec`, see
   [A robot stack in a container you cannot recreate](#a-robot-stack-in-a-container-you-cannot-recreate).
+- Under systemd, set `KillMode=mixed` in the unit. The default, `control-group`, sends the stop
+  signal to every process in the unit at once, each camera's `ffmpeg` included, so the encoders
+  exit before the node can finish them: every stop loses each camera's last frames, counted in
+  `dropped_at_stop`, and logs an encoder failure. `mixed` signals the node alone, which stops its
+  encoders before it ends the session, and kills whatever is left when `TimeoutStopSec` runs out:
+
+  ```ini
+  [Service]
+  KillMode=mixed
+  ```
+
 - Pass the application key in the environment. The node reads it from `C3D_APPLICATION_API_KEY`
   only ([Configuration](configuration.md)): `docker run -e`, or `Environment=` or
   `EnvironmentFile=` in the unit.

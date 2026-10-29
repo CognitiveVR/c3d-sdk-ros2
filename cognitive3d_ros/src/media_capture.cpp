@@ -60,13 +60,17 @@ double ArrivalSeconds(const MediaEnvironment& environment) {
   return environment.arrival_time ? environment.arrival_time() : SteadySeconds();
 }
 
+double SteadyNow(const MediaEnvironment& environment) {
+  return environment.steady_time ? environment.steady_time() : SteadySeconds();
+}
+
 // The wall clock less the steady clock, both real: it moves only when the wall clock steps.
 double WallClockOffset(const MediaEnvironment& environment) {
   using namespace std::chrono;
   const double wall = environment.wall_time
                           ? environment.wall_time()
                           : duration<double>(system_clock::now().time_since_epoch()).count();
-  return wall - (environment.steady_time ? environment.steady_time() : SteadySeconds());
+  return wall - SteadyNow(environment);
 }
 
 double PoseClockSeconds(const MediaEnvironment& environment) {
@@ -287,7 +291,7 @@ CameraCapture::~CameraCapture() {
     std::lock_guard<std::mutex> lock(pending_mu_);
     runner_ = nullptr;
     warn_once_ = nullptr;
-    arrival_time_ = nullptr;
+    steady_time_ = nullptr;
     encoder = std::move(encoder_);
   }
   if (encoder) encoder->Finish(0.0);
@@ -479,7 +483,7 @@ void CameraCapture::ServiceHeld(const MediaEnvironment& environment, SessionRunn
   if (pose_failures > 0) AddToStats(&CameraStats::pose_failures, pose_failures);
 }
 
-// The restart rules, in precedence order. Every one reads the same `now`, the arrival clock read
+// The restart rules, in precedence order. Every one reads the same `now`, the steady clock read
 // once for this frame, and after a stop the frame goes on down the table, so a restart and the feed
 // it was for happen on one frame:
 //
@@ -510,12 +514,14 @@ void CameraCapture::ServiceHeld(const MediaEnvironment& environment, SessionRunn
 bool CameraCapture::FeedFrame(PreparedFrame frame, const c3d::SensorEntry& entry,
                               const c3d::VideoChunkContext& context,
                               const MediaEnvironment& environment, SessionRunner& runner) {
-  const double now = ArrivalSeconds(environment);
+  // Real time, as the encoder's chunks are: the arrival clock is simulated time under
+  // sim_time_on_wire, which a paused simulation stops and a slow one stretches.
+  const double now = SteadyNow(environment);
   const double wall_offset = WallClockOffset(environment);
   const auto bind = [&]() {
     runner_ = &runner;
     warn_once_ = environment.warn_once;
-    arrival_time_ = environment.arrival_time;
+    steady_time_ = environment.steady_time;
   };
 
   bool stop = false;
@@ -866,7 +872,7 @@ void CameraCapture::StopEncoder(double timeout_s, bool for_replay) {
       replay_.Clear();
       runner_ = nullptr;
       warn_once_ = nullptr;
-      arrival_time_ = nullptr;
+      steady_time_ = nullptr;
     }
   }
   if (held > 0) AddToStats(&CameraStats::dropped_at_stop, held);
@@ -945,10 +951,10 @@ void CameraCapture::OnEncoderFailure(const c3d::EncoderFailure& failure) {
     at_stop = stopping_on_ == std::this_thread::get_id();
     // The size row's own kill: everything it abandons is re-encoded.
     if (at_stop && size_stop_) return;
-    clock = arrival_time_;
+    clock = steady_time_;
     chunk_s = chunk_s_;
   }
-  // Read unlocked: the arrival clock is the node's, which locks itself.
+  // Read unlocked: the clock is the node's, which locks itself.
   const double now = clock ? clock() : SteadySeconds();
   std::function<void(const std::string&)> warn;
   bool backed_off = false;

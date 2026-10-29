@@ -622,6 +622,38 @@ TEST(H264Encoder, ProbeNamesWhatIsWrong) {
   EXPECT_NE(missing.find("/nonexistent"), std::string::npos) << missing;
 }
 
+// ProbeFfmpeg asks only -version and -encoders. ProbeFfmpegEncode runs the arguments a camera would,
+// so an ffmpeg that lists libx264 and refuses one of them is caught before a camera starts.
+TEST(H264Encoder, TheEncodeProbeRunsTheRealArguments) {
+  ScratchDir dir;
+  const std::string fake = dir.Script(
+      "lists_but_refuses.sh",
+      "case \"$*\" in\n"
+      "  *-version*) echo 'ffmpeg version 99'; exit 0 ;;\n"
+      "  *-encoders*) echo ' V....D libx264'; exit 0 ;;\n"
+      "esac\n"
+      "echo \"Unrecognized option 'vsync'.\" >&2\n"
+      "exit 8");
+  std::string version;
+  EXPECT_EQ(ProbeFfmpeg(fake, &version), "");
+  H264EncoderSettings settings;
+  settings.ffmpeg_path = fake;
+  const std::string why = ProbeFfmpegEncode(settings);
+  EXPECT_NE(why.find("Unrecognized option 'vsync'"), std::string::npos) << why;
+}
+
+TEST(H264Encoder, TheEncodeProbePassesARealFfmpegWithTheCamerasSettings) {
+  REQUIRE_FFMPEG();
+  H264EncoderSettings settings;
+  EXPECT_EQ(ProbeFfmpegEncode(settings), "");
+  settings.preset = "veryfast";
+  settings.crf = 24;
+  settings.max_bitrate_kbps = 800;
+  EXPECT_EQ(ProbeFfmpegEncode(settings), "");
+  settings.preset = "not-a-preset";
+  EXPECT_NE(ProbeFfmpegEncode(settings), "") << "the preset never reached ffmpeg";
+}
+
 TEST(H264Encoder, AChildThatDiesReportsFailureOnce) {
   ScratchDir dir;
   H264EncoderSettings settings = Small(30.0, 3.0);

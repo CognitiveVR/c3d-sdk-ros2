@@ -165,7 +165,7 @@ though it has sensors.
 | The sensor's frame does not resolve, so every record is dropped | `c3d.camera.<name>.pose_failures` or `c3d.lidar.<name>.pose_failures`; doctor's sensor check | [Poses and frames](camera-and-lidar.md#poses-and-frames) |
 | A depth image, or an encoding the node cannot read | `c3d.camera.<name>.refused` | Record the color topic: [Record a camera](camera-and-lidar.md#record-a-camera) |
 | The publisher's QoS does not match | The node logs a QoS incompatibility naming the policy | [QoS](camera-and-lidar.md#qos) |
-| The camera encoder cannot run, because `ffmpeg` is not installed | doctor's `camera encoder` check, or the configure refusal naming `ffmpeg` | [How a camera is encoded](camera-and-lidar.md#how-a-camera-is-encoded) |
+| The camera encoder cannot run, because `ffmpeg` is not installed or refuses the arguments a camera's settings give it | doctor's `camera encoder` check, or the configure refusal naming `ffmpeg` | [How a camera is encoded](camera-and-lidar.md#how-a-camera-is-encoded) |
 | The encoder is saturated, or was restarted, and frames were dropped. `dropped_backlog` also counts a burst of frames held for their transform, up to 8 released at once when tf catches up, overflowing the encoder's 4-frame queue | `c3d.camera.<name>.dropped_backlog`, `encoder_restarts` | [CPU](camera-and-lidar.md#cpu) |
 | The spool evicted them at its cap, which evicts camera and lidar data first | `c3d.chunks_evicted`; a `cognitive3d: uploads` warning | [The size cap](sessions.md#the-size-cap) |
 

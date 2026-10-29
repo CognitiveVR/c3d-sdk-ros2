@@ -1,11 +1,14 @@
 #include "cognitive3d_ros/media_config.hpp"
 
 #include <algorithm>
+#include <set>
+#include <tuple>
 #include <cmath>
 #include <sstream>
 #include <string>
 #include <utility>
 
+#include "c3d/h264_encoder.hpp"
 #include "c3d/sensor_blocks.hpp"
 
 namespace cognitive3d_ros {
@@ -131,12 +134,33 @@ std::string ValidateCameraConfig(const CameraConfig& camera) {
 }
 
 const char* const kFfmpegRemedy =
-    "Install it with `sudo apt install ffmpeg`, or set ffmpeg_path to a binary that runs and lists "
-    "the libx264 encoder";
+    "Install it with `sudo apt install ffmpeg`, or set ffmpeg_path to a binary that runs, lists "
+    "the libx264 encoder and encodes with the camera's preset and crf";
 
 std::string FfmpegProblem(const std::string& ffmpeg_path, const std::string& why) {
   return "ffmpeg_path '" + ffmpeg_path + "' cannot run as the camera encoder, so no camera can "
          "record: " + why;
+}
+
+std::string ProbeCameraEncoders(const std::string& ffmpeg_path,
+                                const std::vector<CameraConfig>& cameras, std::string* version) {
+  const std::string unusable = c3d::ProbeFfmpeg(ffmpeg_path, version);
+  if (!unusable.empty()) return unusable;
+  std::set<std::tuple<std::string, int, int>> probed;
+  for (const CameraConfig& camera : cameras) {
+    if (!probed.emplace(camera.preset, camera.crf, camera.max_bitrate_kbps).second) continue;
+    c3d::H264EncoderSettings settings;
+    settings.ffmpeg_path = ffmpeg_path;
+    settings.preset = camera.preset;
+    settings.crf = camera.crf;
+    settings.max_bitrate_kbps = camera.max_bitrate_kbps;
+    const std::string why = c3d::ProbeFfmpegEncode(settings);
+    if (!why.empty()) {
+      return "it cannot encode camera '" + camera.name + "' (preset " + camera.preset + ", crf " +
+             std::to_string(camera.crf) + "): " + why;
+    }
+  }
+  return "";
 }
 
 std::string ValidateLidarConfig(const LidarConfig& lidar) {

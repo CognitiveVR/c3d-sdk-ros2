@@ -51,9 +51,12 @@ Before you start:
   leaves the installed ones as they are. Only the SDK's own packages require an exact version, of
   one another.
 - Keep Ubuntu's `universe` component enabled. The Cap'n Proto runtime library and `ffmpeg` come
-  from it, and stock Ubuntu and the official ROS images enable it. The `cognitive3d-ros` deb
-  depends on `ffmpeg`, the camera encoder, so apt installs it with the SDK. On a machine that
-  already has OpenCV, which `cv_bridge` brings, it adds about 100 MB.
+  from it, and stock Ubuntu and the official ROS images enable it.
+- On a robot that records a camera, install `ffmpeg`, the camera encoder, with the SDK: add it to
+  the install line, `sudo apt install --no-install-recommends ffmpeg ./ros-...`. The
+  `cognitive3d-ros` deb recommends it rather than depends on it, because a robot with no camera
+  never runs it, and `--no-install-recommends`, as below, leaves it out. On a machine that already
+  has OpenCV, which `cv_bridge` brings, it adds about 100 MB.
 
 This downloads the three packages for the machine you run it on, checks them against `SHA256SUMS`,
 previews the install and then installs them:
@@ -141,7 +144,7 @@ installation, with `--no-install-recommends`:
 | Humble | about 280 packages, 181 MB download, 721 MB on disk | 738 MB on disk |
 | Jazzy | about 280 packages, 192 MB download, 811 MB on disk | 852 MB on disk |
 
-These figures were measured before `cognitive3d_ros` depended on `ffmpeg`, the camera encoder. Measured by apt simulation on arm64, it adds 85 MB on Ubuntu 22.04, 106 MB on Ubuntu 24.04
+These figures do not include `ffmpeg`, the camera encoder, which the deb recommends and a robot with a camera installs. Measured by apt simulation on arm64, it adds 85 MB on Ubuntu 22.04, 106 MB on Ubuntu 24.04
 and 108 MB on Debian trixie when OpenCV is already installed, as it is here, because only its
 filter and device libraries are new; on a bare OS it adds 387 to 676 MB.
 
@@ -150,8 +153,8 @@ free space before you install. If your robot already has `cv_bridge` installed, 
 camera driver, most of that space is already used and the SDK adds little beyond `ffmpeg`'s 85 to 108 MB. The three debs
 themselves are under 1 MB together.
 
-Leave out `--no-install-recommends` and apt also installs every recommended package, which is
-larger still.
+Leave out `--no-install-recommends` and apt also installs every recommended package, `ffmpeg`
+among them, which is larger still.
 
 ## Build from source
 

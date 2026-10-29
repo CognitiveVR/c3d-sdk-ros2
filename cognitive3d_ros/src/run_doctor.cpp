@@ -950,7 +950,8 @@ int RunDoctor(int argc, char** argv, const NodeFactory& make, const std::string&
     encoder.cameras = node->resolved_cameras().size();
     encoder.ffmpeg_path = node->resolved_ffmpeg_path();
     if (encoder.cameras > 0) {
-      encoder.problem = c3d::ProbeFfmpeg(encoder.ffmpeg_path, &encoder.version);
+      encoder.problem = cognitive3d_ros::ProbeCameraEncoders(
+          encoder.ffmpeg_path, node->resolved_cameras(), &encoder.version);
     }
     checks.push_back(cognitive3d_ros::doctor::CheckCameraEncoder(encoder));
   }

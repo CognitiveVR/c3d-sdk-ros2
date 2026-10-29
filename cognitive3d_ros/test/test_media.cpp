@@ -384,9 +384,10 @@ class MediaTest : public ::testing::Test {
     // A second between arrivals, so every message these tests hand over passes the gate.
     environment_.arrival_time = [this]() { return next_arrival_ += 1.0; };
     fakes_.clock = [this]() { return on_test_clock_ ? clock_ : next_arrival_; };
-    // The real clocks held still, so only a test that steps them moves them apart.
-    environment_.wall_time = [this]() { return wall_; };
-    environment_.steady_time = [this]() { return steady_; };
+    // The real clocks move with the test's clock, from where a test sets them, so only a test that
+    // steps one moves them apart.
+    environment_.wall_time = [this]() { return wall_ + TestClockElapsed(); };
+    environment_.steady_time = [this]() { return steady_ + TestClockElapsed(); };
   }
   void TearDown() override {
     if (runner_) runner_->End("test");
@@ -408,7 +409,8 @@ class MediaTest : public ::testing::Test {
     return config;
   }
   // One frame arriving at `t` seconds on a clock the test sets, so every restart rule is driven
-  // with literals; from the first call, the arrival clock is that one.
+  // with literals; from the first call, the arrival clock is that one, and the real clocks move
+  // with it.
   bool FrameAt(CameraCapture& capture, double t, int width = 32, int height = 24,
                const std::string& frame = "camera_link") {
     environment_.arrival_time = [this]() { return clock_; };
@@ -419,6 +421,7 @@ class MediaTest : public ::testing::Test {
                           environment_, *runner_);
   }
   static constexpr double kClockStart = 1000.0;
+  double TestClockElapsed() const { return on_test_clock_ ? clock_ - kClockStart : 0.0; }
   double clock_ = kClockStart;
   bool on_test_clock_ = false;
   double wall_ = 1788383000.0;
@@ -1619,6 +1622,37 @@ TEST_F(MediaTest, ACameraWhoseFrameFitsNoChunkIsRefusedAtItsFirstFrame) {
   EXPECT_EQ(fakes_.built(), 1u);
 }
 
+// The quiet-gap row and the backoff run on the steady clock, as the encoder's chunks do. Under
+// sim_time_on_wire the arrival clock is simulated time: a paused simulation stops it while the
+// encoder's clock runs on, and a fast-forwarded one races it while real time does not.
+TEST_F(MediaTest, TheGapRowAndTheBackoffRunOnTheSteadyClockNotTheArrivalClock) {
+  auto capture = OnFakes(Front());
+  environment_.steady_time = [this]() { return steady_; };
+  environment_.wall_time = [this]() { return wall_; };
+  const auto arrive = [&](double arrival, double real_seconds) {
+    environment_.arrival_time = [this]() { return clock_; };
+    clock_ = kClockStart + arrival;
+    steady_ += real_seconds;
+    wall_ += real_seconds;
+    return capture->Handle("sensor_msgs/msg/Image",
+                           Serialize(MakeImage(32, 24, "rgb8", "camera_link", 100.0 + arrival)),
+                           environment_, *runner_);
+  };
+  ASSERT_TRUE(arrive(0.0, 0.0));
+  ASSERT_TRUE(arrive(0.1, 60.0)) << "a minute of real time went by while the simulation paused";
+  ASSERT_EQ(fakes_.built(), 2u) << "the pause was not seen as a quiet gap";
+  EXPECT_EQ(capture->stats().gap_restarts, 1u);
+  ASSERT_TRUE(arrive(30.0, 0.1)) << "half a minute of simulated time in a tenth of a second";
+  EXPECT_EQ(fakes_.built(), 2u) << "simulated time was taken for a quiet gap";
+
+  fakes_.live(1).Die(Failure("ffmpeg exited", 1, false, 0));
+  EXPECT_FALSE(arrive(40.0, 0.1)) << "simulated time ended the backoff";
+  EXPECT_EQ(fakes_.built(), 2u);
+  ASSERT_TRUE(arrive(40.1, 5.0));
+  EXPECT_EQ(fakes_.built(), 3u);
+  EXPECT_EQ(capture->stats().encoder_restarts, 1u);
+}
+
 // A unit that would take its chunk past c3d::kMaxVideoChunkBytes is refused by the session. The next
 // frame kills that encoder at once -- no backoff, nothing counted as dropped or failed -- and a
 // replacement re-encodes the refused frame under its own token, so it keeps its seq, time and pose,
@@ -1784,22 +1818,25 @@ TEST_F(MediaTest, AWallClockStepIsSaidOnceASession) {
 }
 
 // What NTP's slewing does stays far under a second, and time that passes on both clocks is no step:
-// neither restarts anything. Exactly a second is not past the bound.
+// neither is restarted for. Exactly a second is not past the bound. A suspend that passes on both
+// clocks is a quiet gap on the steady clock, and is restarted for as one.
 TEST_F(MediaTest, WallClockDriftOfUpToASecondRestartsNothing) {
   auto capture = OnFakes(Front());
+  // Eighths of a second, which the epoch-sized wall clock holds exactly, so the drift is exact.
   ASSERT_TRUE(FrameAt(*capture, 0.0));
   wall_ += 0.5;
-  ASSERT_TRUE(FrameAt(*capture, 0.1));
+  ASSERT_TRUE(FrameAt(*capture, 0.125));
   wall_ -= 1.0;
-  ASSERT_TRUE(FrameAt(*capture, 0.2));
+  ASSERT_TRUE(FrameAt(*capture, 0.25));
   wall_ += 1.5;
-  ASSERT_TRUE(FrameAt(*capture, 0.3));
+  ASSERT_TRUE(FrameAt(*capture, 0.375));
   EXPECT_EQ(fakes_.built(), 1u) << "a drift of exactly a second restarted the encoder";
   wall_ += 100.0;
   steady_ += 100.0;
-  ASSERT_TRUE(FrameAt(*capture, 0.4));
-  EXPECT_EQ(fakes_.built(), 1u) << "time that passed on both clocks restarted the encoder";
-  EXPECT_TRUE(warnings_.empty()) << warnings_.front();
+  ASSERT_TRUE(FrameAt(*capture, 0.5));
+  EXPECT_EQ(capture->stats().gap_restarts, 1u);
+  EXPECT_TRUE(warnings_.empty()) << "time that passed on both clocks was taken for a step: "
+                                 << warnings_.front();
 }
 
 // Nothing fed for a chunk's length on a healthy encoder: the next frame drains it and starts a new

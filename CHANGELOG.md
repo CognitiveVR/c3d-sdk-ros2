@@ -38,7 +38,9 @@ marks as provisional may change in a minor release, and its entry here says how 
 - `lidar.<name>.pointcloud.max_points` is bounded so one cloud encodes to at most 8 MiB, about
   1.39 million points at the defaults: configure refuses a larger value, naming the bound.
 - `doctor`'s `camera encoder` check, which is FATAL when a camera is configured and `ffmpeg` cannot
-  run. Its `camera/<name>` check reports an estimated size and rate.
+  run, or cannot encode two small frames with a camera's `preset`, `crf` and `max_bitrate_kbps`;
+  configure refuses for the same reasons. Its `camera/<name>` check reports an estimated size and
+  rate.
 
 ### Changed
 
@@ -62,6 +64,8 @@ marks as provisional may change in a minor release, and its entry here says how 
   `CameraPayload` with `FrameMeta`, and `LidarPayload` with `ScanBlock` and `CloudBlock`. Migrate:
   deploy a gateway that reads them before this release; one that does not cannot read the
   camera and lidar streams.
+- The `cognitive3d-ros` deb recommends `ffmpeg`, the camera encoder, and does not depend on it:
+  a robot with a camera installs it with the SDK, as [Install](docs/install.md) shows.
 - A camera on a `CompressedImage` topic is decoded and encoded again as H.264. Its JPEG is no
   longer stored as published, so a compressed topic now costs the CPU of a decode as well as the
   encode.
