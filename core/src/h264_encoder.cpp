@@ -817,7 +817,10 @@ std::vector<std::string> FfmpegArguments(const H264EncoderSettings& s) {
       "-pix_fmt", "yuv420p"};
   if (s.max_bitrate_kbps > 0) {
     args.insert(args.end(), {"-maxrate", std::to_string(s.max_bitrate_kbps) + "k",
-                             "-bufsize", std::to_string(2LL * s.max_bitrate_kbps) + "k"});
+                             "-bufsize",
+                             std::to_string(s.bufsize_kbps > 0 ? static_cast<long long>(s.bufsize_kbps)
+                                                               : 2LL * s.max_bitrate_kbps) +
+                                 "k"});
   }
   args.insert(args.end(), {"-flush_packets", "1", "-f", "h264", "pipe:1"});
   return args;

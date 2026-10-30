@@ -1562,12 +1562,15 @@ TEST_F(MediaTest, AFrameSizeTheReplayStoreCannotHoldStartsWithABitrateCap) {
   auto capped = OnFakes(config);
   ASSERT_TRUE(FrameAt(*capped, 0.0, 640, 480));
   EXPECT_EQ(fakes_.last().settings.max_bitrate_kbps, DefaultCameraBitrateKbps(3.0));
+  EXPECT_EQ(fakes_.last().settings.bufsize_kbps, DefaultCameraBitrateKbps(3.0))
+      << "the default cap's buffer is not one second of it";
   capped->StopEncoder();
 
   config.max_bitrate_kbps = 800;
   auto explicit_cap = OnFakes(config);
   ASSERT_TRUE(FrameAt(*explicit_cap, 1.0, 640, 480));
   EXPECT_EQ(fakes_.last().settings.max_bitrate_kbps, 800);
+  EXPECT_EQ(fakes_.last().settings.bufsize_kbps, 0) << "an operator's cap keeps twice its buffer";
   explicit_cap->StopEncoder();
 
   auto uncapped = OnFakes(Front());
@@ -1595,6 +1598,7 @@ TEST_F(MediaTest, RepeatedSizeRestartsHalveTheChunkThenCapTheBitrate) {
   }
   EXPECT_EQ(chunks, (std::vector<double>{3, 3, 3, 1.5, 1.5, 1.5, 1, 1, 1, 1, 1}));
   EXPECT_EQ(bitrates, (std::vector<int>{0, 0, 0, 0, 0, 0, 0, 0, 0, 50331, 50331}));
+  EXPECT_EQ(fakes_.last().settings.bufsize_kbps, 50331);
   EXPECT_EQ(capture->stats().size_restarts, 10u);
   std::size_t said = 0;
   for (const std::string& warning : warnings_) {

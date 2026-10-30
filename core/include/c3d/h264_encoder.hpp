@@ -23,7 +23,8 @@ struct H264EncoderSettings {
   std::string ffmpeg_path = "ffmpeg";  // searched on PATH unless it contains a slash
   std::string preset = "ultrafast";
   int crf = 28;
-  int max_bitrate_kbps = 0;  // 0 is uncapped; otherwise -maxrate K -bufsize 2K
+  int max_bitrate_kbps = 0;  // 0 is uncapped; otherwise -maxrate K -bufsize B
+  int bufsize_kbps = 0;      // B; 0 is twice max_bitrate_kbps
   int threads = 1;
   // The keyframe interval, and so a chunk's length, in REAL time: ffmpeg stamps each frame with the
   // wall clock as it reads it, whatever `fps` declares.

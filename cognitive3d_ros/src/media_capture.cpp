@@ -691,11 +691,14 @@ CameraCapture::Started CameraCapture::StartEncoder(std::uint16_t width, std::uin
   settings.preset = config_.preset;
   settings.crf = config_.crf;
   // An operator's cap always wins. Without one, a frame size whose replay the store cannot hold, or
-  // a camera whose chunks kept reaching the byte cap, gets one sized to the chunk.
+  // a camera whose chunks kept reaching the byte cap, gets one sized to the chunk, with a buffer of
+  // one second of it: a chunk is then at most its rate over the chunk plus that second, about
+  // kMaxVideoChunkBytes at 3 s, where twice the rate would let a busy chunk reach 10 MiB.
   settings.max_bitrate_kbps = config_.max_bitrate_kbps;
   if (settings.max_bitrate_kbps == 0 &&
       (escalated_cap || ReplayNeedsBitrateCap(config_, width, height))) {
     settings.max_bitrate_kbps = DefaultCameraBitrateKbps(chunk_s);
+    settings.bufsize_kbps = settings.max_bitrate_kbps;
   }
   settings.width = width;
   settings.height = height;

@@ -266,6 +266,11 @@ TEST(H264Encoder, TheArgumentsPinTheMeasuredSettings) {
     EXPECT_EQ(NewEncoder(settings, &capped_settings)->encoder_settings(),
               "x264 ultrafast crf=28 threads=1 gop=3s maxrate=800k");
   }
+  settings.bufsize_kbps = 800;
+  std::vector<std::string> one_second = capped;
+  *(std::find(one_second.begin(), one_second.end(), "1600k")) = "800k";
+  EXPECT_EQ(FfmpegArguments(settings), one_second) << "a buffer given was not the one passed";
+  settings.bufsize_kbps = 0;
   // The buffer is twice the cap, which an int cannot hold for every cap an int can.
   settings.max_bitrate_kbps = 2147483647;
   const std::vector<std::string> widest = FfmpegArguments(settings);

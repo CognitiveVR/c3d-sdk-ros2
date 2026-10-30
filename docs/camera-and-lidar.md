@@ -84,7 +84,8 @@ a larger one is dropped and counted in `c3d.camera_access_units_dropped`.
 
 Where 28 frames of the camera's size, as yuv420p, do not fit in `replay_max_mb`, a restart could
 lose the frames that memory cannot keep, so the encoder caps its bitrate by default at 6 MiB over
-the chunk's length, 16,777 kilobits per second for a 3-second chunk. At the default 192 MiB that is
+the chunk's length, 16,777 kilobits per second for a 3-second chunk, with a buffer of one second
+of that rate, so a chunk reaches about 8 MiB at most. At the default 192 MiB that is
 a frame of more than about 4.8 million pixels, so a 4K camera recorded with `max_width_px: 0` is
 capped and a 1440p one is not.
 `max_bitrate_kbps` always wins over the default. A camera whose chunks reach 8 MiB 3 times in a
@@ -98,7 +99,7 @@ Three parameters set the encoder's trade of bytes against quality and CPU:
 | -- | -- | -- |
 | `preset` | `ultrafast` | x264's speed preset: `ultrafast` or `veryfast`. `veryfast` spends more CPU for fewer bytes, at somewhat lower quality at the same `crf` |
 | `crf` | `28` | The constant rate factor, 24 to 32. It sets the quality the encoder holds, and the bytes follow the scene: lower is higher quality and more bytes, and the size roughly doubles every 4 steps lower. Measured at the default 3-second chunks: `24` is about 1.6 to 2.2 times the bytes of `28` depending on the footage, and `32` about 0.55 to 0.6 times |
-| `max_bitrate_kbps` | `0` | A cap on the stream's bitrate in kilobits per second, held over a 2-second window by lowering quality when a scene needs more. `0` sets no cap, unless the node sets one by default, as below |
+| `max_bitrate_kbps` | `0` | A cap on the stream's bitrate in kilobits per second, held over a 2-second window by lowering quality when a scene needs more. A default cap the node sets holds over 1 second. `0` sets no cap, unless the node sets one by default, as below |
 
 Measured on a 20-second clip of a robot's 640 x 480 camera at 15 frames a second, `ultrafast`,
 encoded in 2-second chunks, against the uncompressed frames. The table shows quality, not bytes: VMAF is a video quality score out of 100, and the keypoint columns are the
