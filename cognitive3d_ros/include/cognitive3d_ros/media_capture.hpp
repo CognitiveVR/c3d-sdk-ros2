@@ -206,8 +206,6 @@ class ReplayStore {
   bool Copy(std::uint64_t token, std::string* yuv420p) const;
   void Release(std::uint64_t token);
   void Clear();
-  std::size_t size() const { return frames_.size(); }
-  std::uint64_t bytes() const { return bytes_; }
 
  private:
   std::map<std::uint64_t, std::string> frames_;
