@@ -13,6 +13,7 @@
 #include <rclcpp/version.h>
 #include <rclcpp_components/register_node_macro.hpp>
 
+#include "c3d/h264_encoder.hpp"
 #include "c3d/session.hpp"
 #include "c3d/spool.hpp"
 #include "c3d/transport.hpp"
@@ -170,6 +171,17 @@ constexpr const char* kApplicationKeyParameterRefused =
     "application_key is not a parameter: the node reads the application key only from "
     "C3D_APPLICATION_API_KEY in its environment, because anything on the ROS graph can read a "
     "parameter. Remove application_key from the parameters and export C3D_APPLICATION_API_KEY.";
+
+// Keys a 1.x params file sets that this release no longer reads: refused naming the key, rather
+// than configuring with a setting that does nothing.
+constexpr const char* kRemovedFlushKeys[] = {"camera_flush_s", "camera_flush_bytes",
+                                             "lidar_flush_s", "lidar_flush_bytes"};
+constexpr const char* kRemovedFlushKeyWhy =
+    " was removed: a camera chunk, a scan block and a cloud object each close by their own rule. "
+    "Delete the key";
+constexpr const char* kRemovedCameraFields[] = {"format", "jpeg_quality"};
+constexpr const char* kRemovedCameraFieldWhy =
+    " was removed: a camera is encoded as H.264, its quality set by preset and crf. Delete the key";
 
 // A scene id is a UUID, 8-4-4-4-12 hex digits in either case. The collector answers 200 for one
 // that names no scene and discards the session, so a placeholder left in a params file is refused.
@@ -515,11 +527,8 @@ void Cognitive3DNode::DeclareParameters() {
   declare_parameter<std::vector<std::string>>("lidars", std::vector<std::string>{});
   // Empty by default too: a sensor description is a set of session properties and nothing else.
   declare_parameter<std::vector<std::string>>("sensors", std::vector<std::string>{});
-  // Declared from the struct so the two sets of defaults cannot drift apart.
-  DeclareDouble("camera_flush_s", c3d_config_.camera_flush_s);
-  declare_parameter<int>("camera_flush_bytes", static_cast<int>(c3d_config_.camera_flush_bytes));
-  DeclareDouble("lidar_flush_s", c3d_config_.lidar_flush_s);
-  declare_parameter<int>("lidar_flush_bytes", static_cast<int>(c3d_config_.lidar_flush_bytes));
+  // The camera encoder, run as a child process: searched on PATH unless it contains a slash.
+  declare_parameter<std::string>("ffmpeg_path", "ffmpeg");
 
   declare_parameter<std::vector<std::string>>("topics", std::vector<std::string>{});
 
@@ -586,6 +595,12 @@ bool Cognitive3DNode::LoadConfig(std::string* error) {
           kApplicationKeyParameter) != 0) {
     if (error) *error = kApplicationKeyParameterRefused;
     return false;
+  }
+  for (const char* removed : kRemovedFlushKeys) {
+    if (get_node_parameters_interface()->get_parameter_overrides().count(removed) != 0) {
+      if (error) *error = std::string(removed) + kRemovedFlushKeyWhy;
+      return false;
+    }
   }
   // Mandatory values the node resolves itself. They are reported together with
   // `Config::Validate`'s own, so one refusal names everything a fresh params file is missing.
@@ -969,22 +984,7 @@ bool Cognitive3DNode::LoadConfig(std::string* error) {
 }
 
 bool Cognitive3DNode::LoadMediaConfig(std::string* error) {
-  c3d_config_.camera_flush_s = get_parameter("camera_flush_s").as_double();
-  // Negative values are refused before the cast to unsigned; Config::Validate then bounds the
-  // rest.
-  std::int64_t flush_bytes = 0;
-  if (!ReadInt("camera_flush_bytes", 0, std::numeric_limits<std::int64_t>::max(), &flush_bytes,
-               error)) {
-    return false;
-  }
-  c3d_config_.camera_flush_bytes = static_cast<std::uint64_t>(flush_bytes);
-  c3d_config_.lidar_flush_s = get_parameter("lidar_flush_s").as_double();
-  if (!ReadInt("lidar_flush_bytes", 0, std::numeric_limits<std::int64_t>::max(), &flush_bytes,
-               error)) {
-    return false;
-  }
-  c3d_config_.lidar_flush_bytes = static_cast<std::uint64_t>(flush_bytes);
-
+  ffmpeg_path_ = get_parameter("ffmpeg_path").as_string();
   camera_configs_.clear();
   lidar_configs_.clear();
   cameras_.clear();
@@ -1011,8 +1011,15 @@ bool Cognitive3DNode::LoadMediaConfig(std::string* error) {
     const std::string key = "camera." + name;
     if (!has_parameter(key + ".topic")) declare_parameter<std::string>(key + ".topic", "");
     DeclareDouble(key + ".rate_hz", 30.0);
-    if (!has_parameter(key + ".format")) declare_parameter<std::string>(key + ".format", "jpeg");
-    if (!has_parameter(key + ".jpeg_quality")) declare_parameter<int>(key + ".jpeg_quality", 80);
+    // Declared from the struct so the two sets of defaults cannot drift apart.
+    const CameraConfig defaults;
+    if (!has_parameter(key + ".preset"))
+      declare_parameter<std::string>(key + ".preset", defaults.preset);
+    if (!has_parameter(key + ".crf")) declare_parameter<int>(key + ".crf", defaults.crf);
+    if (!has_parameter(key + ".max_bitrate_kbps"))
+      declare_parameter<int>(key + ".max_bitrate_kbps", defaults.max_bitrate_kbps);
+    if (!has_parameter(key + ".replay_max_mb"))
+      declare_parameter<int>(key + ".replay_max_mb", defaults.replay_max_mb);
     if (!has_parameter(key + ".max_width_px")) declare_parameter<int>(key + ".max_width_px", 640);
     if (!has_parameter(key + ".frame")) declare_parameter<std::string>(key + ".frame", "");
     DeclareDouble(key + ".hfov_degrees", 0.0);
@@ -1085,12 +1092,18 @@ bool Cognitive3DNode::LoadMediaConfig(std::string* error) {
       return false;
     }
     camera.rate_hz = get_parameter(key + ".rate_hz").as_double();
-    camera.format = get_parameter(key + ".format").as_string();
+    camera.preset = get_parameter(key + ".preset").as_string();
     // Narrowed only once in range: an int64 wraps into an int silently, and a wrapped value can
     // land back inside the range ValidateCameraConfig accepts.
     std::int64_t narrowed = 0;
-    if (!ReadInt(key + ".jpeg_quality", 1, 100, &narrowed, error)) return false;
-    camera.jpeg_quality = static_cast<int>(narrowed);
+    if (!ReadInt(key + ".crf", kMinCameraCrf, kMaxCameraCrf, &narrowed, error)) return false;
+    camera.crf = static_cast<int>(narrowed);
+    if (!ReadInt(key + ".max_bitrate_kbps", 0, kMaxCameraBitrateKbps, &narrowed, error)) {
+      return false;
+    }
+    camera.max_bitrate_kbps = static_cast<int>(narrowed);
+    if (!ReadInt(key + ".replay_max_mb", 1, kMaxCameraReplayMb, &narrowed, error)) return false;
+    camera.replay_max_mb = static_cast<int>(narrowed);
     if (!ReadInt(key + ".max_width_px", 0, std::numeric_limits<int>::max(), &narrowed, error)) {
       return false;
     }
@@ -1189,8 +1202,19 @@ bool Cognitive3DNode::LoadMediaConfig(std::string* error) {
     lidar_configs_.push_back(lidar);
   }
 
+  // Asked once at configure rather than discovered at the first frame: without a usable encoder
+  // every frame is dropped while the run looks configured.
+  if (!camera_configs_.empty()) {
+    std::string version;
+    const std::string unusable = ProbeCameraEncoders(ffmpeg_path_, camera_configs_, &version);
+    if (!unusable.empty()) {
+      if (error) *error = FfmpegProblem(ffmpeg_path_, unusable) + ". " + kFfmpegRemedy;
+      return false;
+    }
+  }
+
   for (const auto& camera : camera_configs_) {
-    cameras_.push_back(std::make_unique<CameraCapture>(camera));
+    cameras_.push_back(std::make_unique<CameraCapture>(camera, ffmpeg_path_));
   }
   for (const auto& lidar : lidar_configs_) {
     lidars_.push_back(std::make_unique<LidarCapture>(lidar));
@@ -1337,6 +1361,12 @@ std::string Cognitive3DNode::UnreadBlockKey(const std::string& block, const std:
              prefix + unlisted + ".* key";
     }
     if (has_parameter(key)) continue;
+    if (block == "camera" && rest.size() > name.size()) {
+      const std::string field = rest.substr(name.size() + 1);
+      for (const char* removed : kRemovedCameraFields) {
+        if (field == removed) return key + kRemovedCameraFieldWhy;
+      }
+    }
     const std::string own = prefix + name + ".";
     std::string fields;
     for (const std::string& declared : list_parameters({prefix + name}, 0).names) {
@@ -1789,10 +1819,13 @@ bool Cognitive3DNode::StartSession(const std::string& participant_id,
       session->SetProperty(prefix + "topic", camera.topic);
       session->SetProperty(prefix + "rate_hertz", camera.rate_hz);
       session->SetProperty(prefix + "max_width_pixels", camera.max_width_px);
-      session->SetProperty(prefix + "jpeg_quality", camera.jpeg_quality);
-      session->SetProperty(prefix + "format", camera.format);
-      // The parameters in force, 0 when unset, and where each frame's field of view comes
-      // from. The angles themselves travel per frame; these say how they were chosen.
+      session->SetProperty(prefix + "codec", std::string("h264"));
+      session->SetProperty(prefix + "preset", camera.preset);
+      session->SetProperty(prefix + "crf", camera.crf);
+      session->SetProperty(prefix + "max_bitrate_kilobits_per_second", camera.max_bitrate_kbps);
+      session->SetProperty(prefix + "chunk_seconds", c3d::kVideoChunkSeconds);
+      // The parameters in force, 0 when unset, and where each chunk's field of view comes
+      // from. The angles themselves travel with each chunk; these say how they were chosen.
       session->SetProperty(prefix + "hfov_degrees", camera.hfov_degrees);
       session->SetProperty(prefix + "vfov_degrees", camera.vfov_degrees);
       session->SetProperty(prefix + "fov_source", std::string(capture->fov_source()));
@@ -2218,6 +2251,8 @@ std::optional<double> Cognitive3DNode::SessionEndOnWire() const {
 }
 
 void Cognitive3DNode::StopSession(const std::string& reason) {
+  // Before End: the runner must still take the last access units each encoder drains.
+  StopCameraEncoders(cameras_);
   if (runner_) runner_->End(reason, SessionEndOnWire());
   session_from_activation_ = false;
   // The remembered request dies with the session it described. Every deliberate end comes through
@@ -2679,6 +2714,10 @@ void Cognitive3DNode::RecordLidarTypeProperties(const LidarConfig& lidar,
   session->SetProperty(prefix + "pointcloud.intensity",
                        std::string(c3d::PointIntensityName(lidar.pointcloud.intensity)));
   session->SetProperty(prefix + "pointcloud.zstd_level", lidar.pointcloud.zstd_level);
+  // The encoding written, which float32 positions and a zstd_level of 0 overrule.
+  session->SetProperty(prefix + "pointcloud.encoding",
+                       std::string(c3d::PointCloudEncodingName(
+                           c3d::pointcloud::EffectiveEncoding(lidar.pointcloud))));
 }
 
 void Cognitive3DNode::OnMediaMessage(const std::string& key,
@@ -2812,6 +2851,8 @@ void Cognitive3DNode::OnSampleTimer() {
       session_name = requested_session_name_;
       properties = requested_session_properties_;
     }
+    // Before End, as in StopSession: the runner must still take the last access units.
+    StopCameraEncoders(cameras_);
     runner_->End("ros_time_jumped_backwards", SessionEndOnWire());
     if (!StartSession(participant_id, /*reuse_remote_variables=*/true)) {
       RCLCPP_ERROR(get_logger(), "could not reopen a session after the backward clock jump");
@@ -2930,9 +2971,11 @@ void Cognitive3DNode::RecordSelfTelemetry(double wire_time) {
   // Per sensor, because "the camera stream is healthy" is not a fact a fleet has:
   // one camera's pose failures and another's are different problems with the same
   // symptom in an aggregate.
+  const std::map<std::string, std::uint64_t>& too_large = stats.camera_chunks_too_large;
   for (const auto& capture : cameras_) {
     const std::string prefix = "c3d.camera." + capture->config().name + ".";
-    const CameraStats& stats = capture->stats();
+    // A copy: the encoder's reader thread advances frames and bytes while this reads them.
+    const CameraStats stats = capture->stats();
     session->RecordSensor(prefix + "frames", wire_time, static_cast<double>(stats.frames));
     session->RecordSensor(prefix + "bytes", wire_time, static_cast<double>(stats.bytes));
     session->RecordSensor(prefix + "pose_failures", wire_time,
@@ -2941,10 +2984,32 @@ void Cognitive3DNode::RecordSelfTelemetry(double wire_time) {
     // between it and zero: a rate gate dropping frames and a codec refusing them
     // look identical in `frames` alone, and only one of them is a misconfiguration.
     session->RecordSensor(prefix + "refused", wire_time, static_cast<double>(stats.refused));
+    session->RecordSensor(prefix + "dropped_backlog", wire_time,
+                          static_cast<double>(stats.dropped_backlog));
+    // These two count since configure: the stop that ends a session comes after its last
+    // tick, so a drop there shows in the next session's series.
+    session->RecordSensor(prefix + "dropped_at_stop", wire_time,
+                          static_cast<double>(stats.dropped_at_stop));
+    session->RecordSensor(prefix + "dropped_no_session", wire_time,
+                          static_cast<double>(stats.dropped_no_session));
+    session->RecordSensor(prefix + "encoder_restarts", wire_time,
+                          static_cast<double>(stats.encoder_restarts));
+    session->RecordSensor(prefix + "gap_restarts", wire_time,
+                          static_cast<double>(stats.gap_restarts));
+    session->RecordSensor(prefix + "size_restarts", wire_time,
+                          static_cast<double>(stats.size_restarts));
+    session->RecordSensor(prefix + "dropped_replay", wire_time,
+                          static_cast<double>(stats.dropped_replay));
+    session->RecordSensor(prefix + "backward_stamps", wire_time,
+                          static_cast<double>(stats.backward_stamps));
+    const auto rejected = too_large.find(capture->config().name);
+    session->RecordSensor(prefix + "rejected_too_large", wire_time,
+                          rejected == too_large.end() ? 0.0
+                                                      : static_cast<double>(rejected->second));
   }
   for (const auto& capture : lidars_) {
     const std::string prefix = "c3d.lidar." + capture->config().name + ".";
-    const LidarStats& stats = capture->stats();
+    const LidarStats stats = capture->stats();
     session->RecordSensor(prefix + "scans", wire_time, static_cast<double>(stats.scans));
     session->RecordSensor(prefix + "bytes", wire_time, static_cast<double>(stats.bytes));
     session->RecordSensor(prefix + "dropped_oversize", wire_time,
@@ -2954,6 +3019,8 @@ void Cognitive3DNode::RecordSelfTelemetry(double wire_time) {
     session->RecordSensor(prefix + "pose_failures", wire_time,
                           static_cast<double>(stats.pose_failures));
     session->RecordSensor(prefix + "refused", wire_time, static_cast<double>(stats.refused));
+    session->RecordSensor(prefix + "backward_stamps", wire_time,
+                          static_cast<double>(stats.backward_stamps));
   }
 }
 

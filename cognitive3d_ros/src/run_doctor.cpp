@@ -35,6 +35,7 @@
 #include <ament_index_cpp/get_package_prefix.hpp>
 
 #include "c3d/environment.hpp"
+#include "c3d/h264_encoder.hpp"
 #include "c3d/spool.hpp"
 #include "c3d/transport.hpp"
 #include "cognitive3d_ros/doctor.hpp"
@@ -386,9 +387,17 @@ std::vector<cognitive3d_ros::doctor::MediaSensorFacts> ProbeMediaSensors(
       std::string why;
       std::uint64_t bytes = 0;
       if (is_camera) {
-        cognitive3d_ros::CameraCapture capture(cameras[probe->index]);
-        std::uint16_t width = 0, height = 0;
-        capture.MeasureEncodedFrame(sensor.type, *probe->sample, &bytes, &width, &height, &why);
+        // Prepared exactly as the run prepares a frame, for its size; nothing is encoded.
+        const cognitive3d_ros::CameraCapture capture(cameras[probe->index],
+                                                     node->resolved_ffmpeg_path());
+        cognitive3d_ros::PreparedFrame frame;
+        if (capture.PrepareFrame(sensor.type, *probe->sample, &frame, &why)) {
+          sensor.prepared_width = frame.width;
+          sensor.prepared_height = frame.height;
+        }
+        sensor.crf = cameras[probe->index].crf;
+        sensor.max_bitrate_kbps = cameras[probe->index].max_bitrate_kbps;
+        sensor.replay_max_mb = cameras[probe->index].replay_max_mb;
       } else {
         cognitive3d_ros::LidarCapture capture(lidars[probe->index]);
         capture.MeasureEncodedScan(sensor.type, *probe->sample, convention, &bytes, &why);
@@ -934,6 +943,17 @@ int RunDoctor(int argc, char** argv, const NodeFactory& make, const std::string&
     }
     facts.publishers = node->count_publishers(sensor.topic);
     checks.push_back(doctor::CheckSensorTopic(facts));
+  }
+
+  {
+    cognitive3d_ros::doctor::CameraEncoderFacts encoder;
+    encoder.cameras = node->resolved_cameras().size();
+    encoder.ffmpeg_path = node->resolved_ffmpeg_path();
+    if (encoder.cameras > 0) {
+      encoder.problem = cognitive3d_ros::ProbeCameraEncoders(
+          encoder.ffmpeg_path, node->resolved_cameras(), &encoder.version);
+    }
+    checks.push_back(cognitive3d_ros::doctor::CheckCameraEncoder(encoder));
   }
 
   // Last, because it is the only check that opens subscriptions of its own and

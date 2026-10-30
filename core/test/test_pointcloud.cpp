@@ -74,6 +74,56 @@ void DecodeRgb332(std::uint8_t v, int* r, int* g, int* b) {
 
 }  // namespace
 
+// The ceiling on max_points is the most points whose worst case encoding stays within the bytes
+// given: the planar block at zstd level 0, zstd's bound over it otherwise.
+TEST(PointCloudEncoder, MaxPointsWithinIsTheLargestCountWhoseWorstCaseFits) {
+  const std::uint64_t bytes = 8ull * 1024 * 1024;
+  PointCloudOptions options;
+  options.zstd_level = 0;
+  EXPECT_EQ(pointcloud::MaxPointsWithin(bytes, options), bytes / 6);
+  options.position = PointPosition::kFloat32;
+  options.color = PointColor::kRgb888;
+  options.intensity = PointIntensity::kUint8;
+  EXPECT_EQ(pointcloud::MaxPointsWithin(bytes, options), bytes / 16);
+  for (const PointPosition position : {PointPosition::kInt16Mm, PointPosition::kFloat32}) {
+    options.position = position;
+    options.zstd_level = 3;
+    const std::size_t n = pointcloud::MaxPointsWithin(bytes, options);
+    const std::size_t per_point = position == PointPosition::kFloat32 ? 16 : 10;
+    EXPECT_LE(ZSTD_compressBound(n * per_point), bytes);
+    EXPECT_GT(ZSTD_compressBound((n + 1) * per_point), bytes);
+  }
+}
+
+// A cloud at the ceiling, of points zstd cannot shrink, encodes within the bytes the ceiling was
+// taken for.
+TEST(PointCloudEncoder, ACloudAtTheCeilingEncodesWithinItsBytes) {
+  const std::uint64_t bytes = 8ull * 1024 * 1024;
+  PointCloudOptions options = RawOptions();
+  options.position = PointPosition::kFloat32;
+  options.color = PointColor::kRgb888;
+  options.intensity = PointIntensity::kUint8;
+  options.zstd_level = 3;
+  const std::size_t n = pointcloud::MaxPointsWithin(bytes, options);
+  options.max_points = n;
+  std::mt19937 random(7);
+  std::uniform_real_distribution<float> metres(-30.0f, 30.0f);
+  PointCloudInput input;
+  for (std::size_t i = 0; i < n; ++i) {
+    for (int axis = 0; axis < 3; ++axis) input.xyz.push_back(metres(random));
+    for (int channel = 0; channel < 3; ++channel) {
+      input.rgb.push_back(static_cast<std::uint8_t>(random()));
+    }
+    input.intensity.push_back(static_cast<float>(random() % 256));
+  }
+  input.intensity_is_integral = true;
+  const EncodedPointCloud cloud = pointcloud::Encode(input, options);
+  ASSERT_TRUE(cloud.ok) << cloud.reason;
+  EXPECT_EQ(cloud.point_count, n);
+  EXPECT_GT(cloud.data.size(), bytes * 9 / 10) << "the points compressed; the test proves nothing";
+  EXPECT_LE(cloud.data.size(), bytes);
+}
+
 TEST(PointCloudEncoder, VoxelCellCollapsesToItsCentroid) {
   PointCloudInput input;
   // Three points inside one 10 cm cell and one well outside it.
@@ -379,13 +429,18 @@ TEST(PointCloudEncoder, ZstdRoundTripsAndLevelZeroIsThePlainBlock) {
   EXPECT_EQ(plain.zstd_level, 0u);
   EXPECT_EQ(plain.data.size(), plain.raw_bytes);
 
-  PointCloudOptions compressed_options = raw;
-  compressed_options.zstd_level = 1;
-  const EncodedPointCloud compressed = pointcloud::Encode(input, compressed_options);
+  // The encoder's own defaults, every point kept so the block compares with the plain one: zstd
+  // level 3 over delta-coded, byte-shuffled position planes.
+  PointCloudOptions defaults;
+  defaults.voxel_leaf_m = 0.0;
+  const EncodedPointCloud compressed = pointcloud::Encode(input, defaults);
   ASSERT_TRUE(compressed.ok);
-  EXPECT_EQ(compressed.zstd_level, 1u);
+  EXPECT_EQ(compressed.zstd_level, 3u);
+  EXPECT_EQ(compressed.encoding, PointCloudEncoding::kPlanarDeltaShuffleZstd);
   EXPECT_LT(compressed.data.size(), plain.data.size());
-  EXPECT_EQ(Decompress(compressed), plain.data);
+  EXPECT_EQ(pointcloud::InverseDeltaShufflePositionPlanes(Decompress(compressed),
+                                                          compressed.point_count, 2),
+            plain.data);
 }
 
 TEST(PointCloudEncoder, WireSpellingsAreTheLowercaseConstantsTheGatewayValidates) {
@@ -415,4 +470,166 @@ TEST(PointCloudEncoder, AnEmptyCloudIsRefusedRatherThanEncodedAsZeroPoints) {
   PointCloudInput all_far;
   all_far.xyz = {5000.0f, 0.0f, 0.0f};
   EXPECT_EQ(pointcloud::Encode(all_far, RawOptions()).reason, "no_points_in_range");
+}
+
+namespace {
+
+PointCloudInput ThreePointFixture() {
+  PointCloudInput input;
+  input.xyz = {0.001f, 0.002f, 0.003f,
+               0.004f, 0.005f, 0.006f,
+               0.007f, 0.008f, 0.009f};
+  input.rgb = {255, 0, 0, 0, 255, 0, 0, 0, 255};
+  input.intensity = {10.0f, 20.0f, 30.0f};
+  input.intensity_is_integral = true;
+  return input;
+}
+
+PointCloudInput RandomCloud(unsigned seed, int points) {
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<float> position(-30.0f, 30.0f);
+  std::uniform_int_distribution<int> byte(0, 255);
+  PointCloudInput input;
+  for (int i = 0; i < points; ++i) {
+    for (int axis = 0; axis < 3; ++axis) input.xyz.push_back(position(rng));
+    for (int channel = 0; channel < 3; ++channel) {
+      input.rgb.push_back(static_cast<std::uint8_t>(byte(rng)));
+    }
+    input.intensity.push_back(static_cast<float>(byte(rng)));
+  }
+  input.intensity_is_integral = true;
+  return input;
+}
+
+}  // namespace
+
+TEST(PointCloudEncoder, DeltaShuffleOfThreePointsIsByteExact) {
+  PointCloudOptions options = RawOptions();
+  options.color = PointColor::kRgb888;
+  options.intensity = PointIntensity::kUint8;
+  const EncodedPointCloud plain = pointcloud::Encode(ThreePointFixture(), options);
+  ASSERT_TRUE(plain.ok) << plain.reason;
+
+  const std::string transformed = pointcloud::DeltaShufflePositionPlanes(plain.data, 3, 2);
+  const std::string expected(
+      "\x01\x03\x03\x00\x00\x00"          // X deltas 1,3,3: low bytes, then high bytes
+      "\x02\x03\x03\x00\x00\x00"          // Y deltas 2,3,3
+      "\x03\x03\x03\x00\x00\x00"          // Z deltas 3,3,3
+      "\xff\x00\x00\x00\xff\x00\x00\x00\xff"  // C[3], rgb888, verbatim
+      "\x0a\x14\x1e",                     // I[3], uint8, verbatim
+      3 * 2 * 3 + 9 + 3);
+  EXPECT_EQ(transformed, expected);
+  EXPECT_EQ(pointcloud::InverseDeltaShufflePositionPlanes(transformed, 3, 2), plain.data);
+}
+
+TEST(PointCloudEncoder, DeltaShuffleRoundTripsAndLeavesTheAttributePlanesAlone) {
+  PointCloudOptions options = RawOptions();
+  options.color = PointColor::kRgb565;
+  options.intensity = PointIntensity::kUint8;
+  const EncodedPointCloud plain = pointcloud::Encode(RandomCloud(7, 1000), options);
+  ASSERT_TRUE(plain.ok) << plain.reason;
+  const std::size_t n = plain.point_count;
+  ASSERT_GT(n, 0u);
+
+  const std::string transformed = pointcloud::DeltaShufflePositionPlanes(plain.data, n, 2);
+  ASSERT_EQ(transformed.size(), plain.data.size());
+  EXPECT_NE(transformed, plain.data);
+  const std::size_t positions = n * 2 * 3;
+  EXPECT_EQ(transformed.substr(positions), plain.data.substr(positions));
+  EXPECT_EQ(pointcloud::InverseDeltaShufflePositionPlanes(transformed, n, 2), plain.data);
+}
+
+TEST(PointCloudEncoder, TheResultSaysWhichEncodingWasWritten) {
+  const PointCloudInput input = RandomCloud(11, 300);
+
+  PointCloudOptions shuffled = RawOptions();
+  shuffled.encoding = PointCloudEncoding::kPlanarDeltaShuffleZstd;
+  shuffled.zstd_level = 3;
+  const EncodedPointCloud delta = pointcloud::Encode(input, shuffled);
+  ASSERT_TRUE(delta.ok);
+  EXPECT_EQ(delta.encoding, PointCloudEncoding::kPlanarDeltaShuffleZstd);
+
+  const std::string plain_block = pointcloud::Encode(input, RawOptions()).data;
+
+  PointCloudOptions raw = shuffled;
+  raw.zstd_level = 0;
+  const EncodedPointCloud raw_cloud = pointcloud::Encode(input, raw);
+  ASSERT_TRUE(raw_cloud.ok);
+  EXPECT_EQ(raw_cloud.encoding, PointCloudEncoding::kPlanarZstd);
+  EXPECT_EQ(raw_cloud.zstd_level, 0u);
+  EXPECT_EQ(raw_cloud.data, plain_block);
+
+  PointCloudOptions floats = shuffled;
+  floats.position = PointPosition::kFloat32;
+  const EncodedPointCloud float_cloud = pointcloud::Encode(input, floats);
+  ASSERT_TRUE(float_cloud.ok);
+  EXPECT_EQ(float_cloud.encoding, PointCloudEncoding::kPlanarZstd);
+  PointCloudOptions float_raw = RawOptions();
+  float_raw.position = PointPosition::kFloat32;
+  EXPECT_EQ(Decompress(float_cloud), pointcloud::Encode(input, float_raw).data);
+
+  PointCloudOptions plain_zstd = shuffled;
+  plain_zstd.encoding = PointCloudEncoding::kPlanarZstd;
+  const EncodedPointCloud plain = pointcloud::Encode(input, plain_zstd);
+  ASSERT_TRUE(plain.ok);
+  EXPECT_EQ(plain.encoding, PointCloudEncoding::kPlanarZstd);
+  std::string expected_zstd(ZSTD_compressBound(plain_block.size()), '\0');
+  const std::size_t expected_size = ZSTD_compress(&expected_zstd[0], expected_zstd.size(),
+                                                  plain_block.data(), plain_block.size(), 3);
+  ASSERT_FALSE(ZSTD_isError(expected_size));
+  expected_zstd.resize(expected_size);
+  EXPECT_EQ(plain.data, expected_zstd);
+}
+
+// What the session property states is what Encode writes, for every combination the encoding can
+// be asked for in.
+TEST(PointCloudEncoder, TheEffectiveEncodingIsTheOneEncodeWrites) {
+  const PointCloudInput input = RandomCloud(13, 200);
+  for (const PointCloudEncoding asked :
+       {PointCloudEncoding::kPlanarDeltaShuffleZstd, PointCloudEncoding::kPlanarZstd}) {
+    for (const PointPosition position : {PointPosition::kInt16Mm, PointPosition::kFloat32}) {
+      for (const int level : {0, 3}) {
+        SCOPED_TRACE(std::string(PointCloudEncodingName(asked)) + " " +
+                     PointPositionName(position) + " level " + std::to_string(level));
+        PointCloudOptions options = RawOptions();
+        options.encoding = asked;
+        options.position = position;
+        options.zstd_level = level;
+        const bool delta = asked == PointCloudEncoding::kPlanarDeltaShuffleZstd &&
+                           position == PointPosition::kInt16Mm && level > 0;
+        const PointCloudEncoding expected =
+            delta ? PointCloudEncoding::kPlanarDeltaShuffleZstd : PointCloudEncoding::kPlanarZstd;
+        EXPECT_EQ(pointcloud::EffectiveEncoding(options), expected);
+        const EncodedPointCloud encoded = pointcloud::Encode(input, options);
+        ASSERT_TRUE(encoded.ok) << encoded.reason;
+        EXPECT_EQ(encoded.encoding, expected);
+      }
+    }
+  }
+}
+
+TEST(PointCloudEncoder, DeltaShuffledOutputDecodesToTheSamePointsAsThePlainBlock) {
+  const PointCloudInput input = RandomCloud(23, 2000);
+  PointCloudOptions options = RawOptions();
+  options.color = PointColor::kRgb565;
+  options.intensity = PointIntensity::kUint8;
+  const EncodedPointCloud plain = pointcloud::Encode(input, options);
+  ASSERT_TRUE(plain.ok);
+
+  options.encoding = PointCloudEncoding::kPlanarDeltaShuffleZstd;
+  options.zstd_level = 3;
+  const EncodedPointCloud delta = pointcloud::Encode(input, options);
+  ASSERT_TRUE(delta.ok);
+  ASSERT_EQ(delta.encoding, PointCloudEncoding::kPlanarDeltaShuffleZstd);
+  EXPECT_EQ(delta.point_count, plain.point_count);
+  EXPECT_EQ(delta.raw_bytes, plain.raw_bytes);
+
+  const std::string block = Decompress(delta);
+  EXPECT_EQ(pointcloud::InverseDeltaShufflePositionPlanes(block, delta.point_count, 2), plain.data);
+}
+
+TEST(PointCloudEncoder, EncodingNamesAreTheSchemaEnumerants) {
+  EXPECT_STREQ(PointCloudEncodingName(PointCloudEncoding::kPlanarZstd), "planarZstd");
+  EXPECT_STREQ(PointCloudEncodingName(PointCloudEncoding::kPlanarDeltaShuffleZstd),
+               "planarDeltaShuffleZstd");
 }

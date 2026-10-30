@@ -3,7 +3,10 @@
 - `tools/release/changelog_section.sh` prints exactly one version's notes, matches the version as a
   literal rather than as a pattern, and refuses a missing or empty section. With `--release` it
   also refuses an undated heading and an HTML comment, and makes every relative link absolute.
-- `tools/release/pin_control.py` pins exactly the named packages in a debian/control's Depends.
+- `tools/release/pin_control.py` pins exactly the named packages in a debian/control's Depends,
+  and adds the named packages to its Recommends, refusing one that is already in Depends.
+- `cognitive3d_ros/package.xml` makes ffmpeg a recommendation of the deb, not a dependency: only a
+  camera needs it.
 - `tools/release/build_debs.sh` and `smoke_test.sh` refuse a distro they do not know before they
   start a container.
 - `tools/release/rosdep.yaml` has a key, for every distro the release builds, for each of this
@@ -317,6 +320,58 @@ class PinControl(unittest.TestCase):
                                      capture_output=True, text=True)
             self.assertEqual(refused.returncode, 1)
             self.assertEqual(control.read_text(), before)
+
+
+class Recommend(unittest.TestCase):
+    recommend = staticmethod(load_pin_control().recommend)
+
+    def test_a_recommends_field_is_added_after_depends(self):
+        text, recommends = self.recommend(CONTROL, ['ffmpeg'])
+        self.assertEqual(recommends, 'ffmpeg')
+        self.assertIn(' ros-jazzy-cognitive3d-ros (= 1.2.0), ros-jazzy-nav2-msgs\n'
+                      'Recommends: ffmpeg\nDescription:', text)
+        self.assertIn('Build-Depends: debhelper (>= 9.0.0), ros-jazzy-cognitive3d-ros, '
+                      'ros-jazzy-nav2-msgs\n', text)
+
+    def test_an_existing_recommends_field_is_extended_once(self):
+        text = CONTROL.replace('Description:', 'Recommends: python3\nDescription:')
+        text, recommends = self.recommend(text, ['ffmpeg', 'python3'])
+        self.assertEqual(recommends, 'python3, ffmpeg')
+        self.assertEqual(text.count('Recommends:'), 1)
+
+    def test_a_package_in_depends_cannot_be_only_recommended(self):
+        with self.assertRaisesRegex(ValueError, 'ros-jazzy-nav2-msgs is in Depends'):
+            self.recommend(CONTROL, ['ros-jazzy-nav2-msgs'])
+
+    def test_the_command_line_pins_and_recommends_together(self):
+        with tempfile.TemporaryDirectory() as directory:
+            control = pathlib.Path(directory) / 'control'
+            control.write_text(CONTROL)
+            script = str(RELEASE / 'pin_control.py')
+            ok = subprocess.run(['python3', script, str(control), '--recommends', 'ffmpeg',
+                                 'ros-jazzy-cognitive3d-ros=1.2.0-0noble'],
+                                capture_output=True, text=True)
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            written = control.read_text()
+            self.assertIn('ros-jazzy-cognitive3d-ros (= 1.2.0-0noble)', written)
+            self.assertIn('Recommends: ffmpeg\n', written)
+            alone = subprocess.run(['python3', script, str(control), '--recommends', 'x264'],
+                                   capture_output=True, text=True)
+            self.assertEqual(alone.returncode, 0, alone.stderr)
+            self.assertIn('Recommends: ffmpeg, x264\n', control.read_text())
+            usage = subprocess.run(['python3', script, str(control), '--recommends'],
+                                   capture_output=True, text=True)
+            self.assertEqual(usage.returncode, 2)
+
+
+class FfmpegIsRecommended(unittest.TestCase):
+    def test_the_node_package_recommends_ffmpeg_and_only_its_tests_depend_on_it(self):
+        manifest = ET.parse(REPO / 'cognitive3d_ros' / 'package.xml').getroot()
+        recommended = [e.text.strip() for e in manifest.findall('export/deb_recommends')]
+        self.assertEqual(recommended, ['ffmpeg'])
+        for tag in ('depend', 'exec_depend', 'build_export_depend'):
+            self.assertNotIn('ffmpeg', [e.text.strip() for e in manifest.findall(tag)], tag)
+        self.assertIn('ffmpeg', [e.text.strip() for e in manifest.findall('test_depend')])
 
 
 class ContainerScriptsRefuseBadArguments(unittest.TestCase):

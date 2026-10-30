@@ -1260,8 +1260,6 @@ TEST(ConfigValidateSizes, ANegativeSizeThatWrappedOnTheWayInIsRefused) {
     EXPECT_NE(problem.find(name), std::string::npos) << name << ": " << problem;
   };
   refused("spool_max_bytes", [&](Config& c) { c.spool_max_bytes = minus_one_mib; });
-  refused("camera_flush_bytes", [](Config& c) { c.camera_flush_bytes = static_cast<std::uint64_t>(-5); });
-  refused("lidar_flush_bytes", [](Config& c) { c.lidar_flush_bytes = static_cast<std::uint64_t>(-5); });
   refused("gaze_batch", [](Config& c) { c.gaze_batch = static_cast<std::size_t>(-1); });
   refused("max_records_per_batch",
           [](Config& c) { c.max_records_per_batch = static_cast<std::size_t>(-1); });
@@ -1273,14 +1271,14 @@ TEST(ConfigValidateSizes, ANegativeSizeThatWrappedOnTheWayInIsRefused) {
           [](Config& c) { c.wall_clock_floor_epoch_s = std::numeric_limits<double>::infinity(); });
   // Each by its own name, and NaN as well as a non-positive value: NaN fails every comparison.
   for (const double bad : {0.0, -1.0, std::numeric_limits<double>::quiet_NaN()}) {
-    Config camera = cfg;
-    camera.camera_flush_s = bad;
-    EXPECT_NE(camera.Validate().find("camera_flush_s"), std::string::npos) << bad;
-    EXPECT_EQ(camera.Validate().find("lidar_flush_s"), std::string::npos) << camera.Validate();
-    Config lidar = cfg;
-    lidar.lidar_flush_s = bad;
-    EXPECT_NE(lidar.Validate().find("lidar_flush_s"), std::string::npos) << bad;
-    EXPECT_EQ(lidar.Validate().find("camera_flush_s"), std::string::npos) << lidar.Validate();
+    Config scans = cfg;
+    scans.scan_block_idle_s = bad;
+    EXPECT_NE(scans.Validate().find("scan_block_idle_s"), std::string::npos) << bad;
+    EXPECT_EQ(scans.Validate().find("cloud_object_idle_s"), std::string::npos) << scans.Validate();
+    Config clouds = cfg;
+    clouds.cloud_object_idle_s = bad;
+    EXPECT_NE(clouds.Validate().find("cloud_object_idle_s"), std::string::npos) << bad;
+    EXPECT_EQ(clouds.Validate().find("scan_block_idle_s"), std::string::npos) << clouds.Validate();
   }
 
   Config fine = cfg;

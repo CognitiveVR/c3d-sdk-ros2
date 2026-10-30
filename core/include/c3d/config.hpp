@@ -60,22 +60,20 @@ struct Config {
   // growing without limit, which is how telemetry agents OOM a robot.
   std::size_t max_records_per_batch = 20000;
 
-  // The binary streams are cut on whichever bound is reached first. They are
-  // bounded by BYTES as well as by time because one camera frame is three orders
-  // of magnitude larger than one gaze sample: a count-based batch that is right
-  // for a 250x250 still is a 40 MB payload on a 4K one, and the platform drops a
-  // single frame over 1 MB after the upload carrying it has been accepted.
-  double camera_flush_s = 2.0;
-  std::uint64_t camera_flush_bytes = 4ull * 1024 * 1024;
-  double lidar_flush_s = 2.0;
-  std::uint64_t lidar_flush_bytes = 4ull * 1024 * 1024;
+  // A scan block or a cloud object closes on its own bounds (c3d/sensor_blocks.hpp)
+  // and also once its sensor has delivered nothing for this long, so a sensor that
+  // stops leaves nothing buffered. A video chunk has no idle close: it closes at the
+  // encoder's next keyframe, or at End().
+  double scan_block_idle_s = 3.0;
+  double cloud_object_idle_s = 5.0;
 
   // ---- Transport -----------------------------------------------------------
   // An upload is judged by whether it is MOVING, not by how long it takes. A part
-  // is up to camera_flush_bytes of camera frames, and on a slow uplink sending one
-  // legitimately takes longer than any fixed timeout short enough to catch a dead
-  // link -- a 1.5 MB part at 100 kB/s is 15 s -- so a fixed timeout fails the same
-  // part forever, and the oldest part blocks every stream behind it. So:
+  // is a video chunk of one keyframe interval or a cloud object of up to 2 MiB, and
+  // on a slow uplink sending one legitimately takes longer than any fixed timeout
+  // short enough to catch a dead link -- a 1.5 MB part at 100 kB/s is 15 s -- so a
+  // fixed timeout fails the same part forever, and the oldest part blocks every
+  // stream behind it. So:
   //
   //   * `http_connect_timeout_s` bounds reaching the gateway at all.
   //   * `http_low_speed_limit_bytes_per_s` over `http_low_speed_time_s` is the
@@ -85,8 +83,9 @@ struct Config {
   //     a slow link after curl has handed it the last byte, then the gateway's
   //     response -- which on a bufferbloated uplink is tens of seconds.
   //   * `http_timeout_s` is the whole-request ceiling, a safety net for a link that
-  //     trickles just above the stall limit forever. It has to clear the largest
-  //     part at the slowest rate still worth sending: 4 MB in 300 s is ~14 kB/s.
+  //     trickles just above the stall limit forever. It has to clear a 2 MiB
+  //     upload, the size at which a point-cloud object closes, at the slowest rate
+  //     still worth sending: 2 MiB in 300 s is about 7 KB/s.
   int http_timeout_s = 300;
   int http_connect_timeout_s = 10;
   int http_low_speed_limit_bytes_per_s = 1024;

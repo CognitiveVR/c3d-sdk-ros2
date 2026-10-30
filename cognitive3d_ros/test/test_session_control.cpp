@@ -1244,8 +1244,6 @@ TEST(ParameterValidation, OutOfRangeValuesAreRefusedByName) {
       {"event_rate_limit_hz", {"event_rate_limit_hz", -1.0}},
       {"spool_max_mb", {"spool_max_mb", -1}},
       {"spool_max_mb", {"spool_max_mb", 0}},
-      {"camera_flush_bytes", {"camera_flush_bytes", -1}},
-      {"lidar_flush_bytes", {"lidar_flush_bytes", -4096}},
   };
   for (const auto& [name, parameter] : refused) {
     const std::string error = ConfigureError(dir, {parameter});
@@ -1279,7 +1277,9 @@ TEST(ParameterValidation, OutOfRangeValuesAreRefusedByName) {
 
   // Per sensor, including values that would wrap back into range when narrowed to an int.
   const std::vector<std::pair<std::string, rclcpp::Parameter>> sensor = {
-      {"camera.front.jpeg_quality", {"camera.front.jpeg_quality", std::int64_t{4294967376}}},
+      {"camera.front.crf", {"camera.front.crf", std::int64_t{4294967324}}},
+      {"camera.front.max_bitrate_kbps", {"camera.front.max_bitrate_kbps", -1}},
+      {"camera.front.max_bitrate_kbps", {"camera.front.max_bitrate_kbps", 1000001}},
       {"camera.front.max_width_px", {"camera.front.max_width_px", -1}},
       {"lidar.scan.pointcloud.max_points", {"lidar.scan.pointcloud.max_points", -1}},
       {"lidar.scan.pointcloud.zstd_level",
@@ -3138,14 +3138,20 @@ TEST(NodeMediaProperties, EveryConfiguredCameraAndLidarRecordsTheConfigInForce) 
   // A whole number, as a params file writes it: an integer to rclcpp, taken as the double.
   overrides.push_back({"camera.rear.hfov_degrees", 61});
   overrides.push_back({"camera.rear.vfov_degrees", 45.5});
+  overrides.push_back({"camera.rear.preset", std::string("veryfast")});
+  overrides.push_back({"camera.rear.crf", 24});
+  overrides.push_back({"camera.rear.max_bitrate_kbps", 1500});
   overrides.push_back({"camera.side.topic", std::string("/side/image_raw/compressed")});
   overrides.push_back({"camera.side.camera_info_topic", std::string("")});
-  overrides.push_back({"lidars", std::vector<std::string>{"scan", "depth"}});
+  overrides.push_back({"lidars", std::vector<std::string>{"scan", "depth", "raw"}});
   overrides.push_back({"lidar.scan.topic", std::string("/scan")});
   overrides.push_back({"lidar.scan.intensities", true});
   overrides.push_back({"lidar.depth.topic", std::string("/points")});
   overrides.push_back({"lidar.depth.pointcloud.color", std::string("rgb565")});
   overrides.push_back({"lidar.depth.pointcloud.max_points", 5000});
+  // The delta encoding asked for, as by default, and float32 positions, which it cannot take.
+  overrides.push_back({"lidar.raw.topic", std::string("/points")});
+  overrides.push_back({"lidar.raw.pointcloud.position", std::string("float32")});
   overrides.push_back({"discovery_period_s", 0.2});
   options.parameter_overrides(overrides);
 
@@ -3222,8 +3228,17 @@ void ExpectMediaProperties(const nlohmann::json& sent) {
   expect("c3d.ros.camera.front.topic", "/image");
   expect("c3d.ros.camera.front.rate_hertz", 2.5);
   expect("c3d.ros.camera.front.max_width_pixels", 640);
-  expect("c3d.ros.camera.front.jpeg_quality", 80);
-  expect("c3d.ros.camera.front.format", "jpeg");
+  expect("c3d.ros.camera.front.codec", "h264");
+  expect("c3d.ros.camera.front.preset", "ultrafast");
+  expect("c3d.ros.camera.front.crf", 28);
+  expect("c3d.ros.camera.front.max_bitrate_kilobits_per_second", 0);
+  expect("c3d.ros.camera.front.chunk_seconds", 3.0);
+  expect("c3d.ros.camera.rear.preset", "veryfast");
+  expect("c3d.ros.camera.rear.crf", 24);
+  expect("c3d.ros.camera.rear.max_bitrate_kilobits_per_second", 1500);
+  for (const std::string gone : {"jpeg_quality", "format"}) {
+    EXPECT_FALSE(sent.contains("c3d.ros.camera.front." + gone)) << gone << " in " << dumped;
+  }
   // The field of view: from the image topic's sibling CameraInfo by default, from the parameters
   // when set, and from nothing with the CameraInfo switched off. A double either way, 0 unset.
   expect("c3d.ros.camera.front.hfov_degrees", 0.0);
@@ -3251,11 +3266,14 @@ void ExpectMediaProperties(const nlohmann::json& sent) {
   expect("c3d.ros.lidar.depth.pointcloud.position", "int16_mm");
   expect("c3d.ros.lidar.depth.pointcloud.color", "rgb565");
   expect("c3d.ros.lidar.depth.pointcloud.intensity", "none");
-  expect("c3d.ros.lidar.depth.pointcloud.zstd_level", 1);
+  expect("c3d.ros.lidar.depth.pointcloud.zstd_level", 3);
+  expect("c3d.ros.lidar.depth.pointcloud.encoding", "planarDeltaShuffleZstd");
+  expect("c3d.ros.lidar.raw.pointcloud.position", "float32");
+  expect("c3d.ros.lidar.raw.pointcloud.encoding", "planarZstd");
 
   EXPECT_FALSE(sent.contains("c3d.ros.lidar.depth.intensities")) << dumped;
   for (const std::string key : {"voxel_leaf_meters", "max_points", "position", "color",
-                                "intensity", "zstd_level"}) {
+                                "intensity", "zstd_level", "encoding"}) {
     EXPECT_FALSE(sent.contains("c3d.ros.lidar.scan.pointcloud." + key)) << key << " in " << dumped;
   }
 }
@@ -3439,6 +3457,10 @@ TEST(NodeRateGates, AZeroStampedCameraAndAnOdometryTopicAreGatedOnArrival) {
   const double frames = SeriesMaximum(bodies, "c3d.camera.front.frames");
   EXPECT_GE(frames, 4.0) << "a zero-stamped camera at 20 Hz into a 2 Hz gate froze";
   EXPECT_LE(frames, 13.0) << "a 2 Hz gate over about five seconds";
+  for (const char* series :
+       {"size_restarts", "dropped_replay", "rejected_too_large", "backward_stamps"}) {
+    EXPECT_EQ(SeriesMaximum(bodies, std::string("c3d.camera.front.") + series), 0.0) << series;
+  }
   std::size_t speeds = 0;
   for (const auto& body : bodies) {
     if (!body.contains("data") || !body["data"].is_array()) continue;
@@ -5037,4 +5059,132 @@ TEST(NodeSensorProperties, HandWrittenSensorPropertiesAreReproducedFromParameter
     EXPECT_EQ(sent.value("c3d.ros.sensor.line.topic", std::string()), "/line_sensor");
     EXPECT_EQ(sent.value("c3d.ros.sensors", std::string()), "ultrasonic,line");
   }
+}
+
+// Every path that ends a session stops the camera encoders FIRST, so the last access units each
+// one drains reach the session they belong to: the ~/end_session service, and the backward clock
+// jump, which ends the session directly rather than through StopSession. A unit that arrived after
+// its session ended would be said in the log and counted in dropped_no_session, which counts for
+// the life of the capture and so shows in the following session's series. On the real encoder,
+// whose last unit always arrives during the stop: every stop has a tail to lose.
+TEST(NodeCameraStop, EveryEndStopsTheEncoderBeforeTheSessionSoNoUnitOutlivesIt) {
+  const auto dir = fs::temp_directory_path() / ("c3d_camstop_" + std::to_string(::getpid()));
+  fs::create_directories(dir);
+  LogCapture log;
+
+  rclcpp::NodeOptions options;
+  auto overrides = OfflineSessionOverrides(dir);
+  overrides.push_back({"use_sim_time", true});
+  overrides.push_back({"auto_start_session", false});
+  overrides.push_back({"remote_variables", false});
+  overrides.push_back({"reference_frame", std::string("odom")});
+  overrides.push_back({"fallback_reference_frame", std::string("")});
+  overrides.push_back({"discovery_period_s", 0.2});
+  overrides.push_back({"cameras", std::vector<std::string>{"front"}});
+  overrides.push_back({"camera.front.topic", std::string("/probe/stop_image")});
+  overrides.push_back({"camera.front.camera_info_topic", std::string("")});
+  options.parameter_overrides(overrides);
+  auto node = std::make_shared<cognitive3d_ros::Cognitive3DNode>(options);
+
+  auto publishers = std::make_shared<rclcpp::Node>("c3d_test_camstop_publishers");
+  auto image = publishers->create_publisher<sensor_msgs::msg::Image>("/probe/stop_image", 10);
+  auto clock = publishers->create_publisher<rosgraph_msgs::msg::Clock>("/clock",
+                                                                      rclcpp::ClockQoS());
+  auto start = publishers->create_client<StartSession>("/cognitive3d/start_session");
+  auto end = publishers->create_client<EndSession>("/cognitive3d/end_session");
+  tf2_ros::StaticTransformBroadcaster mounts(publishers);
+  {
+    geometry_msgs::msg::TransformStamped base;
+    base.header.frame_id = "odom";
+    base.child_frame_id = "base_link";
+    base.transform.rotation.w = 1.0;
+    geometry_msgs::msg::TransformStamped camera = base;
+    camera.header.frame_id = "base_link";
+    camera.child_frame_id = "camera_link";
+    mounts.sendTransform({base, camera});
+  }
+
+  ASSERT_EQ(node->configure().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE)
+      << node->configure_error();
+  ASSERT_EQ(node->activate().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(node->get_node_base_interface());
+  executor.add_node(publishers);
+  ASSERT_TRUE(start->wait_for_service(std::chrono::seconds(5)));
+  ASSERT_TRUE(end->wait_for_service(std::chrono::seconds(5)));
+
+  // /clock held at `sim_seconds` and a 32x24 frame every 100 ms stamped with it, for `wall_s`.
+  const auto run = [&](double wall_s, double sim_seconds) {
+    const rclcpp::Time now(static_cast<int64_t>(sim_seconds * 1e9), RCL_ROS_TIME);
+    sensor_msgs::msg::Image frame;
+    frame.header.stamp = now;
+    frame.header.frame_id = "camera_link";
+    frame.width = 32;
+    frame.height = 24;
+    frame.encoding = "rgb8";
+    frame.step = 32 * 3;
+    frame.data.assign(32 * 24 * 3, 90);
+    rosgraph_msgs::msg::Clock tick;
+    tick.clock = now;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::duration<double>(wall_s);
+    auto next_frame = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() < until) {
+      clock->publish(tick);
+      if (std::chrono::steady_clock::now() >= next_frame) {
+        image->publish(frame);
+        next_frame += std::chrono::milliseconds(100);
+      }
+      executor.spin_some(std::chrono::milliseconds(5));
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  };
+  const auto start_session = [&]() {
+    auto pending = start->async_send_request(std::make_shared<StartSession::Request>());
+    EXPECT_EQ(executor.spin_until_future_complete(pending, std::chrono::seconds(10)),
+              rclcpp::FutureReturnCode::SUCCESS);
+    const auto response = pending.get();
+    EXPECT_TRUE(response->ok) << response->message;
+    return response->session_id;
+  };
+  const auto end_session = [&]() {
+    auto pending = end->async_send_request(std::make_shared<EndSession::Request>());
+    EXPECT_EQ(executor.spin_until_future_complete(pending, std::chrono::seconds(10)),
+              rclcpp::FutureReturnCode::SUCCESS);
+    EXPECT_TRUE(pending.get()->ok) << pending.get()->message;
+  };
+
+  run(1.0, 100.0);
+  ASSERT_TRUE(node->get_clock()->ros_time_is_active());
+  ASSERT_NEAR(node->get_clock()->now().seconds(), 100.0, 1.0) << "/clock never reached the node";
+  ASSERT_GT(image->get_subscription_count(), 0u) << "the camera never subscribed";
+
+  const std::string first = start_session();
+  run(1.5, 100.0);
+  end_session();
+  const std::string after_the_service = start_session();
+  run(1.5, 100.0);
+  run(1.5, 1.0);  // a world reset: the node closes the session and opens another
+  run(1.5, 1.0);
+  end_session();
+  node->deactivate();
+  node->cleanup();
+  executor.remove_node(node->get_node_base_interface());
+  executor.remove_node(publishers);
+  node.reset();
+
+  const std::vector<std::string> reasons = EndReasons(dir);
+  ASSERT_EQ(std::count(reasons.begin(), reasons.end(), "ros_time_jumped_backwards"), 1)
+      << "the backward clock jump did not end a session";
+  ASSERT_GE(SpooledCameraParts(dir), 3) << "a session recorded no video, so its stop had no tail";
+  EXPECT_EQ(log.Count("access units arrived after the session ended"), 0u);
+  const auto dropped = SeriesMaximumBySession(dir, "c3d.camera.front.dropped_no_session");
+  ASSERT_EQ(dropped.size(), 3u) << "the service's session, the jump's, and the one after it";
+  for (const auto& [session, value] : dropped) {
+    EXPECT_EQ(value, 0.0) << "session " << session
+                          << (session == first               ? " (the first)"
+                              : session == after_the_service ? " (after the service's end)"
+                                                             : " (after the clock jump's end)");
+  }
+  std::error_code ec;
+  fs::remove_all(dir, ec);
 }

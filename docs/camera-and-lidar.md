@@ -1,17 +1,17 @@
 # Camera and lidar
 
-Beside the pose timeline, the node can record two streams of sensor data: camera frames, stored as
-JPEG, and lidar scans, stored either as a `LaserScan` copied as published or as a `PointCloud2`
-that is downsampled and compressed. Every frame and every scan carries the pose of its sensor in
-the scene, so Session Replay can show what the robot saw from where it saw it. Both streams are
-off by default.
+Beside the pose timeline, the node can record two streams of sensor data: camera frames, encoded
+as H.264 in chunks of 3 seconds, and lidar scans, stored either as a `LaserScan` in blocks of 3
+seconds or as a `PointCloud2` that is downsampled, delta coded and packed into objects. Every frame
+and every scan carries the pose of its sensor in the scene, so Session Replay can show what the
+robot saw from where it saw it. Both streams are off by default.
 
-[Data format](data-format.md#camera-frames) describes what is stored.
+[Data format](data-format.md#camera-chunks) describes what is stored.
 
 ## Record a camera
 
 Name each camera in `cameras` and give it a topic. The name is a label you choose: it is the camera
-id on every stored frame and keys the camera's counters, so a robot whose topic is renamed keeps
+id on every stored chunk and keys the camera's counters, so a robot whose topic is renamed keeps
 its history joined. It must not be empty or contain `.` or `/`.
 
 ```yaml
@@ -23,7 +23,8 @@ its history joined. It must not be empty or contain `.` or `/`.
         topic: "/oakd/rgb/preview/image_raw"
         rate_hz: 30.0         # frames recorded per second
         max_width_px: 640     # wider frames are scaled down; 0 never resizes
-        jpeg_quality: 80
+        preset: "ultrafast"   # or "veryfast": more CPU for fewer bytes
+        crf: 28               # 24 to 32; lower is higher quality and more bytes
 ```
 
 [Configuration](configuration.md) lists every camera parameter with its default and range. The
@@ -31,27 +32,111 @@ topic's type is read from the ROS graph, and must be `sensor_msgs/msg/Image` or
 `sensor_msgs/msg/CompressedImage`:
 
 - **An `Image`** in `rgb8`, `bgr8`, `rgba8`, `bgra8` or `mono8` is scaled down to `max_width_px`
-  when it is wider, with its aspect ratio kept, and encoded as JPEG at `jpeg_quality`. The depth encodings `32FC1`,
-  `16UC1` and `mono16` are refused, because a depth image encoded as JPEG is a grey picture: point
-  the camera at the color topic instead. Any other encoding is refused too.
-- **A `CompressedImage`** that is already JPEG and no wider than `max_width_px` is stored byte for
-  byte, with no decoding and no re-encoding. Any other `CompressedImage` is decoded, scaled and
-  encoded as JPEG.
+  when it is wider, with its aspect ratio kept, and fed to the H.264 encoder. The depth encodings
+  `32FC1`, `16UC1` and `mono16` are refused, because a depth image encoded as video is a grey
+  picture: point the camera at the color topic instead. Any other encoding is refused too.
+- **A `CompressedImage`** is decoded, scaled to `max_width_px` when it is wider, and fed to the
+  encoder like an `Image`. Nothing is stored as the camera published it, whatever its format.
 
-The stored width and height are the frame's own, after any scaling. `format` takes only `jpeg`.
+The encoder needs even dimensions, so a frame with an odd width or height loses its last column or
+row. The stored width and height are the frame's own, after any scaling and cropping.
+
+### How a camera is encoded
+
+Frames are encoded as H.264 by the host's `ffmpeg`, which the node runs as a child process, using
+x264. The node never links the encoder. `ffmpeg` is a package the node's deb recommends, installed
+by name on a robot with a camera: see [Install](install.md). `ffmpeg_path` names another binary
+when `ffmpeg` is not on the node's `PATH`; it defaults to `ffmpeg`. With a camera configured,
+configure refuses when that binary cannot run, or cannot encode two small frames with the
+arguments each camera's `preset`, `crf` and `max_bitrate_kbps` give it, naming the package to
+install, and `doctor`'s `camera encoder` check says the same before a session opens.
+
+A chunk is 3 seconds of real time, one closed group of pictures, whatever the camera delivers, and
+every chunk starts on a keyframe. The node's own timing of the encoder, the quiet gap and wedge
+rules below and the 5-second wait after a crash, is real time too, so a paused simulation is a
+quiet gap. A camera whose 3-second chunk the node estimates at more than
+6 MiB gets shorter chunks: the longest length, in tenths of a second down to 1 second, whose
+estimate fits, chosen when its encoder starts from the size of the frame it starts on and logged
+once. The estimate is `doctor`'s, from the frame size, `crf` and `rate_hz`, capped by
+`max_bitrate_kbps` when that is set; `preset` is not in it. A camera at which not even a 1-second
+chunk fits is refused: with `max_width_px` set, configure refuses it, sizing the frame as a 16:9
+one that wide; with `max_width_px: 0`, the node refuses it at its first frame, logs it once and
+counts its frames in `refused`. Either way the message names `max_width_px`, `crf` and
+`max_bitrate_kbps`, the parameters that make the chunks smaller. Under `sim_time_on_wire`, 3 seconds of real time is 3 x the
+real-time factor seconds on the wire. `rate_hz` caps the frames fed to the encoder, as it caps
+every sensor's records: it does not set a chunk's length, so a camera that delivers 15 frames a
+second with `rate_hz: 30` makes chunks of about 45 frames. A camera slower than one frame every 3
+seconds gets one chunk per frame. A camera whose field of view changes records the angle of each
+chunk's first frame. The encoder times a chunk's 3 seconds by the wall clock, so when the wall
+clock steps by more than a second while a camera records, as when NTP corrects a stale clock, the
+node restarts that camera's encoder, which starts a new chunk, and logs it once per session.
+
+A chunk also ends before its encoded frames would pass 8 MiB, because the platform refuses an
+object larger than 10 MiB, and an object it refuses is deleted. The node then restarts the
+camera's encoder and encodes again, from a keyframe that opens the next chunk, every frame from the
+one that did not fit on, so no frame is lost and each keeps its `time`, `seq` and pose. Each such
+restart counts in `size_restarts` and is logged once per session. To do this the node keeps every
+frame it feeds the encoder until that frame is in a chunk, as yuv420p at 1.5 bytes a pixel, in up
+to `replay_max_mb` of memory per camera, 192 MiB by default: a frame that finds that memory full is
+not kept, and is dropped and counted in `dropped_replay` if it has to be encoded again. A chunk's
+first frame, a keyframe, is never encoded again: up to 9 MiB it is kept as a chunk of its own, and
+a larger one is dropped and counted in `c3d.camera_access_units_dropped`.
+
+Where 28 frames of the camera's size, as yuv420p, do not fit in `replay_max_mb`, a restart could
+lose the frames that memory cannot keep, so the encoder caps its bitrate by default at 6 MiB over
+the chunk's length, 16,777 kilobits per second for a 3-second chunk, with a buffer of one second
+of that rate, so a chunk reaches about 8 MiB at most. At the default 192 MiB that is
+a frame of more than about 4.8 million pixels, so a 4K camera recorded with `max_width_px: 0` is
+capped and a 1440p one is not.
+`max_bitrate_kbps` always wins over the default. A camera whose chunks reach 8 MiB 3 times in a
+session gets chunks half as long from its next restart, down to 1 second, and after 3 more at
+1 second its bitrate is capped too; the first of these is logged once per session, and a new
+session starts from the full length again.
+
+Three parameters set the encoder's trade of bytes against quality and CPU:
+
+| parameter | default | what |
+| -- | -- | -- |
+| `preset` | `ultrafast` | x264's speed preset: `ultrafast` or `veryfast`. `veryfast` spends more CPU for fewer bytes, at somewhat lower quality at the same `crf` |
+| `crf` | `28` | The constant rate factor, 24 to 32. It sets the quality the encoder holds, and the bytes follow the scene: lower is higher quality and more bytes, and the size roughly doubles every 4 steps lower. Measured at the default 3-second chunks: `24` is about 1.6 to 2.2 times the bytes of `28` depending on the footage, and `32` about 0.55 to 0.6 times |
+| `max_bitrate_kbps` | `0` | A cap on the stream's bitrate in kilobits per second, held over a 2-second window by lowering quality when a scene needs more. A default cap the node sets holds over 1 second. `0` sets no cap, unless the node sets one by default, as below |
+
+Measured on a 20-second clip of a robot's 640 x 480 camera at 15 frames a second, `ultrafast`,
+encoded in 2-second chunks, against the uncompressed frames. The table shows quality, not bytes: VMAF is a video quality score out of 100, and the keypoint columns are the
+share of the source's keypoints, up to 1,000 per frame, that the video still detects and still
+matches by descriptor, a measure of what a vision model can still find:
+
+| `crf` | VMAF mean | ORB keypoints detected / matched | SIFT keypoints detected / matched |
+| -- | -- | -- | -- |
+| 24 | 95.7 | 97% / 90% | 80% / 76% |
+| 28 | 93.8 | 96% / 87% | 74% / 70% |
+| 32 | 90.2 | 95% / 83% | 69% / 63% |
+
+About 94 at `crf: 28` holds for the robot and for an indoor sequence from a Kinect on a wheeled
+robot, where `crf: 24` reaches 98 and `crf: 32` 86. On an outdoor street sequence VMAF saturates:
+99.8 at `crf: 28`, and only the keypoint columns separate `crf: 24` from `crf: 28` there (ORB
+matched 88% against 84%). Keep `crf: 28` unless you know what reads the video. `veryfast` is the
+opt-in for fewer bytes at the same VMAF: `veryfast` at `crf: 24` matched `ultrafast` at `crf: 28`
+(93.9 against 93.8 on the robot footage) for about 14 percent fewer bytes, and costs about three
+times the CPU, 19 percent of a Pi 5 core against 6 to 7 percent at 640 x 480 and 15 frames a
+second.
+
+A frame held for its transform, as [Poses and frames](#poses-and-frames) describes, is held as a raw
+image, so one camera holds at most 8 x 3 x width x height bytes while it waits for a pose: 7.4 MB
+at 640 x 480.
 
 ### A camera's field of view
 
-Every frame can carry the camera's field of view, as two full angles in degrees, horizontal and
-vertical. Session Replay draws the camera's frustum from it. It travels with each frame rather than
-once per session, so a camera that zooms can record a different angle on every frame. Scaling a
+Every chunk can carry the camera's field of view, as two full angles in degrees, horizontal and
+vertical. Session Replay draws the camera's frustum from it. It travels with each chunk rather than
+once per session, so a camera that zooms can record a different angle in each chunk. Scaling a
 frame down to `max_width_px` does not change it.
 
 By default the node computes it from the camera's `sensor_msgs/msg/CameraInfo`, on the image
 topic's sibling by image_transport's convention: for `/oakd/rgb/image_raw` or
-`/oakd/rgb/image_raw/compressed`, that is `/oakd/rgb/camera_info`. Each frame carries the field of
-view of the latest CameraInfo, so a driver that republishes it as it zooms changes it frame by
-frame. A frame that arrives before the first CameraInfo carries none. It is computed from the calibration matrix `K`, the image size and any region of interest,
+`/oakd/rgb/image_raw/compressed`, that is `/oakd/rgb/camera_info`. Each chunk carries the field of
+view of the latest CameraInfo when its first frame arrived, so a driver that republishes it as it
+zooms changes it chunk by chunk. A chunk whose first frame arrives before the first CameraInfo carries none. It is computed from the calibration matrix `K`, the image size and any region of interest,
 and binning changes no angle:
 
 ```text
@@ -76,7 +161,7 @@ To set it yourself, from the lens datasheet or a measurement, use `hfov_degrees`
 ```
 
 Set both or neither. Each must be greater than 0 and less than 180; anything else refuses
-configure. With neither set and no usable CameraInfo, frames carry no field of view, stored as 0
+configure. With neither set and no usable CameraInfo, chunks carry no field of view, stored as 0
 by 0, and Session Replay draws no frustum for the camera. `doctor`'s `camera/<name> field of view`
 check says which source a camera has. During a run, the node warns once per session when a
 camera's first frame finds its CameraInfo topic with no publisher, naming the topic and the two
@@ -105,10 +190,16 @@ Name each lidar in `lidars` and give it a topic, with the same naming rule as a 
 
 The topic's type must be `sensor_msgs/msg/LaserScan` or `sensor_msgs/msg/PointCloud2`.
 
-**A `LaserScan`** is stored as published: its angles, timing and ranges stay in the sensor's own
-units and frame, infinities and NaNs included. Intensities are stored only with
-`lidar.<name>.intensities: true`, which doubles the size of a scan. A scan with no ranges is
-skipped.
+**A `LaserScan`** is stored in blocks of 3 seconds of scans. Each range becomes a 16-bit code, in
+millimeters when the sensor's `range_max` is 65 meters or less and in centimeters otherwise, with
+codes of their own for `+inf`, `-inf` and NaN, so a sensor's no-return survives. A block's header
+holds the geometry every scan in it shares, and every scan keeps its own `time_increment` and
+`scan_time` on its entry, because drivers such as RPLIDAR's change them on every sweep. The block is
+then delta coded within each scan, byte shuffled and compressed with zstd. A scan with different
+geometry or a different number of rays starts a new block. Intensities are stored only with
+`lidar.<name>.intensities: true`, as 16-bit values in the same layout, which doubles the size of a
+scan. A scan with no ranges is skipped. One with more than 65,535 rays is refused and counted in the
+lidar's `refused`.
 
 **A `PointCloud2`** is read, converted to the scene's axes and encoded. The node reads clouds that
 are little-endian, with `x`, `y` and `z` as `FLOAT32`; color from an `rgb` or `rgba` field
@@ -131,7 +222,12 @@ an `intensity` field (`FLOAT32`, `UINT8` or `UINT16`). Then:
 - `pointcloud.intensity` is `none` (the default) or `uint8`. A `FLOAT32` intensity whose values are
   all 1.0 or less is scaled to 0 to 255; any other intensity is clamped to 0 to 255, so a 16-bit
   or wide-range intensity saturates at 255.
-- `pointcloud.zstd_level` (default 1) compresses the result; `0` stores it uncompressed.
+- `pointcloud.zstd_level` (default 3) compresses the result; `0` stores it uncompressed.
+
+With `int16_mm` positions and a `zstd_level` above 0, each position plane is delta coded and byte
+shuffled before zstd, which leaves about two thirds of the bytes of the plain planar block. Clouds are packed into objects:
+an object closes at 2 MiB or 5 seconds of clouds, whichever comes first, and a cloud larger than
+2 MiB is an object of its own, at most 8 MiB because `max_points` is bounded to that. `float32` positions are compressed without the delta.
 
 A cloud the node cannot read, such as a big-endian one or one whose `x`, `y` and `z` are not
 `FLOAT32`, is refused and counted in `refused`, with one warning naming the reason.
@@ -246,51 +342,42 @@ For a lidar, the error asks you to compare the publisher's profile, from
 
 ### Bandwidth
 
-What a stream costs is the size of one record times the records it stores per second: `rate_hz`,
-or the source's own rate when the source is slower. Record size depends on resolution, settings and
-what the sensor sees. These sizes were measured in simulation:
+What a stream costs is the bytes of what it stores each second, and that depends on resolution,
+settings and what the sensor sees. These sizes were measured on recorded footage from a robot, a
+Kinect on a wheeled robot and a car, and on lidar recordings from an RPLIDAR, a Velodyne and a
+simulated TurtleBot 4 in Gazebo:
 
 | record | stored size |
 | -- | -- |
-| 320 x 240 camera frame, JPEG quality 80 | about 14.5 KB |
-| 640 x 480 camera frame, JPEG quality 80 | about 58 KB, scaled from the above by pixel count |
-| 1280 x 720 camera frame, JPEG quality 80 | about 175 KB, scaled the same way |
-| 640-ray `LaserScan`, no intensities | 2,560 bytes: 4 bytes per ray, 8 with intensities |
-| depth point cloud, 0.05 meter voxels, `int16_mm`, no color | about 3 bytes per stored point |
-| the same cloud with `rgb565` color | about 20 percent more |
-| the same cloud with `float32` positions | about 3 times as much |
+| camera chunk, 3 seconds at 640 wide, `ultrafast`, `crf: 28` | 225 to 280 KB median on every source measured; at most 319 KB at 15 frames a second on a robot, 437 KB at 10 on a car, 645 KB at 22 on the wheeled robot's Kinect |
+| a camera over 10 minutes, the same settings | 44 MB for a robot driving at 15 frames a second, 68 MB for the indoor footage at 22 |
+| `LaserScan` block, 3 seconds | 18 KB median for 720 rays at 10 Hz; 36 KB median, 45 KB at most, for 640 rays at 30 Hz; 57 to 59 KB when the ranges carry 2 centimeters of noise |
+| depth point cloud, 0.05 meter voxels, `int16_mm`, no color | 60 KB median and 90 KB at most per cloud for the simulated TurtleBot 4; 270 KB median per cloud for a Velodyne scan of a street |
+| point cloud object | closes at 2 MiB: about 1 second of the TurtleBot 4's clouds, 30 clouds at 30 Hz; 7 of the Velodyne's. An object of slow or sparse clouds reaches 5 seconds at 1.5 to 1.8 MB |
+| the same cloud with `rgb565` color | about 20 percent more, measured on the plain `int16_mm` block |
+| the same cloud with `float32` positions | about 3 times as much, measured on the plain `int16_mm` block, and `float32` is not delta coded |
 
-For example, at the default 30 records per second:
+A camera at 640 x 480 therefore stores about 260 to 410 MB per hour at 15 to 22 frames a second, and
+more at 30. The same footage as JPEG at quality 80 is 271 to 329 MB per 10 minutes for the robot and
+421 MB for the indoor sequence, so a chunk is about 13 to 16 percent of the JPEG bytes. A `LaserScan` block is a sixth to a quarter of what its scans stored one by one. A
+point cloud takes about two thirds of the bytes it took without delta coding, for up to 6 percent
+more CPU.
 
-- a 640 x 480 camera stores about 1.7 MB per second, about 6 GB per hour
-- a depth point cloud of 20,000 stored points stores about 1.8 MB per second, about 6.5 GB per hour
-- a point cloud at the default `max_points` of 100,000 stores about 9 MB per second, about 32 GB per
-  hour
-
-`doctor` sizes each configured sensor by encoding one real message with the same encoder the run
-uses and multiplying by `rate_hz`, so it overstates a source slower than that. It warns when all
-sensors together exceed 2 MiB per second, as the camera and the 20,000-point cloud above do
-together. To record less, lower `rate_hz`, `max_width_px` or `jpeg_quality`, or raise a point
-cloud's `voxel_leaf_m`.
-
-> [!WARNING]
-> The platform stores each frame or scan as one record of at most about 1 MiB. A larger record is
-> accepted with its upload and then dropped, and nothing reports it. `doctor` warns about any
-> sensor whose sample encodes to more than 900 KiB.
-
-A camera at full resolution with `max_width_px: 0`, or a point cloud with `float32` positions,
-`rgb888` color and no voxel leaf, can exceed it. Lower `max_width_px` or `jpeg_quality` for a
-camera; for a point cloud, keep `int16_mm`, drop color, raise `voxel_leaf_m` or lower `max_points`.
+`doctor` sizes each configured camera from an estimate, from its resolution, `crf` and `rate_hz`,
+and each lidar by encoding one real message with the encoder the run uses and multiplying by
+`rate_hz`; both overstate a source slower than `rate_hz`. It warns when all sensors together
+exceed 2 MiB per second, as a depth point cloud at 30 Hz can. To record less, lower `rate_hz`,
+`max_width_px` or raise `crf`, or raise a point cloud's `voxel_leaf_m`.
 
 ### Uplink and disk
 
-Camera and lidar records go to the spool before they upload, and share its `spool_max_mb` budget
+Camera and lidar objects go to the spool before they upload, and share its `spool_max_mb` budget
 with every other stream. When the spool is full, the oldest camera and lidar data is evicted before
 any pose, sensor or event data. When the uplink is slower than the data rate, the spool grows by
-the difference for as long as the session lasts. On disk a camera or lidar record takes about a
-third more than it uploads, so the default 1 GiB holds about 8 minutes of the camera above with no
-uplink at all. [Sessions](sessions.md) describes the spool, recording with uploads paused, and
-draining it later over a faster link.
+the difference for as long as the session lasts. On disk an object takes about a third more than it
+uploads, so the default 1 GiB holds about two hours of the camera above with no uplink at all.
+[Sessions](sessions.md) describes the spool, recording with uploads paused, and draining it later
+over a faster link.
 
 ### CPU
 
@@ -299,23 +386,48 @@ the ones the rate limit drops. A raw high-resolution image topic at 30 Hz is cop
 30 times a second. Where your robot publishes a compressed or reduced-resolution topic, record that
 one.
 
-For each recorded message, the work is, from cheapest to most expensive:
+The encoder runs in its own process, so a camera's encoding does not delay the node's other work.
+For each recorded message, the node's own work is, from cheapest to most expensive:
 
-- a `CompressedImage` already in JPEG and within `max_width_px`: stored as it is
-- a `LaserScan`: copied
-- an `Image`, or a `CompressedImage` that needs scaling: converted, scaled and JPEG-encoded
+- a `LaserScan`: held as published until its block closes, then converted to codes, delta coded
+  and compressed on the node's worker thread, a few microseconds per scan
+- an `Image`, or a `CompressedImage` of any format: converted, scaled and written to the encoder's
+  input
 - a `PointCloud2`: converted, voxel-downsampled, sorted and compressed
 
-The node handles its callbacks one at a time, so a slow encode delays its other work, including the
-next pose sample. At the default 30 records a second, an `Image` or a `PointCloud2` is a heavy load
-for a small CPU: record a compressed or reduced-resolution topic there, or lower `max_width_px`, the
-point cloud's size or `rate_hz`.
+On a Raspberry Pi 5, the `ffmpeg` process alone costs 6 to 7 percent of one core at `ultrafast` and
+`crf: 28` for a 640 x 480 camera at 15 frames a second, and 19 percent at `veryfast` and
+`crf: 24`. That was measured with the robot's own software running and the SDK not, so the node's
+own conversion, scaling and writes to the encoder are not in it.
+
+The node handles its callbacks one at a time, so a slow conversion delays its other work, including
+the next pose sample. At the default 30 records a second, a `PointCloud2` is a heavy load for a
+small CPU: record a reduced-resolution topic there, or lower the point cloud's size or `rate_hz`.
 
 A record held for its transform, as [Poses and frames](#poses-and-frames) describes, costs the node
 no time: the node goes on with its other work and retries the held records every 10 milliseconds,
 and whenever the sensor's next record arrives. Once a sensor has 8 records waiting, the oldest is
 dropped and counted in `pose_failures`. Records still held when a session ends are discarded and
 not counted.
+
+What the encoder costs the node, and what it loses, is bounded:
+
+- **A stop or a restart blocks the node for at most 1.25 seconds.** That is the time the node
+  waits for the encoder to finish what it has accepted, then to be killed and collected. A healthy
+  encoder finishes in milliseconds. Stopping several cameras waits once, not once per camera.
+- **A wedged encoder is killed without waiting** when the camera is fast enough to show that it has
+  refused every frame for a chunk's length, and the node starts a new one 5 seconds later. On a camera too
+  slow to show the refusals, the wedge is found as a quiet gap and costs 1.25 seconds once and then
+  0.5 seconds every 5 seconds, for as long as the cause lasts.
+- **The measured envelope is `ultrafast` and `veryfast` at 640 wide on a Pi 5.** A configuration
+  that saturates the encoder, such as `veryfast` at 1080p there, drops frames while it runs, counted
+  in `dropped_backlog`, and at a stop it may lose up to about 18 frames the encoder had accepted,
+  counted in `dropped_at_stop` and said once in the log.
+- **A camera that stops publishing keeps up to 3 seconds of frames in memory**, unspooled, until
+  its next keyframe or the end of the session. A crash or SIGKILL in that time loses them.
+
+A camera that delivers fewer frames than `rate_hz` makes a chunk of fewer frames, not a chunk
+shorter than 3 seconds.
 
 ## What gets refused
 
@@ -327,17 +439,28 @@ Configure refuses, naming the parameter:
   `qos.*` key
 - a camera or lidar with no `topic`
 - a `rate_hz` of 0 or less
-- a camera `format` other than `jpeg`, a `jpeg_quality` outside 1 to 100, or a negative
-  `max_width_px`
-- a `pointcloud.voxel_leaf_m` below 0 or above 65 meters, a `pointcloud.max_points` below 1, or a
+- a negative `camera.<name>.max_width_px`, a `preset` other than `ultrafast` or `veryfast`, a `crf`
+  outside 24 to 32, or a `max_bitrate_kbps` that is negative or above 1,000,000
+- a `camera.<name>.format` or `camera.<name>.jpeg_quality`, or any of `camera_flush_s`,
+  `camera_flush_bytes`, `lidar_flush_s` and `lidar_flush_bytes`: the refusal names the key and says
+  it was removed
+- a camera with `max_width_px` set at which not even a 1-second chunk is estimated under 6 MiB; see
+  [How a camera is encoded](#how-a-camera-is-encoded)
+- a camera configured while the binary named by `ffmpeg_path` cannot run, lists no `libx264`
+  encoder, or cannot encode two frames with a camera's `preset`, `crf` and `max_bitrate_kbps`: the
+  refusal names the binary, the camera and what `ffmpeg` said, and says `sudo apt install ffmpeg`
+- a `pointcloud.voxel_leaf_m` below 0 or above 65 meters, a `pointcloud.max_points` below 1 or
+  above the most points whose worst case encoding stays under 8 MiB, so that one cloud never
+  makes an object the platform refuses (about 1.39 million at the defaults), or a
   `pointcloud.zstd_level` outside 0 to 22
 - a `pointcloud.position`, `pointcloud.color` or `pointcloud.intensity` that is not one of the values
   above
 - a camera `qos` value that is not one of those under [QoS](#qos)
-- a `camera_flush_s` or `lidar_flush_s` of 0 or less, or a `camera_flush_bytes` or
-  `lidar_flush_bytes` outside 1024 to 33554432 (32 MiB)
 
-Three refusals come later, because they depend on what the robot publishes. Each is logged once per
+`camera_flush_s`, `camera_flush_bytes`, `lidar_flush_s` and `lidar_flush_bytes` no longer exist: a
+chunk, a block or an object closes by its own rule.
+
+Four refusals come later, because they depend on what the robot publishes. Each is logged once per
 sensor:
 
 - A topic whose type is not one the sensor takes is refused when the node subscribes, and nothing
@@ -345,9 +468,11 @@ sensor:
   driver that starts after the node is picked up then.
 - A frame in a depth or unsupported encoding is refused and counted in `refused`.
 - A point cloud the node cannot read is refused and counted in `refused`.
+- A `LaserScan` with more than 65,535 rays is refused and counted in `refused`, because a block
+  stores the ray count in 16 bits.
 
-The platform also validates every camera and lidar upload. It rejects a part whose scene id and
-scene version it cannot resolve for your application key, and the part is discarded with every
+The platform also validates every camera and lidar upload. It rejects an object whose scene id and
+scene version it cannot resolve for your application key, and the object is discarded with every
 record in it. Check the scene id, the version number and the project as [Scenes](scenes.md)
 describes.
 
@@ -360,31 +485,44 @@ properties:
 | -- | -- |
 | `c3d.ros.cameras`, `c3d.ros.lidars` | The configured names, comma-separated |
 | `c3d.ros.camera.<name>.topic` | The camera's topic |
-| `c3d.ros.camera.<name>.rate_hertz`, `.max_width_pixels`, `.jpeg_quality`, `.format` | The camera's settings in force, defaults included |
-| `c3d.ros.camera.<name>.hfov_degrees`, `.vfov_degrees` | The field of view parameters, 0 when unset. Each frame carries its own field of view; see [A camera's field of view](#a-cameras-field-of-view) |
-| `c3d.ros.camera.<name>.fov_source` | The source the camera is configured to take its frames' field of view from: `parameter`, `camera_info`, or `none`. `camera_info` does not say that a CameraInfo arrived: a frame before the first one carries no field of view |
+| `c3d.ros.camera.<name>.rate_hertz`, `.max_width_pixels` | The camera's settings in force, defaults included |
+| `c3d.ros.camera.<name>.codec`, `.preset`, `.crf`, `.max_bitrate_kilobits_per_second`, `.chunk_seconds` | How the camera is encoded: `h264`, the preset and `crf` in force, the bitrate cap with 0 for none, and the chunk length in seconds. The last two are the configured values when the session starts, and the ones the encoder runs with once the node chooses others. Each chunk's `encoderSettings` names its own |
+| `c3d.ros.camera.<name>.hfov_degrees`, `.vfov_degrees` | The field of view parameters, 0 when unset. Each chunk carries its own field of view; see [A camera's field of view](#a-cameras-field-of-view) |
+| `c3d.ros.camera.<name>.fov_source` | The source the camera is configured to take its chunks' field of view from: `parameter`, `camera_info`, or `none`. `camera_info` does not say that a CameraInfo arrived: a chunk whose first frame precedes the first one carries none |
 | `c3d.ros.camera.<name>.camera_info_topic` | The CameraInfo topic, resolved; empty when switched off |
 | `c3d.ros.lidar.<name>.topic`, `.rate_hertz` | The lidar's topic and rate |
 | `c3d.ros.lidar.<name>.message_type` | `sensor_msgs/msg/LaserScan` or `sensor_msgs/msg/PointCloud2`, once the topic is subscribed |
 | `c3d.ros.lidar.<name>.intensities` | For a `LaserScan`: whether intensities are stored |
 | `c3d.ros.lidar.<name>.pointcloud.voxel_leaf_meters`, `.max_points`, `.position`, `.color`, `.intensity`, `.zstd_level` | For a `PointCloud2`: the settings in force |
+| `c3d.ros.lidar.<name>.pointcloud.encoding` | For a `PointCloud2`: how its position planes are coded, `planarDeltaShuffleZstd` or `planarZstd` |
 
 A lidar whose topic never appears records neither `message_type` nor the settings that depend on it.
 
 Every 5 seconds, the session also records what each sensor did since the session started, as sensor
-series:
+series, except where a row says otherwise:
 
 | series | counts |
 | -- | -- |
-| `c3d.camera.<name>.frames`, `c3d.lidar.<name>.scans` | Records stored |
-| `c3d.camera.<name>.bytes`, `c3d.lidar.<name>.bytes` | Bytes of image or scan data stored |
+| `c3d.camera.<name>.frames`, `c3d.lidar.<name>.scans` | Frames, and scans or clouds, stored |
+| `c3d.camera.<name>.bytes`, `c3d.lidar.<name>.bytes` | Bytes of encoded video, scan or cloud data stored |
 | `c3d.camera.<name>.pose_failures`, `c3d.lidar.<name>.pose_failures` | Records dropped because their pose could not be looked up |
 | `c3d.camera.<name>.refused`, `c3d.lidar.<name>.refused` | Messages the node would not encode or could not read |
+| `c3d.camera.<name>.dropped_backlog` | Frames the encoder could not take: its queue was full, no encoder could start, or the frame came during the 5 seconds after an encoder crashed or was killed, when none is started |
+| `c3d.camera.<name>.dropped_at_stop` | Frames the encoder had accepted and could not finish when it was stopped. Counted since the node was configured, not since the session started, because the stop that ends a session comes after that session's last sample |
+| `c3d.camera.<name>.dropped_no_session` | Encoded frames that arrived when no session was open. Counted since the node was configured, for the same reason. It reads 0 when the node stops the encoder before it ends a session, as it does on every path |
+| `c3d.camera.<name>.encoder_restarts` | Encoders replaced after one died, or after a wedged one was killed |
+| `c3d.camera.<name>.gap_restarts` | Encoders replaced after the camera was quiet for a chunk's length or more. A time-lapse camera, slower than a frame every 3 seconds, adds one for every frame, and that means nothing is wrong |
+| `c3d.camera.<name>.size_restarts` | Encoders replaced because a chunk reached 8 MiB before its time was up; see [How a camera is encoded](#how-a-camera-is-encoded) |
+| `c3d.camera.<name>.rejected_too_large` | Chunks the platform refused as larger than its 10 MiB, which were deleted. Counted since the node was configured. It reads 0 while the 8 MiB rule above holds, and the first one in a session is logged |
+| `c3d.camera.<name>.dropped_replay` | Frames a size restart could not encode again, because `replay_max_mb` had no room for them or the replacement encoder could not start |
+| `c3d.camera.<name>.backward_stamps`, `c3d.lidar.<name>.backward_stamps` | Frames, scans or clouds whose time is earlier than the one before them, as a simulator's clock, a stamp the clock rule replaced with its arrival, or a clock step makes. Each is stored where it came with its own time, never sorted or clamped |
 | `c3d.lidar.<name>.dropped_oversize` | Clouds dropped whole for exceeding `max_points` |
 | `c3d.lidar.<name>.dropped_range` | Points dropped for being out of `int16_mm` range |
 
 Messages the rate limit drops are not counted. A low frame count with `refused` at zero is the rate
-limit doing its job; a rising `refused` is a configuration to fix.
+limit doing its job; a rising `refused` is a configuration to fix. A restart after a change of image
+size or of the camera's tf frame, after a wall-clock step, at a session's start or at a stop counts in
+none of `encoder_restarts`, `gap_restarts` and `size_restarts`.
 
 These counts reach the session only. The report line and `~/diagnostics` carry nothing for a camera
 or lidar; see [The report line](sessions.md#the-report-line).

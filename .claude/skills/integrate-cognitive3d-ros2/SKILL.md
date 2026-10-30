@@ -135,7 +135,11 @@ Make each decision from the survey, in one or two sentences, and record why.
   `doctor`. A camera's field of view lets Session Replay draw its frustum. It comes from the
   driver's CameraInfo when that is calibrated; when `doctor`'s `camera/<name> field of view` says
   there is no source, set `camera.<name>.hfov_degrees` and `vfov_degrees` from the datasheet or a
-  measurement, both or neither. See [Camera and lidar](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/camera-and-lidar.md).
+  measurement, both or neither. A camera is encoded as H.264 by the host's `ffmpeg`, which must be
+  installed (`sudo apt install ffmpeg` when it is not): configure refuses a camera without it, and
+  `doctor`'s `camera encoder` check says so first. Leave `preset: ultrafast` and `crf: 28` unless
+  the human needs more detail per frame: `crf` runs 24 to 32, lower for quality and more bytes, and
+  `veryfast` costs about three times the CPU. See [Camera and lidar](https://github.com/CognitiveVR/c3d-sdk-ros2/blob/v1.1.0/docs/camera-and-lidar.md).
 - **The robot's Dynamic Object.** Leave `robot_dynamic_object` off. Session Replay draws the robot
   from the pose timeline, and turning it on needs a mesh upload first.
 - **The device id.** A stable name unique to this robot.

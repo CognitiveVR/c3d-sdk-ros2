@@ -6,7 +6,7 @@
 # It stands up the fakes, the node and tools/stub_gateway.py, drives a session,
 # and then ASSERTS on the bytes that would actually have been transmitted -- the
 # JSON streams by reading the captures, and the two binary streams by decoding
-# them with tools/capnp_dump.py.
+# them with tools/capnp_dump.py and every camera chunk again with ffmpeg.
 #
 # Then it does it twice more, under the two conventions whose position map is a
 # REFLECTION, with a camera and a LaserScan on one tilted mount: that is the only
@@ -74,6 +74,9 @@ rm -rf "$SPOOL" "$LOGS"
 mkdir -p "$CAPTURE" "$LOGS"
 rm -f "$CAPTURE"/*.json "$CAPTURE"/*.bin "$CAPTURE"/*.partial 2>/dev/null || true
 
+# Each camera chunk's stream, extracted by capnp_dump for ffmpeg to decode on its own.
+H264="$LOGS/h264"
+
 echo "=== building the workspace ==="
 mkdir -p /tmp/ws/src
 find /src -mindepth 2 -maxdepth 2 -name package.xml -not -path "*/.git/*" \
@@ -110,13 +113,16 @@ MOUNT_FRAME=sensor_mount
 MOUNT_XYZ=0.35,-0.12,0.47
 MOUNT_RPY_DEG=20,35,55
 
+# The camera publisher's rate. The assertions bound the time between two stored frames with it.
+CAMERA_PUBLISH_HZ=5.0
+
 echo "=== starting the stub gateway and the fakes ==="
 start stub_gateway python3 /src/tools/stub_gateway.py 8931 "$CAPTURE"
 start tf_publisher python3 /src/tools/fake_tf_publisher.py
 start nav_server python3 /src/tools/fake_nav_server.py
 # The three the binary streams need. Rates above what the node is configured to
 # take, so the rate gate is exercised rather than merely satisfied.
-start camera_publisher python3 /src/tools/fake_camera_publisher.py --rate 5.0
+start camera_publisher python3 /src/tools/fake_camera_publisher.py --rate "$CAMERA_PUBLISH_HZ"
 start pointcloud_publisher python3 /src/tools/fake_pointcloud_publisher.py --rate 2.0
 start laserscan_publisher python3 /src/tools/fake_laserscan_publisher.py --rate 5.0
 sleep 6
@@ -155,8 +161,10 @@ sleep 1
 
 echo
 echo "=== assertions ==="
-RUN_START="$RUN_START" RUN_END="$RUN_END" CAPTURE="$CAPTURE" LOGS="$LOGS" python3 - <<'PY'
+RUN_START="$RUN_START" RUN_END="$RUN_END" CAPTURE="$CAPTURE" LOGS="$LOGS" H264="$H264" \
+  CAMERA_PUBLISH_HZ="$CAMERA_PUBLISH_HZ" python3 - <<'PY'
 import glob
+import importlib.util
 import json
 import math
 import os
@@ -167,6 +175,9 @@ capture = os.environ['CAPTURE']
 run_start = int(os.environ['RUN_START'])
 run_end = int(os.environ['RUN_END'])
 duration = run_end - run_start
+# camera.<name>.rate_hz in synthetic_params.yaml, the same for front and zoom.
+CAMERA_RATE_HZ = 2.0
+CAMERA_PUBLISH_HZ = float(os.environ['CAMERA_PUBLISH_HZ'])
 
 failures = []
 
@@ -177,6 +188,16 @@ def check(condition, message):
         failures.append(message)
 
 
+def publisher(name):
+    """One of the fakes, imported for its constants and its argparse defaults, so an expectation
+    here cannot drift from what was published: the run passes neither a ray count nor a range.
+    Importing runs nothing, because each fake spins only under __main__."""
+    spec = importlib.util.spec_from_file_location(name, f'/src/tools/{name}.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 camera_files = sorted(glob.glob(os.path.join(capture, '*-camera.bin')))
 lidar_files = sorted(glob.glob(os.path.join(capture, '*-lidar.bin')))
 partials = glob.glob(os.path.join(capture, '*.partial'))
@@ -184,65 +205,144 @@ partials = glob.glob(os.path.join(capture, '*.partial'))
 # short by one -- which is worse than a corrupt file, because a wrong aggregate
 # still looks measured.
 check(not partials, f'no .partial orphans left behind ({len(partials)} found)')
-check(bool(camera_files), f'camera parts captured: {len(camera_files)}')
-check(bool(lidar_files), f'lidar parts captured: {len(lidar_files)}')
+check(bool(camera_files), f'camera chunks captured: {len(camera_files)}')
+check(bool(lidar_files), f'lidar blocks captured: {len(lidar_files)}')
 if not camera_files or not lidar_files:
     sys.exit(1)
 
 document = json.loads(subprocess.check_output(
-    [sys.executable, '/src/tools/capnp_dump.py', *camera_files, *lidar_files]))
+    [sys.executable, '/src/tools/capnp_dump.py', '--scan-ranges',
+     '--extract-h264', os.environ['H264'], *camera_files, *lidar_files]))
 entries = document['files']
 cameras = [e for e in entries if e['stream'] == 'camera']
 lidars = [e for e in entries if e['stream'] == 'lidar']
+front = [c for c in cameras if c['cameraId'] == 'front']
+zoom = [c for c in cameras if c['cameraId'] == 'zoom']
+scan_blocks = [e for e in lidars if e['sensorId'] == 'scan']
+depth_objects = [e for e in lidars if e['sensorId'] == 'depth']
+frames = [f for c in cameras for f in c['frames']]
+scans = [s for b in scan_blocks for s in b['entries']]
+clouds = [c for o in depth_objects for c in o['entries']]
 
-frames = [f for e in cameras for f in e['frames']]
-scans = [s for e in lidars for s in e['scans']]
 
-# Rate x duration, with a wide tolerance: the session opens after activate and the
-# first part is cut a flush interval later, so an exact count would be a flaky
-# test rather than a stricter one.
+# Rate x duration, with a wide tolerance: the session opens after activate and an
+# exact count would be a flaky test rather than a stricter one. So only a gross loss
+# shows here; the continuity checks on each camera's frames below are what see one
+# lost frame.
 def within(count, rate, name):
     expected = rate * duration
     check(0.4 * expected <= count <= 1.2 * expected + 4,
           f'{name}: {count} records for {rate} Hz over {duration}s (expected about {expected:.0f})')
 
 
-front = [f for f in frames if f['cameraId'] == 'front']
-zoom = [f for f in frames if f['cameraId'] == 'zoom']
-within(len(front), 2.0, 'camera front')
-within(len(zoom), 2.0, 'camera zoom')
-within(len([s for s in scans if s['sensorId'] == 'scan']), 2.0, 'lidar scan')
-within(len([s for s in scans if s['sensorId'] == 'depth']), 1.0, 'lidar depth')
+# A chunk and a scan block each span 3 s of real time; the upper bound allows the
+# short one that ends the session and one more.
+def one_per_three_seconds(count, name):
+    check(0.4 * duration / 3 <= count <= duration / 3 + 2,
+          f'{name}: {count} over {duration}s, at one per 3 s')
 
-check(all(f['format'] == 'jpeg' for f in frames), 'every frame says format jpeg')
-check(all(f['jpegSoi'] for f in frames), 'every frame body starts with a JPEG SOI marker')
-check(all(f['width'] <= 160 for f in front),
-      f'every front frame is at or below max_width_px 160 (widest {max(f["width"] for f in front)})')
-check(len(front) + len(zoom) == len(frames), 'every frame carries a configured name')
-# The field of view the parameters set, on every frame, exactly: both are Float32-exact. The
+
+check(len(front) + len(zoom) == len(cameras), 'every chunk carries a configured camera name')
+check(len(scan_blocks) + len(depth_objects) == len(lidars),
+      'every lidar block carries a configured lidar name')
+within(len([f for c in front for f in c['frames']]), CAMERA_RATE_HZ, 'camera front frames')
+within(len([f for c in zoom for f in c['frames']]), CAMERA_RATE_HZ, 'camera zoom frames')
+within(len(scans), 2.0, 'lidar scan')
+within(len(clouds), 1.0, 'lidar depth')
+one_per_three_seconds(len(front), 'camera front chunks')
+one_per_three_seconds(len(zoom), 'camera zoom chunks')
+one_per_three_seconds(len(scan_blocks), 'lidar scan blocks')
+
+# seq counts one sensor's objects from 0, so it is checked per sensor, and a missing
+# number is an object lost. Capture order is upload order, and the uploader sends the
+# oldest object first.
+for name, group in (('camera front', front), ('camera zoom', zoom), ('lidar scan', scan_blocks),
+                    ('lidar depth', depth_objects)):
+    seqs = [e['seq'] for e in group]
+    check(bool(seqs) and seqs == list(range(len(seqs))),
+          f'{name} seq runs from 0 with none missing: {seqs}')
+
+# Continuity, frame by frame, across chunk boundaries. Every frame the node poses takes the
+# camera's next frame seq whether or not it is stored, so a frame lost anywhere -- dropped as
+# backlog, or held by the encoder when a chunk is closed by force -- leaves a gap in seq. A
+# frame lost after the last one stored leaves none, so a loss at the session's end does not
+# show here.
+#
+# And in time, which catches a hole no posed frame was taken for. The gate takes the first
+# frame at or after its deadline, and its deadline is at most one gate period after the frame
+# it took last, so two stored frames are at most 1/rate_hz + 1/publisher rate apart:
+# 1/2.0 + 1/5.0 = 0.7 s, here 0.4 or 0.6 s, at a chunk boundary as anywhere else. The bound is
+# twice the 0.7 s, which a loss of about three frames in a row at a boundary exceeds and a
+# loss of one does not.
+boundary_bound = 2 * (1 / CAMERA_RATE_HZ + 1 / CAMERA_PUBLISH_HZ)
+for name, group in (('front', front), ('zoom', zoom)):
+    chunks = sorted(group, key=lambda c: c['seq'])
+    frame_seqs = [f['seq'] for c in chunks for f in c['frames']]
+    check(bool(frame_seqs) and frame_seqs == list(range(len(frame_seqs))),
+          f'camera {name} frame seq runs from 0 across its chunks with none missing '
+          f'({len(frame_seqs)} frames; missing '
+          f'{sorted(set(range(max(frame_seqs, default=0) + 1)) - set(frame_seqs))[:8]})')
+    gaps = [(b['frames'][0]['time'] - a['frames'][-1]['time']) / 1000.0
+            for a, b in zip(chunks, chunks[1:]) if a['frames'] and b['frames']]
+    check(bool(gaps) and all(0 < gap <= boundary_bound for gap in gaps),
+          f'camera {name}: from each chunk\'s last frame to the next chunk\'s first is at most '
+          f'{boundary_bound:.1f} s (largest {max(gaps, default=0.0):.3f} s, '
+          f'smallest {min(gaps, default=0.0):.3f} s, over {len(gaps)} boundaries)')
+
+# A chunk is one closed group of pictures, which is what lets it decode on its own.
+check(all(c['frames'] and c['frames'][0]['keyframe'] for c in cameras),
+      'every chunk opens on a keyframe')
+check(all(c['offsetsTile'] for c in cameras),
+      "every chunk's frames are its data, back to back from byte 0 to the last")
+check(all(c['keyframesMatchNalTypes'] for c in cameras),
+      'every frame flagged keyframe carries an IDR slice, and no other frame does')
+check(all(f['startsWithAud'] for f in frames),
+      f"every frame's access unit opens on a delimiter ({len(frames)} frames)")
+check(all(c['width'] <= 160 for c in front),
+      f'every front chunk is at or below max_width_px 160 (widest {max(c["width"] for c in front)})')
+# The field of view the parameters set, on every chunk, exactly: both are Float32-exact. The
 # camera's sibling CameraInfo, which "front" has too, does not override them.
-fovs = sorted({(f['hfovDegrees'], f['vfovDegrees']) for f in front})
-check(fovs == [(61.0, 45.5)], f'every front frame carries its parameters, 61 x 45.5: {fovs}')
-# "zoom" has no parameters, so each frame carries the latest CameraInfo's field of view, and the
-# publisher's focal length alternates between half the 320 x 240 image's width and all of it.
+fovs = sorted({(c['hfovDegrees'], c['vfovDegrees']) for c in front})
+check(fovs == [(61.0, 45.5)], f'every front chunk carries its parameters, 61 x 45.5: {fovs}')
+# "zoom" has no parameters, so each chunk carries the latest CameraInfo's field of view at its
+# first frame, and the publisher's focal length alternates between half the 320 x 240 image's
+# width and all of it. Which of the two a chunk opens on is not something to assert.
 zoom_fovs = [
     (2 * math.degrees(math.atan(160 / f)), 2 * math.degrees(math.atan(120 / f)))
     for f in (160.0, 320.0)]
-def zoom_level(frame):
+
+
+def zoom_level(chunk):
     for i, (h, v) in enumerate(zoom_fovs):
-        if abs(frame['hfovDegrees'] - h) < 1e-3 and abs(frame['vfovDegrees'] - v) < 1e-3:
+        if abs(chunk['hfovDegrees'] - h) < 1e-3 and abs(chunk['vfovDegrees'] - v) < 1e-3:
             return i
     return None
-# A frame taken before the first CameraInfo arrived carries none (0 by 0): the two subscriptions
-# connect independently. That is allowed at the start of the stream and nowhere after it.
-levels = [zoom_level(f) for f in sorted(zoom, key=lambda f: f['time'])]
-unknown = [f for f in zoom if f['hfovDegrees'] == 0.0 and f['vfovDegrees'] == 0.0]
+
+
+# A chunk that opened before the first CameraInfo arrived carries none (0 by 0): the two
+# subscriptions connect independently. That is allowed for the first chunk and no other.
+levels = [zoom_level(c) for c in sorted(zoom, key=lambda c: c['seq'])]
+unknown = [c for c in zoom if c['hfovDegrees'] == 0.0 and c['vfovDegrees'] == 0.0]
 leading = next((i for i, level in enumerate(levels) if level is not None), len(levels))
-check(zoom and leading <= 3 and None not in levels[leading:] and len(unknown) == leading,
-      f'every zoom frame after the first CameraInfo carries its field of view ({leading} before it): '
-      f'{sorted({(round(f["hfovDegrees"], 3), round(f["vfovDegrees"], 3)) for f in zoom})}')
-check(set(levels[leading:]) == {0, 1},
-      f'the zoom frames carry both zoom levels, frame to frame: {levels}')
+check(zoom and leading <= 1 and None not in levels[leading:] and len(unknown) == leading,
+      f'every zoom chunk after the first CameraInfo carries one of its two levels '
+      f'({leading} before it): {levels}')
+
+# Each chunk decodes on its own, to exactly the frames it lists. `-vsync passthrough` because a
+# raw stream carries no timestamps and ffmpeg's constant-rate default can drop a frame of one.
+undecodable = []
+for chunk in cameras:
+    decoded = subprocess.run(
+        ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-f', 'h264', '-i', chunk['extracted'],
+         '-vsync', 'passthrough', '-f', 'rawvideo', '-pix_fmt', 'gray', '-'],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    want = len(chunk['frames']) * chunk['width'] * chunk['height']
+    if decoded.returncode != 0 or len(decoded.stdout) != want:
+        undecodable.append((chunk['cameraId'], chunk['seq'], decoded.returncode,
+                            len(decoded.stdout), want, decoded.stderr.decode()[-200:]))
+check(not undecodable,
+      f'every chunk decodes with ffmpeg to frames x width x height grey bytes '
+      f'({len(cameras)} chunks): {undecodable[:3]}')
 
 # doctor names each camera's source: the parameters for front, the zooming CameraInfo for zoom.
 doctor_lines = [line for line in open(os.path.join(os.environ['LOGS'], 'doctor.log'))
@@ -257,20 +357,17 @@ check(any('[ok  ] camera/zoom field of view' in line and 'from /fake/camera/came
 # The clock rule. Under sim time a stamp starts near zero, and a session whose
 # record timestamps do that is accepted with a 200 and never appears -- so this is
 # the assertion that would catch ROS time reaching the wire.
-times = [f['time'] for f in frames] + [s['time'] for s in scans]
+times = [r['time'] for r in frames + scans + clouds]
 check(all(run_start * 1000 - 5000 <= t <= run_end * 1000 + 5000 for t in times),
       f'every record time is inside the run window ({min(times)} .. {max(times)})')
 
 for stream, group in (('camera', cameras), ('lidar', lidars)):
-    parts = [e['header']['part'] for e in group]
-    check(parts == sorted(parts) and parts[0] == 1 and len(set(parts)) == len(parts),
-          f'{stream} part is monotonic from 1: {parts}')
     check(all(e['header']['sdkVersion'] == group[0]['header']['sdkVersion'] for e in group),
           f'{stream} carries one sdkVersion: {group[0]["header"]["sdkVersion"]}')
     check(all(e['header']['sessionId'] == group[0]['header']['sessionId'] for e in group),
           f'{stream} carries one sessionId: {group[0]["header"]["sessionId"]}')
-    check(all(e['header']['formatVersion'] == '1.0' for e in group),
-          f'{stream} formatVersion is 1.0')
+    check(all(e['header']['formatVersion'] == '2.0' for e in group),
+          f'{stream} formatVersion is 2.0')
 
 # The JSON streams join the binary ones on sessionId. This is the whole point of
 # sending the same value: rows from six streams describe one session.
@@ -280,6 +377,8 @@ if gaze:
     gaze_session = json.load(open(gaze[0]))['body']['sessionid']
     check(gaze_session == cameras[0]['header']['sessionId'],
           f'the camera stream joins the gaze stream on {gaze_session}')
+    check(gaze_session == lidars[0]['header']['sessionId'],
+          f'the lidar stream joins the gaze stream on {gaze_session}')
     # A robot has no eyes: a gaze record is a position and a rotation, and a gaze point would be
     # counted by the platform's gaze analytics as somewhere the robot looked.
     records = [r for path in gaze for r in json.load(open(path))['body'].get('data', [])]
@@ -287,28 +386,100 @@ if gaze:
     check(all(sorted(r) == ['p', 'r', 'time'] for r in records),
           'every gaze record is time, p and r, with no gaze point')
 
-laser = [s for s in scans if s['kind'] == 'laserscan']
-clouds = [s for s in scans if s['kind'] == 'pointcloud']
-check(bool(laser), f'laserscan arms decoded: {len(laser)}')
-check(bool(clouds), f'pointcloud arms decoded: {len(clouds)}')
-if laser:
-    check(all(s['rangeCount'] == 640 for s in laser), 'every scan carries its 640 rays')
-    check(all(s['intensityCount'] == 640 for s in laser),
-          'intensities are present, because this lidar asked for them')
-if clouds:
+check(bool(scan_blocks) and all(b['kind'] == 'scans' for b in scan_blocks),
+      f'lidar scan is stored as scan blocks: {len(scan_blocks)}')
+check(bool(depth_objects) and all(o['kind'] == 'clouds' for o in depth_objects),
+      f'lidar depth is stored as cloud objects: {len(depth_objects)}')
+if scan_blocks:
+    laserscan = publisher('fake_laserscan_publisher')
+    published = laserscan.parse_args([])
+    check(all(b['rays'] == published.rays for b in scan_blocks),
+          f"every scan block carries the publisher's {published.rays} rays")
+    # docs/data-format.md: millimetres when rangeMax is 65 m or less, centimetres above it.
+    unit = 'millimetre' if published.range_max <= 65.0 else 'centimetre'
+    check(all(b['rangeUnit'] == unit for b in scan_blocks),
+          f'every scan block is in {unit}s, for a {published.range_max} m rangeMax')
+    check(all(b['encoding'] == 'deltaShuffleZstd' for b in scan_blocks),
+          'every scan block is deltaShuffleZstd')
+    check(all(len(s['ranges']) == published.rays for s in scans),
+          f'every scan decodes to {published.rays} ranges')
+
+    # Which rays the publisher made non-finite, by its own constants and in its own order: a
+    # sentinel has to come back as the same kind of nothing, not merely as some kind.
+    def published_kind(ray):
+        if ray % laserscan.NO_RETURN_EVERY == 0:
+            return 'inf'
+        if ray % laserscan.INVALID_EVERY == laserscan.INVALID_PHASE:
+            return 'nan'
+        return 'finite'
+
+    def kind(value):
+        if math.isnan(value):
+            return 'nan'
+        if math.isinf(value):
+            return 'inf' if value > 0 else '-inf'
+        return 'finite'
+
+    wrong = [(s['seq'], ray, kind(value)) for s in scans for ray, value in enumerate(s['ranges'])
+             if kind(value) != published_kind(ray)]
+    check(not wrong, f'every ray the publisher made inf or NaN is that after the round trip, and '
+                     f'every other ray is finite: {len(wrong)} wrong, first {wrong[:4]}')
+    # Half a millimetre either side: a range is stored as the nearest whole millimetre.
+    finite = [v for s in scans for v in s['ranges'] if math.isfinite(v)]
+    check(bool(finite) and published.range_min - 0.0005 <= min(finite)
+          and max(finite) <= published.range_max + 0.0005,
+          f'every finite range is inside [{published.range_min}, {published.range_max}] m '
+          f'({min(finite, default=None)} .. {max(finite, default=None)})')
+
+    # The publisher draws a smooth sine across the sweep, so neighbouring rays are millimetres
+    # apart. Its own message counter is not on the wire, so its formula cannot be evaluated here.
+    def steepest_step(ranges):
+        values = [v for v in ranges if math.isfinite(v)]
+        return max((abs(b - a) for a, b in zip(values, values[1:])), default=0.0)
+
+    steepest = max((steepest_step(s['ranges']) for s in scans), default=math.inf)
+    check(steepest < 0.1,
+          f'scan by scan, consecutive finite rays differ by under 0.1 m (largest {steepest:.4f} m)')
+    check(all(len(s['intensities']) == published.rays for s in scans),
+          'intensities are present on every scan, because this lidar asked for them')
+    # A ray's intensity does not depend on the publisher's counter, so the publisher's own
+    # function gives every one, and each is stored as its nearest whole code.
+    _ranges, intensities = laserscan.ranges_and_intensities(
+        published.rays, published.range_min, published.range_max, 0)
+    off = [(s['seq'], ray, code) for s in scans
+           for ray, (code, want) in enumerate(zip(s['intensities'], intensities))
+           if abs(code - want) > 0.5 + 1e-3]
+    check(not off, f'every intensity is the published one for its ray, to the nearest whole code, '
+                   f'{min(intensities):.0f} to {max(intensities):.0f}: '
+                   f'{len(off)} off, first {off[:4]}')
+
+if depth_objects:
+    pointcloud = publisher('fake_pointcloud_publisher')
+    check(all(o['encoding'] == 'planarDeltaShuffleZstd' for o in depth_objects),
+          'every cloud object is planarDeltaShuffleZstd')
+    check(all(o['zstdLevel'] == 1 for o in depth_objects),
+          'every cloud object carries the configured zstd_level 1')
+    check(all(o['position'] == 'int16_mm' and o['color'] == 'rgb565' for o in depth_objects),
+          'every cloud object carries the configured position and colour')
+    check(all(o['voxelLeafMm'] == 50 for o in depth_objects), 'the voxel leaf is recorded as 50 mm')
     check(all(c['pointCount'] <= 100000 for c in clouds),
           f'every cloud is at or under max_points (largest {max(c["pointCount"] for c in clouds)})')
-    check(all(c['position'] == 'int16_mm' and c['color'] == 'rgb565' and c['zstdLevel'] == 1
-              for c in clouds),
-          'every cloud carries the configured position, colour and compression')
-    check(all(c['voxelLeafMm'] == 50 for c in clouds), 'the voxel leaf is recorded as 50 mm')
-    # The block DECODES: pointCount and the format fields describe it and nothing
+    # Each block DECODES: pointCount and the format fields describe it and nothing
     # else does, so a header that disagrees with its own bytes is exactly the
     # failure this decode catches.
     check(all(c['decoded']['consistent'] for c in clouds),
-          'every cloud block decodes to the point count its header claims')
+          'every cloud decodes from its own slice to the point count its entry claims')
     check(all(c['decoded']['points'] == c['pointCount'] for c in clouds),
-          'the decoded point count matches the header')
+          'the decoded point count matches the entry')
+    # A wrong inverse transform still decodes to the right NUMBER of points, so the positions
+    # are checked as well: each is a voxel centroid of points drawn inside the publisher's box
+    # with its jitter, give or take the int16 millimetre.
+    slack = pointcloud.JITTER_M + 0.001
+    outside = [point for c in clouds for point in c['decoded']['first']
+               if not all(low - slack <= point[axis] <= high + slack
+                          for axis, (low, high) in enumerate(pointcloud.BOX))]
+    check(not outside, f"every decoded point reported lies inside the publisher's box "
+                       f'{pointcloud.BOX}: {outside[:3]}')
 
 print()
 if failures:

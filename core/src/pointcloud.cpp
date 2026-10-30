@@ -9,6 +9,11 @@
 
 namespace c3d {
 
+const char* PointCloudEncodingName(PointCloudEncoding e) {
+  return e == PointCloudEncoding::kPlanarDeltaShuffleZstd ? "planarDeltaShuffleZstd"
+                                                          : "planarZstd";
+}
+
 const char* PointPositionName(PointPosition p) {
   return p == PointPosition::kFloat32 ? "float32" : "int16_mm";
 }
@@ -155,6 +160,71 @@ std::size_t BytesPerColor(PointColor c) {
 }
 
 }  // namespace
+
+std::size_t MaxPointsWithin(std::uint64_t bytes, const PointCloudOptions& options) {
+  const std::uint64_t per_point =
+      (options.position == PointPosition::kFloat32 ? 12u : 6u) + BytesPerColor(options.color) +
+      (options.intensity == PointIntensity::kUint8 ? 1u : 0u);
+  if (options.zstd_level <= 0) return static_cast<std::size_t>(bytes / per_point);
+  // The largest n whose block's bound fits; the bound grows with n.
+  std::uint64_t low = 0, high = bytes / per_point;
+  while (low < high) {
+    const std::uint64_t mid = low + (high - low + 1) / 2;
+    if (ZSTD_compressBound(static_cast<std::size_t>(mid * per_point)) <= bytes) {
+      low = mid;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return static_cast<std::size_t>(low);
+}
+
+std::string DeltaShufflePositionPlanes(const std::string& planar, std::size_t n,
+                                       std::size_t position_bytes) {
+  if (position_bytes != 2 || planar.size() < 3 * n * 2) return planar;
+  std::string out = planar;
+  for (std::size_t plane = 0; plane < 3; ++plane) {
+    const std::size_t base = plane * n * 2;
+    std::uint16_t previous = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+      const std::uint16_t value =
+          static_cast<std::uint16_t>(static_cast<unsigned char>(planar[base + i * 2]) |
+                                     (static_cast<unsigned char>(planar[base + i * 2 + 1]) << 8));
+      const std::uint16_t delta = static_cast<std::uint16_t>(value - previous);
+      previous = value;
+      out[base + i] = static_cast<char>(delta & 0xFF);
+      out[base + n + i] = static_cast<char>(delta >> 8);
+    }
+  }
+  return out;
+}
+
+std::string InverseDeltaShufflePositionPlanes(const std::string& transformed, std::size_t n,
+                                              std::size_t position_bytes) {
+  if (position_bytes != 2) return transformed;
+  if (transformed.size() < 3 * n * 2) return std::string();
+  std::string out = transformed;
+  for (std::size_t plane = 0; plane < 3; ++plane) {
+    const std::size_t base = plane * n * 2;
+    std::uint16_t value = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+      const std::uint16_t delta =
+          static_cast<std::uint16_t>(static_cast<unsigned char>(transformed[base + i]) |
+                                     (static_cast<unsigned char>(transformed[base + n + i]) << 8));
+      value = static_cast<std::uint16_t>(value + delta);
+      out[base + i * 2] = static_cast<char>(value & 0xFF);
+      out[base + i * 2 + 1] = static_cast<char>(value >> 8);
+    }
+  }
+  return out;
+}
+
+PointCloudEncoding EffectiveEncoding(const PointCloudOptions& options) {
+  return options.encoding == PointCloudEncoding::kPlanarDeltaShuffleZstd &&
+                 options.position == PointPosition::kInt16Mm && options.zstd_level > 0
+             ? PointCloudEncoding::kPlanarDeltaShuffleZstd
+             : PointCloudEncoding::kPlanarZstd;
+}
 
 EncodedPointCloud Encode(const PointCloudInput& input, const PointCloudOptions& options) {
   EncodedPointCloud out;
@@ -359,11 +429,17 @@ EncodedPointCloud Encode(const PointCloudInput& input, const PointCloudOptions& 
   out.raw_bytes = block.size();
 
   const int level = std::min(ZSTD_maxCLevel(), std::max(0, options.zstd_level));
+  out.encoding = PointCloudEncoding::kPlanarZstd;
   if (level == 0) {
     out.zstd_level = 0;
     out.data = std::move(block);
     out.ok = true;
     return out;
+  }
+
+  if (EffectiveEncoding(options) == PointCloudEncoding::kPlanarDeltaShuffleZstd) {
+    block = DeltaShufflePositionPlanes(block, kept.size(), position_bytes);
+    out.encoding = PointCloudEncoding::kPlanarDeltaShuffleZstd;
   }
 
   std::string compressed;

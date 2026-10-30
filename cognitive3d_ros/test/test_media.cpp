@@ -11,15 +11,22 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <limits>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
+#include "c3d/h264_encoder.hpp"
+#include "c3d/scan_block.hpp"
 #include "c3d/spool.hpp"
 #include "c3d/transport.hpp"
 #include "cognitive3d_ros/doctor.hpp"
@@ -54,8 +61,7 @@ rclcpp::SerializedMessage Serialize(const MessageT& message) {
   return out;
 }
 
-// A real JPEG of a given size, produced by the same encoder the capture uses, so
-// the pass-through tests are about real bytes rather than a hand-built header.
+// A real JPEG of a given size and one colour, so the decode tests are about real bytes.
 std::string MakeJpeg(int width, int height) {
   cv::Mat image(height, width, CV_8UC3, cv::Scalar(20, 120, 200));
   std::vector<std::uint8_t> buffer;
@@ -123,6 +129,235 @@ void PutUint32(std::vector<std::uint8_t>* data, std::size_t offset, std::uint32_
   std::memcpy(data->data() + offset, &value, sizeof(value));
 }
 
+// What one fake encoder was asked to do, kept after the capture has released the encoder.
+struct FakeRecord {
+  c3d::H264EncoderSettings settings;
+  bool started = false;
+  int feed_calls = 0;
+  std::vector<std::size_t> fed_sizes;  // the frames Feed took, in bytes
+  std::vector<std::uint64_t> fed_tokens;
+  std::vector<std::uint64_t> refed_tokens;
+  std::vector<double> finish_timeouts;
+};
+
+// How the encoders a FakeEncoders factory builds behave; each takes a copy of `next` when built.
+struct FakeBehaviour {
+  std::function<bool(int feed_call)> accept;  // unset takes every frame
+  bool start_fails = false;
+  std::string start_error = "posix_spawnp ffmpeg: No such file or directory (ENOENT)";
+  // Deliver nothing from Feed: every unit waits for Finish, a tail. A drain (a timeout above 0)
+  // delivers them; a kill (0) abandons them, unless deliver_held_at_kill.
+  bool hold_units = false;
+  // Units the reader was already delivering when a kill came: Finish(0) delivers them too.
+  bool deliver_held_at_kill = false;
+  // Each unit is delivered only once this many more frames have been fed, as the real encoder's
+  // splitter holds a unit until the next one begins.
+  std::size_t lag_units = 0;
+  // The size of the unit for the encoder's n-th frame, fed or refed; unset is "unit-<n>".
+  std::function<std::size_t(int unit)> unit_bytes;
+  // After the unit for this feed call, one more that pairs with no frame, as an ffmpeg that
+  // duplicated a frame would return.
+  int unpaired_after_call = -1;
+  // Reported once, from Finish, in place of what Finish would report itself.
+  std::optional<c3d::EncoderFailure> finish_failure;
+  double finish_sleep_s = 0.0;
+};
+
+// An encoder with no child process: every frame it takes comes back as an access unit at once, on
+// the caller's thread, with a keyframe at the first frame at or after 3 * n seconds of the
+// capture's clock since Start, for the next n -- the real encoder's rule, which is real time.
+// Finish behaves as the real one does: a timeout above 0 drains, which this fake always completes;
+// Finish(0) on a running instance kills it, abandons what it still holds and reports `killed`.
+class FakeH264Encoder : public c3d::IH264Encoder {
+ public:
+  FakeH264Encoder(const c3d::H264EncoderSettings& settings, c3d::OnAccessUnit on_access_unit,
+                  c3d::OnEncoderFailure on_failure, FakeBehaviour behaviour,
+                  std::shared_ptr<FakeRecord> record, std::function<double()> clock)
+      : settings_(settings),
+        on_access_unit_(std::move(on_access_unit)),
+        on_failure_(std::move(on_failure)),
+        behaviour_(std::move(behaviour)),
+        record_(std::move(record)),
+        clock_(std::move(clock)) {}
+
+  bool Start(std::string* error) override {
+    if (behaviour_.start_fails) {
+      *error = behaviour_.start_error;
+      return false;
+    }
+    started_ = true;
+    started_at_ = clock_();
+    record_->started = true;
+    return true;
+  }
+  bool Feed(std::string bgr24, std::uint64_t token) override {
+    if (!started_ || finished_ || dead_) return false;
+    const int call = record_->feed_calls++;
+    if (behaviour_.accept && !behaviour_.accept(call)) return false;
+    record_->fed_tokens.push_back(token);
+    Encode(bgr24, token);
+    if (call == behaviour_.unpaired_after_call) {
+      c3d::EncodedAccessUnit extra;
+      extra.paired = false;
+      extra.bytes = "unpaired";
+      on_access_unit_(std::move(extra));
+    }
+    return true;
+  }
+  bool Refeed(std::string bgr24, std::uint64_t token) override {
+    if (!started_ || finished_ || dead_) return false;
+    record_->refed_tokens.push_back(token);
+    Encode(bgr24, token);
+    return true;
+  }
+  void Finish(double timeout_s) override {
+    if (finished_) return;
+    finished_ = true;
+    record_->finish_timeouts.push_back(timeout_s);
+    if (behaviour_.finish_sleep_s > 0.0) {
+      std::this_thread::sleep_for(std::chrono::duration<double>(behaviour_.finish_sleep_s));
+    }
+    const bool kill = timeout_s <= 0.0 && started_ && !dead_;
+    std::uint64_t abandoned = 0;
+    if (kill && !behaviour_.deliver_held_at_kill) {
+      abandoned = held_.size();
+      held_.clear();
+    }
+    for (auto& unit : held_) on_access_unit_(std::move(unit));
+    held_.clear();
+    if (reported_) return;
+    if (behaviour_.finish_failure) {
+      reported_ = true;
+      on_failure_(*behaviour_.finish_failure);
+    } else if (kill) {
+      reported_ = true;
+      c3d::EncoderFailure failure;
+      failure.why = "killed at the deadline";
+      failure.killed = true;
+      failure.abandoned = abandoned;
+      on_failure_(failure);
+    }
+  }
+  void Encode(const std::string& bgr24, std::uint64_t token) {
+    // The encoder's contract: exactly one frame of its own size.
+    EXPECT_EQ(bgr24.size(), static_cast<std::size_t>(settings_.width) * settings_.height * 3u);
+    record_->fed_sizes.push_back(bgr24.size());
+    c3d::EncodedAccessUnit unit;
+    unit.token = token;
+    unit.bytes = behaviour_.unit_bytes ? std::string(behaviour_.unit_bytes(accepted_), 'u')
+                                       : "unit-" + std::to_string(accepted_);
+    unit.keyframe = clock_() - started_at_ >= settings_.chunk_s * keyframes_;
+    if (unit.keyframe) ++keyframes_;
+    ++accepted_;
+    unit.codec_params = "\x01" "fake";
+    unit.encoder_settings = "fake " + settings_.preset + " crf=" + std::to_string(settings_.crf);
+    held_.push_back(std::move(unit));
+    if (behaviour_.hold_units) return;
+    while (held_.size() > behaviour_.lag_units) {
+      c3d::EncodedAccessUnit next = std::move(held_.front());
+      held_.erase(held_.begin());
+      on_access_unit_(std::move(next));
+    }
+  }
+  // The child dying while the encoder runs: reported at once, from the caller's thread, which is
+  // not a stop's.
+  void Die(const c3d::EncoderFailure& failure) {
+    dead_ = true;
+    reported_ = true;
+    on_failure_(failure);
+  }
+  std::string codec_params() const override { return "\x01" "fake"; }
+  std::string encoder_settings() const override { return "fake"; }
+  c3d::H264EncoderStats stats() const override { return {}; }
+
+ private:
+  c3d::H264EncoderSettings settings_;
+  c3d::OnAccessUnit on_access_unit_;
+  c3d::OnEncoderFailure on_failure_;
+  FakeBehaviour behaviour_;
+  std::shared_ptr<FakeRecord> record_;
+  std::function<double()> clock_;
+  std::vector<c3d::EncodedAccessUnit> held_;
+  bool started_ = false, finished_ = false, dead_ = false, reported_ = false;
+  double started_at_ = 0.0;
+  int accepted_ = 0;
+  int keyframes_ = 0;
+};
+
+// Builds FakeH264Encoders and keeps what each was asked to do.
+class FakeEncoders {
+ public:
+  FakeBehaviour next;
+  // The capture's arrival clock, read without advancing it; each fixture sets it.
+  std::function<double()> clock = [] { return 0.0; };
+  H264EncoderFactory Factory() {
+    return [this](const c3d::H264EncoderSettings& settings, c3d::OnAccessUnit on_access_unit,
+                  c3d::OnEncoderFailure on_failure) -> std::unique_ptr<c3d::IH264Encoder> {
+      auto record = std::make_shared<FakeRecord>();
+      record->settings = settings;
+      records_.push_back(record);
+      auto encoder = std::make_unique<FakeH264Encoder>(settings, std::move(on_access_unit),
+                                                       std::move(on_failure), next, record, clock);
+      live_.push_back(encoder.get());
+      return encoder;
+    };
+  }
+  std::size_t built() const { return records_.size(); }
+  FakeRecord& record(std::size_t i) { return *records_.at(i); }
+  FakeRecord& last() { return *records_.back(); }
+  // Valid only while the capture still holds that encoder.
+  FakeH264Encoder& live(std::size_t i) { return *live_.at(i); }
+
+ private:
+  std::vector<std::shared_ptr<FakeRecord>> records_;
+  std::vector<FakeH264Encoder*> live_;
+};
+
+// What a camera handed the session, one call per access unit.
+struct AccessUnitCall {
+  std::string camera_id;
+  std::uint64_t time_ms = 0;
+  std::uint32_t seq = 0;
+  std::string frame_id;
+  c3d::Vec3 position;
+  c3d::Quat rotation;
+  c3d::VideoChunkContext context;
+  std::string bytes;
+  bool keyframe = false;
+  c3d::VideoUnitFate fate = c3d::VideoUnitFate::kDropped;
+};
+
+// A real runner, which also keeps every access unit it is handed: test_media cannot decode what the
+// session stores.
+class RecordingRunner : public SessionRunner {
+ public:
+  using SessionRunner::SessionRunner;
+  c3d::VideoUnitFate RecordCameraAccessUnit(const std::string& camera_id, std::uint64_t time_ms,
+                                            std::uint32_t seq, const std::string& frame_id,
+                                            const c3d::Vec3& ros_position,
+                                            const c3d::Quat& ros_rotation,
+                                            c3d::VideoChunkContext context,
+                                            std::string access_unit, bool keyframe) override {
+    AccessUnitCall call{camera_id, time_ms, seq, frame_id, ros_position, ros_rotation,
+                        context,   access_unit, keyframe};
+    call.fate = SessionRunner::RecordCameraAccessUnit(camera_id, time_ms, seq, frame_id,
+                                                      ros_position, ros_rotation,
+                                                      std::move(context), std::move(access_unit),
+                                                      keyframe);
+    std::lock_guard<std::mutex> lock(mu_);
+    calls_.push_back(std::move(call));
+    return calls_.back().fate;
+  }
+  std::vector<AccessUnitCall> calls() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return calls_;
+  }
+
+ private:
+  mutable std::mutex mu_;
+  std::vector<AccessUnitCall> calls_;
+};
+
 class MediaTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -137,12 +372,12 @@ class MediaTest : public ::testing::Test {
     cfg.spool_dir = dir_.string();
     cfg.auto_send_interval_s = 3600.0;
     cfg.worker_tick_s = 0.01;
-    runner_ = std::make_unique<SessionRunner>(cfg, PoseConvention::kRep103,
-                                             std::make_shared<NullTransport>(),
-                                             std::make_shared<c3d::DiskSpool>(
-                                                 dir_.string(), 64ull << 20,
-                                                 std::make_shared<c3d::NullLogger>()),
-                                             std::make_shared<c3d::NullLogger>());
+    runner_ = std::make_unique<RecordingRunner>(cfg, PoseConvention::kRep103,
+                                               std::make_shared<NullTransport>(),
+                                               std::make_shared<c3d::DiskSpool>(
+                                                   dir_.string(), 64ull << 20,
+                                                   std::make_shared<c3d::NullLogger>()),
+                                               std::make_shared<c3d::NullLogger>());
     ASSERT_TRUE(runner_->Begin());
 
     environment_.lookup_pose = [this](const std::string& frame, const rclcpp::Time& stamp,
@@ -157,6 +392,11 @@ class MediaTest : public ::testing::Test {
     environment_.warn_once = [this](const std::string& text) { warnings_.push_back(text); };
     // A second between arrivals, so every message these tests hand over passes the gate.
     environment_.arrival_time = [this]() { return next_arrival_ += 1.0; };
+    fakes_.clock = [this]() { return on_test_clock_ ? clock_ : next_arrival_; };
+    // The real clocks move with the test's clock, from where a test sets them, so only a test that
+    // steps one moves them apart.
+    environment_.wall_time = [this]() { return wall_ + TestClockElapsed(); };
+    environment_.steady_time = [this]() { return steady_ + TestClockElapsed(); };
   }
   void TearDown() override {
     if (runner_) runner_->End("test");
@@ -165,7 +405,39 @@ class MediaTest : public ::testing::Test {
     fs::remove_all(dir_, ec);
   }
 
-  std::unique_ptr<SessionRunner> runner_;
+  // A capture on fake encoders, which `fakes_` builds and remembers.
+  std::unique_ptr<CameraCapture> OnFakes(CameraConfig config) {
+    return std::make_unique<CameraCapture>(std::move(config), "ffmpeg", fakes_.Factory());
+  }
+  // A camera whose gate passes everything a test sends at up to 1000 Hz.
+  static CameraConfig Front() {
+    CameraConfig config;
+    config.name = "front";
+    config.topic = "/image";
+    config.rate_hz = 1000.0;
+    return config;
+  }
+  // One frame arriving at `t` seconds on a clock the test sets, so every restart rule is driven
+  // with literals; from the first call, the arrival clock is that one, and the real clocks move
+  // with it.
+  bool FrameAt(CameraCapture& capture, double t, int width = 32, int height = 24,
+               const std::string& frame = "camera_link") {
+    environment_.arrival_time = [this]() { return clock_; };
+    on_test_clock_ = true;
+    clock_ = kClockStart + t;
+    return capture.Handle("sensor_msgs/msg/Image",
+                          Serialize(MakeImage(width, height, "rgb8", frame, 100.0 + t)),
+                          environment_, *runner_);
+  }
+  static constexpr double kClockStart = 1000.0;
+  double TestClockElapsed() const { return on_test_clock_ ? clock_ - kClockStart : 0.0; }
+  double clock_ = kClockStart;
+  bool on_test_clock_ = false;
+  double wall_ = 1788383000.0;
+  double steady_ = 52000.0;
+
+  std::unique_ptr<RecordingRunner> runner_;
+  FakeEncoders fakes_;
   MediaEnvironment environment_;
   std::vector<std::string> looked_up_frames_;
   std::vector<std::string> warnings_;
@@ -179,54 +451,6 @@ class MediaTest : public ::testing::Test {
 int MediaTest::counter_ = 0;
 
 }  // namespace
-
-// ---------------------------------------------------------------------------
-// The JPEG SOF parser, which exists so a pass-through never decodes
-// ---------------------------------------------------------------------------
-
-TEST(JpegDimensions, ReadsABaselineFrameHeader) {
-  const std::string jpeg = MakeJpeg(320, 240);
-  std::uint16_t width = 0, height = 0;
-  ASSERT_TRUE(JpegDimensions(jpeg, &width, &height));
-  EXPECT_EQ(width, 320);
-  EXPECT_EQ(height, 240);
-}
-
-TEST(JpegDimensions, ReadsAProgressiveFrameHeader) {
-  // SOF2, which is what an encoder asked for a progressive JPEG emits. A parser
-  // that matched only SOF0 would report 0x0 for it and the wire would carry that.
-  const std::string jpeg =
-      std::string("\xff\xd8", 2) +                          // SOI
-      std::string("\xff\xc2\x00\x11\x08\x01\x90\x02\x80\x03\x01\x11\x00\x02\x11\x01\x03\x11\x01",
-                  19);
-  std::uint16_t width = 0, height = 0;
-  ASSERT_TRUE(JpegDimensions(jpeg, &width, &height));
-  EXPECT_EQ(height, 400);
-  EXPECT_EQ(width, 640);
-}
-
-TEST(JpegDimensions, SkipsTheSegmentsThatShareTheFrameHeaderRange) {
-  // DHT is 0xC4 and sits inside C0-CF. Read as a frame header its table bytes
-  // become a plausible width and height, which is worse than failing.
-  std::string jpeg = std::string("\xff\xd8", 2);
-  jpeg += std::string("\xff\xc4\x00\x06\x00\x01\x02\x03", 8);   // DHT, length 6
-  jpeg += std::string("\xff\xc0\x00\x11\x08\x00\x64\x00\xc8\x03\x01\x11\x00\x02\x11\x01\x03\x11\x01",
-                      19);                                     // SOF0, 200 x 100
-  std::uint16_t width = 0, height = 0;
-  ASSERT_TRUE(JpegDimensions(jpeg, &width, &height));
-  EXPECT_EQ(height, 100);
-  EXPECT_EQ(width, 200);
-}
-
-TEST(JpegDimensions, RefusesWhatIsNotAJpegOrIsCutShort) {
-  std::uint16_t width = 0, height = 0;
-  EXPECT_FALSE(JpegDimensions("", &width, &height));
-  EXPECT_FALSE(JpegDimensions("not a jpeg at all", &width, &height));
-  EXPECT_FALSE(JpegDimensions(std::string("\x89PNG\r\n\x1a\n", 8), &width, &height));
-  // A real JPEG truncated before its frame header: the SOI is there and the
-  // answer still is not.
-  EXPECT_FALSE(JpegDimensions(MakeJpeg(64, 64).substr(0, 4), &width, &height));
-}
 
 // ---------------------------------------------------------------------------
 // Encoding acceptance
@@ -247,19 +471,68 @@ TEST(ImageEncodings, ColourAndGreyscaleAreAcceptedAndDepthIsNamedSeparately) {
   EXPECT_FALSE(IsDepthEncoding("bayer_rggb8"));
 }
 
-TEST(ImageEncodings, TheCompressedFormatFieldIsSearchedNotMatched) {
-  // All three are published by the ROS image transport for the same JPEG.
-  EXPECT_TRUE(CompressedFormatIsJpeg("jpeg"));
-  EXPECT_TRUE(CompressedFormatIsJpeg("bgr8; jpeg compressed bgr8"));
-  EXPECT_TRUE(CompressedFormatIsJpeg("rgb8; jpeg compressed bgr8"));
-  EXPECT_TRUE(CompressedFormatIsJpeg("JPEG"));
-  EXPECT_FALSE(CompressedFormatIsJpeg("png"));
-  EXPECT_FALSE(CompressedFormatIsJpeg("bgr8; png compressed bgr8"));
-}
-
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
+
+// A chunk is sized, by the fitted estimate, to stay under 6 MiB: the longest length from 1 to 3 s,
+// in tenths, that fits, with max_bitrate_kbps capping the estimate; 0 when not even 1 s fits.
+TEST(CameraChunkSeconds, TheLongestLengthUnderTheTargetFromOneToThreeSeconds) {
+  CameraConfig camera;
+  camera.rate_hz = 30.0;
+  camera.crf = 24;
+  EXPECT_EQ(CameraChunkSeconds(camera, 640, 480), 3.0);
+  EXPECT_EQ(CameraChunkSeconds(camera, 1920, 1080), 3.0);
+  // 3.69 MB a second: 6 MiB is 1.71 s of it.
+  EXPECT_DOUBLE_EQ(CameraChunkSeconds(camera, 2560, 1440), 1.7);
+  // 8.29 MB a second: not even 1 s fits.
+  EXPECT_EQ(CameraChunkSeconds(camera, 3840, 2160), 0.0);
+  camera.max_bitrate_kbps = 20000;
+  EXPECT_DOUBLE_EQ(CameraChunkSeconds(camera, 3840, 2160), 2.5);
+  camera.max_bitrate_kbps = 0;
+  camera.crf = 28;
+  EXPECT_DOUBLE_EQ(CameraChunkSeconds(camera, 3840, 2160), 1.5);
+  camera.rate_hz = 15.0;
+  EXPECT_DOUBLE_EQ(CameraChunkSeconds(camera, 3840, 2160), 3.0);
+}
+
+// The replay store must hold kReplayWindowFrames frames of the size, as yuv420p, for a size
+// restart to lose nothing; past it the encoder caps its bitrate by default, at 6 MiB over a chunk.
+TEST(CameraChunkSeconds, TheBitrateIsCappedByDefaultOnlyWhereTheReplayOverflows) {
+  CameraConfig camera;
+  EXPECT_EQ(camera.replay_max_mb, 192);
+  EXPECT_FALSE(ReplayNeedsBitrateCap(camera, 1920, 1080));
+  EXPECT_FALSE(ReplayNeedsBitrateCap(camera, 2560, 1440));
+  EXPECT_TRUE(ReplayNeedsBitrateCap(camera, 3840, 2160));
+  camera.replay_max_mb = 64;
+  EXPECT_TRUE(ReplayNeedsBitrateCap(camera, 1920, 1080));
+  EXPECT_EQ(DefaultCameraBitrateKbps(3.0), 16777);
+  EXPECT_EQ(DefaultCameraBitrateKbps(1.0), 50331);
+}
+
+// With max_width_px set, configure sizes the camera as a 16:9 frame that wide and refuses it when
+// not even a 1-second chunk fits, naming the parameters that change that. Unset, the size is
+// known only at the first frame.
+TEST(MediaConfig, ACameraWhoseWidthFitsNoChunkIsRefusedNamingTheLevers) {
+  CameraConfig camera;
+  camera.name = "front";
+  camera.topic = "/image";
+  camera.rate_hz = 30.0;
+  camera.crf = 24;
+  camera.max_width_px = 3840;
+  const std::string refusal = ValidateCameraConfig(camera);
+  EXPECT_EQ(refusal.rfind("camera.front.max_width_px is 3840", 0), 0u) << refusal;
+  for (const char* lever : {"max_width_px", "crf", "max_bitrate_kbps", "10 MiB"}) {
+    EXPECT_NE(refusal.find(lever), std::string::npos) << lever << ": " << refusal;
+  }
+  camera.max_width_px = 2560;
+  EXPECT_EQ(ValidateCameraConfig(camera), "");
+  camera.max_width_px = 0;
+  EXPECT_EQ(ValidateCameraConfig(camera), "");
+  camera.max_width_px = 3840;
+  camera.max_bitrate_kbps = 20000;
+  EXPECT_EQ(ValidateCameraConfig(camera), "");
+}
 
 TEST(MediaConfig, EveryRefusalNamesTheParameter) {
   CameraConfig camera;
@@ -279,19 +552,40 @@ TEST(MediaConfig, EveryRefusalNamesTheParameter) {
   zero_rate.rate_hz = std::numeric_limits<double>::quiet_NaN();
   EXPECT_NE(ValidateCameraConfig(zero_rate).find("camera.front.rate_hz"), std::string::npos);
 
-  // Reserved on the wire, not implemented here: accepting it would produce a
-  // stream nothing downstream can open.
-  CameraConfig jxl = camera;
-  jxl.format = "jpegxl";
-  EXPECT_NE(ValidateCameraConfig(jxl).find("camera.front.format"), std::string::npos);
-  jxl.format = "JPEG";
-  EXPECT_NE(ValidateCameraConfig(jxl).find("camera.front.format"), std::string::npos);
+  // The band the encoder was measured over, both ends inside it.
+  CameraConfig crf = camera;
+  for (const int outside : {23, 33, 0, -28}) {
+    crf.crf = outside;
+    const std::string refusal = ValidateCameraConfig(crf);
+    EXPECT_NE(refusal.find("camera.front.crf"), std::string::npos) << outside << ": " << refusal;
+    EXPECT_NE(refusal.find("from 24 to 32"), std::string::npos) << outside << ": " << refusal;
+  }
+  for (const int inside : {24, 28, 32}) {
+    crf.crf = inside;
+    EXPECT_EQ(ValidateCameraConfig(crf), "") << inside;
+  }
 
-  CameraConfig quality = camera;
-  quality.jpeg_quality = 0;
-  EXPECT_NE(ValidateCameraConfig(quality).find("jpeg_quality"), std::string::npos);
-  quality.jpeg_quality = 101;
-  EXPECT_NE(ValidateCameraConfig(quality).find("jpeg_quality"), std::string::npos);
+  CameraConfig preset = camera;
+  for (const char* refused : {"medium", "Ultrafast", "superfast", ""}) {
+    preset.preset = refused;
+    const std::string refusal = ValidateCameraConfig(preset);
+    EXPECT_NE(refusal.find("camera.front.preset"), std::string::npos) << refused << ": " << refusal;
+    EXPECT_NE(refusal.find("'ultrafast' or 'veryfast'"), std::string::npos) << refusal;
+  }
+  preset.preset = "veryfast";
+  EXPECT_EQ(ValidateCameraConfig(preset), "");
+
+  CameraConfig bitrate = camera;
+  for (const int outside : {-1, 1000001, std::numeric_limits<int>::max()}) {
+    bitrate.max_bitrate_kbps = outside;
+    EXPECT_NE(ValidateCameraConfig(bitrate).find("camera.front.max_bitrate_kbps"),
+              std::string::npos)
+        << outside;
+  }
+  for (const int inside : {0, 2000, 1000000}) {
+    bitrate.max_bitrate_kbps = inside;
+    EXPECT_EQ(ValidateCameraConfig(bitrate), "") << inside;
+  }
 
   CameraConfig width = camera;
   width.max_width_px = -1;
@@ -326,6 +620,31 @@ TEST(MediaConfig, AFieldOfViewIsBothAnglesStrictlyBetween0And180OrNeither) {
     EXPECT_NE(refusal(61.0, bad).find("camera.front.vfov_degrees"), std::string::npos) << bad;
   }
   EXPECT_EQ(refusal(179.99, 0.01), "");
+}
+
+// One cloud is an object of its own when it is large, so max_points is bounded to the most points
+// whose worst case encoding stays under 8 MiB at the configured layout: refused above it, naming it.
+TEST(MediaConfig, ALidarsMaxPointsIsBoundedSoOneCloudStaysUnderTheObjectLimit) {
+  LidarConfig lidar;
+  lidar.name = "front";
+  lidar.topic = "/points";
+  const std::size_t ceiling =
+      c3d::pointcloud::MaxPointsWithin(c3d::kMaxCloudBytes, lidar.pointcloud);
+  EXPECT_GT(ceiling, 1000000u);
+  lidar.pointcloud.max_points = ceiling;
+  EXPECT_EQ(ValidateLidarConfig(lidar), "");
+  lidar.pointcloud.max_points = ceiling + 1;
+  const std::string refusal = ValidateLidarConfig(lidar);
+  EXPECT_EQ(refusal.rfind("lidar.front.pointcloud.max_points is " + std::to_string(ceiling + 1), 0),
+            0u)
+      << refusal;
+  EXPECT_NE(refusal.find("at most " + std::to_string(ceiling)), std::string::npos) << refusal;
+
+  lidar.pointcloud.position = c3d::PointPosition::kFloat32;
+  lidar.pointcloud.color = c3d::PointColor::kRgb888;
+  lidar.pointcloud.intensity = c3d::PointIntensity::kUint8;
+  lidar.pointcloud.max_points = 600000;
+  EXPECT_NE(ValidateLidarConfig(lidar), "") << "16 bytes a point allow about 524,000";
 }
 
 TEST(MediaConfig, ALidarsPointCloudOptionsAreBoundedWhereTheWireIs) {
@@ -465,11 +784,12 @@ class MediaGateTest : public MediaTest {
     config.name = "front";
     config.topic = "/image";
     config.rate_hz = rate_hz;
-    return CameraCapture(config);
+    return CameraCapture(config, "ffmpeg", fakes_.Factory());
   }
   void SetUp() override {
     MediaTest::SetUp();
     environment_.arrival_time = [this]() { return arrival_; };
+    fakes_.clock = [this]() { return arrival_; };
   }
   static constexpr double kSteady0 = 52000.0;  // a steady clock: seconds since boot
   static constexpr double kEpoch0 = 1.79e9;    // a header stamp: epoch seconds
@@ -589,32 +909,64 @@ TEST_F(MediaGateTest, TheLidarGateIsOnArrivalToo) {
 // Camera capture
 // ---------------------------------------------------------------------------
 
-TEST_F(MediaTest, AnImageIsEncodedResizedAndRecorded) {
+namespace {
+
+// An rgb8 frame whose last column and last row are a different colour from the rest, so the crop
+// can be seen to drop exactly those.
+sensor_msgs::msg::Image EdgedImage(int width, int height) {
+  sensor_msgs::msg::Image image = MakeImage(width, height, "rgb8");
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const bool edge = x == width - 1 || y == height - 1;
+      std::uint8_t* pixel = &image.data[(static_cast<std::size_t>(y) * width + x) * 3];
+      pixel[0] = edge ? 250 : 10;  // r
+      pixel[1] = 20;               // g
+      pixel[2] = 30;               // b
+    }
+  }
+  return image;
+}
+
+}  // namespace
+
+// The encoder takes bgr24 of even dimensions. 321x241 is scaled by nothing at max_width_px 0, so
+// only the crop can make it even: the last column and row go, and what is fed is 320x240 of the
+// rest, in b, g, r order. Scaled to 160 wide it is 160x120, even already.
+TEST_F(MediaTest, AnImageIsPreparedShrunkToEvenDimensionsAndFed) {
   CameraConfig config;
   config.name = "front";
   config.topic = "/image";
   config.rate_hz = 100.0;
-  config.max_width_px = 64;
-  CameraCapture capture(config);
+  config.max_width_px = 0;
+  auto capture = OnFakes(config);
 
-  const auto message = Serialize(MakeImage(320, 240, "rgb8"));
-  ASSERT_TRUE(capture.Handle("sensor_msgs/msg/Image", message, environment_, *runner_));
-  EXPECT_EQ(capture.stats().frames, 1u);
-  EXPECT_GT(capture.stats().bytes, 0u);
-  EXPECT_EQ(capture.stats().refused, 0u);
+  const auto odd = Serialize(EdgedImage(321, 241));
+  ASSERT_TRUE(capture->Handle("sensor_msgs/msg/Image", odd, environment_, *runner_));
+  ASSERT_EQ(fakes_.built(), 1u);
+  EXPECT_EQ(fakes_.last().settings.width, 320);
+  EXPECT_EQ(fakes_.last().settings.height, 240);
+  EXPECT_EQ(fakes_.last().fed_sizes, std::vector<std::size_t>{230400u});
   ASSERT_EQ(looked_up_frames_.size(), 1u);
   EXPECT_EQ(looked_up_frames_[0], "camera_link");
 
-  // The size on the wire is what was SENT, not what was configured: the aspect
-  // ratio is kept, so 320x240 at max_width 64 is 64x48.
-  std::uint64_t bytes = 0;
-  std::uint16_t width = 0, height = 0;
+  PreparedFrame frame;
   std::string why;
-  ASSERT_TRUE(capture.MeasureEncodedFrame("sensor_msgs/msg/Image", message, &bytes, &width,
-                                          &height, &why))
-      << why;
-  EXPECT_EQ(width, 64);
-  EXPECT_EQ(height, 48);
+  ASSERT_TRUE(capture->PrepareFrame("sensor_msgs/msg/Image", odd, &frame, &why)) << why;
+  EXPECT_EQ(frame.width, 320);
+  EXPECT_EQ(frame.height, 240);
+  ASSERT_EQ(frame.bgr24.size(), 230400u);
+  for (std::size_t i = 0; i < frame.bgr24.size(); i += 3) {
+    ASSERT_EQ(static_cast<unsigned char>(frame.bgr24[i]), 30) << "pixel " << i / 3;
+    ASSERT_EQ(static_cast<unsigned char>(frame.bgr24[i + 1]), 20) << "pixel " << i / 3;
+    ASSERT_EQ(static_cast<unsigned char>(frame.bgr24[i + 2]), 10) << "pixel " << i / 3;
+  }
+
+  config.max_width_px = 160;
+  auto shrunk = OnFakes(config);
+  ASSERT_TRUE(shrunk->Handle("sensor_msgs/msg/Image", odd, environment_, *runner_));
+  EXPECT_EQ(fakes_.last().settings.width, 160);
+  EXPECT_EQ(fakes_.last().settings.height, 120);
+  EXPECT_EQ(fakes_.last().fed_sizes, std::vector<std::size_t>{160u * 120u * 3u});
 }
 
 // The field of view of the image a CameraInfo describes, against intrinsics whose angles are known.
@@ -712,7 +1064,7 @@ TEST(CameraFovSource, ParametersThenTheLatestCameraInfoThenNone) {
   config.name = "front";
   config.topic = "/cam/image_raw";
   config.camera_info_topic = "/cam/camera_info";
-  CameraCapture capture(config);
+  CameraCapture capture(config, "ffmpeg");
   EXPECT_STREQ(capture.fov_source(), "camera_info");
   EXPECT_TRUE(capture.wants_camera_info());
   ExpectFov(capture.CurrentFov(), 0.0, 0.0);  // nothing yet
@@ -743,7 +1095,7 @@ TEST(CameraFovSource, ParametersThenTheLatestCameraInfoThenNone) {
   // The parameters win over a usable CameraInfo, and the topic is then not wanted.
   config.hfov_degrees = 61.0;
   config.vfov_degrees = 45.0;
-  CameraCapture measured(config);
+  CameraCapture measured(config, "ffmpeg");
   EXPECT_STREQ(measured.fov_source(), "parameter");
   EXPECT_FALSE(measured.wants_camera_info());
   measured.HandleCameraInfo(Intrinsics(500, 500, 320, 240, 640, 480), environment);
@@ -755,7 +1107,7 @@ TEST(CameraFovSource, ParametersThenTheLatestCameraInfoThenNone) {
   config.hfov_degrees = 0.0;
   config.vfov_degrees = 0.0;
   config.camera_info_topic.clear();
-  CameraCapture off(config);
+  CameraCapture off(config, "ffmpeg");
   EXPECT_STREQ(off.fov_source(), "none");
   EXPECT_FALSE(off.wants_camera_info());
   off.HandleCameraInfo(Intrinsics(500, 500, 320, 240, 640, 480), environment);
@@ -773,7 +1125,7 @@ TEST_F(MediaTest, ACameraInfoTopicWithNoPublisherIsSaidAtTheFirstFrameOfEachSess
   config.name = "front";
   config.topic = "/cam/image_raw";
   config.camera_info_topic = "/cam/camera_info";
-  CameraCapture capture(config);
+  CameraCapture capture(config, "ffmpeg", fakes_.Factory());
   const auto frame = [this](CameraCapture& camera) {
     return camera.Handle("sensor_msgs/msg/Image", Serialize(MakeImage(32, 32, "rgb8")),
                          environment_, *runner_);
@@ -803,7 +1155,7 @@ TEST_F(MediaTest, ACameraInfoTopicWithNoPublisherIsSaidAtTheFirstFrameOfEachSess
 
   config.hfov_degrees = 61.0;
   config.vfov_degrees = 45.0;
-  CameraCapture measured(config);
+  CameraCapture measured(config, "ffmpeg", fakes_.Factory());
   ASSERT_TRUE(frame(measured));
   EXPECT_EQ(warnings_.size(), 2u) << "the parameters are the field of view";
 }
@@ -814,14 +1166,14 @@ TEST(CameraFovSource, TheParametersAreTheFieldOfViewWhenSet) {
   CameraConfig config;
   config.name = "front";
   config.topic = "/image";
-  CameraCapture unset(config);
+  CameraCapture unset(config, "ffmpeg");
   EXPECT_EQ(unset.CurrentFov().hfov_deg, 0.0f);
   EXPECT_EQ(unset.CurrentFov().vfov_deg, 0.0f);
   EXPECT_STREQ(unset.fov_source(), "none");
 
   config.hfov_degrees = 61.0;
   config.vfov_degrees = 45.5;
-  CameraCapture set(config);
+  CameraCapture set(config, "ffmpeg");
   EXPECT_EQ(set.CurrentFov().hfov_deg, 61.0f);
   EXPECT_EQ(set.CurrentFov().vfov_deg, 45.5f);
   EXPECT_STREQ(set.fov_source(), "parameter");
@@ -833,7 +1185,7 @@ TEST_F(MediaTest, AConfiguredFrameWinsOverTheMessageHeader) {
   config.topic = "/image";
   config.rate_hz = 100.0;
   config.frame = "front_optical_frame";
-  CameraCapture capture(config);
+  CameraCapture capture(config, "ffmpeg", fakes_.Factory());
 
   ASSERT_TRUE(capture.Handle("sensor_msgs/msg/Image",
                              Serialize(MakeImage(32, 32, "rgb8", "wrong_frame")), environment_,
@@ -847,7 +1199,7 @@ TEST_F(MediaTest, ADepthImageIsRefusedOncePerTopicAndNamedAsDepth) {
   config.name = "front";
   config.topic = "/depth";
   config.rate_hz = 100.0;
-  CameraCapture capture(config);
+  CameraCapture capture(config, "ffmpeg", fakes_.Factory());
 
   for (int i = 0; i < 5; ++i) {
     EXPECT_FALSE(capture.Handle("sensor_msgs/msg/Image",
@@ -861,13 +1213,16 @@ TEST_F(MediaTest, ADepthImageIsRefusedOncePerTopicAndNamedAsDepth) {
   EXPECT_NE(warnings_[0].find("DEPTH"), std::string::npos) << warnings_[0];
 }
 
-TEST_F(MediaTest, AJpegThatNeedsNothingDoneToItIsPassedThroughByteForByte) {
+// A CompressedImage is decoded and fed like an Image, whatever its format, even when nothing about
+// it has to change: there is no pass-through to a second stream format. A wider one is scaled, then
+// cropped to even.
+TEST_F(MediaTest, ACompressedJpegIsDecodedNotPassedThrough) {
   CameraConfig config;
   config.name = "front";
   config.topic = "/image/compressed";
   config.rate_hz = 100.0;
   config.max_width_px = 640;
-  CameraCapture capture(config);
+  auto capture = OnFakes(config);
 
   sensor_msgs::msg::CompressedImage compressed;
   compressed.header.frame_id = "camera_link";
@@ -875,46 +1230,35 @@ TEST_F(MediaTest, AJpegThatNeedsNothingDoneToItIsPassedThroughByteForByte) {
   compressed.format = "rgb8; jpeg compressed bgr8";
   const std::string original = MakeJpeg(320, 240);
   compressed.data.assign(original.begin(), original.end());
-
   const auto message = Serialize(compressed);
-  std::uint64_t bytes = 0;
-  std::uint16_t width = 0, height = 0;
+
+  ASSERT_TRUE(capture->Handle("sensor_msgs/msg/CompressedImage", message, environment_, *runner_));
+  ASSERT_EQ(fakes_.built(), 1u);
+  EXPECT_EQ(fakes_.last().settings.width, 320);
+  EXPECT_EQ(fakes_.last().settings.height, 240);
+  EXPECT_EQ(fakes_.last().fed_sizes, std::vector<std::size_t>{320u * 240u * 3u});
+
+  PreparedFrame frame;
   std::string why;
-  ASSERT_TRUE(capture.MeasureEncodedFrame("sensor_msgs/msg/CompressedImage", message, &bytes,
-                                          &width, &height, &why))
+  ASSERT_TRUE(capture->PrepareFrame("sensor_msgs/msg/CompressedImage", message, &frame, &why))
       << why;
-  EXPECT_EQ(bytes, original.size()) << "a pass-through must not re-encode";
-  EXPECT_EQ(width, 320);
-  EXPECT_EQ(height, 240);
+  ASSERT_EQ(frame.bgr24.size(), 320u * 240u * 3u);
+  // MakeJpeg's colour, b g r, through a lossy round trip.
+  EXPECT_NEAR(static_cast<unsigned char>(frame.bgr24[0]), 20, 6);
+  EXPECT_NEAR(static_cast<unsigned char>(frame.bgr24[1]), 120, 6);
+  EXPECT_NEAR(static_cast<unsigned char>(frame.bgr24[2]), 200, 6);
 
-  ASSERT_TRUE(capture.Handle("sensor_msgs/msg/CompressedImage", message, environment_, *runner_));
-  EXPECT_EQ(capture.stats().bytes, original.size());
-}
-
-TEST_F(MediaTest, AJpegWiderThanTheCapIsDecodedAndReEncoded) {
-  CameraConfig config;
-  config.name = "front";
-  config.topic = "/image/compressed";
-  config.rate_hz = 100.0;
   config.max_width_px = 100;
-  CameraCapture capture(config);
-
-  sensor_msgs::msg::CompressedImage compressed;
-  compressed.header.frame_id = "camera_link";
-  compressed.header.stamp.sec = 100;
-  compressed.format = "jpeg";
-  const std::string original = MakeJpeg(320, 240);
-  compressed.data.assign(original.begin(), original.end());
-
-  std::uint64_t bytes = 0;
-  std::uint16_t width = 0, height = 0;
-  std::string why;
-  ASSERT_TRUE(capture.MeasureEncodedFrame("sensor_msgs/msg/CompressedImage",
-                                          Serialize(compressed), &bytes, &width, &height, &why))
+  auto narrow = OnFakes(config);
+  ASSERT_TRUE(narrow->PrepareFrame("sensor_msgs/msg/CompressedImage", message, &frame, &why))
       << why;
-  EXPECT_EQ(width, 100);
-  EXPECT_EQ(height, 75);
-  EXPECT_NE(bytes, original.size());
+  EXPECT_EQ(frame.width, 100);
+  EXPECT_EQ(frame.height, 74) << "75 rows scaled, then cropped to even";
+
+  compressed.data.assign({'n', 'o', 't', ' ', 'a', 'n', ' ', 'i', 'm', 'a', 'g', 'e'});
+  EXPECT_FALSE(capture->PrepareFrame("sensor_msgs/msg/CompressedImage", Serialize(compressed),
+                                     &frame, &why));
+  EXPECT_NE(why.find("cannot decode"), std::string::npos) << why;
 }
 
 TEST_F(MediaTest, AFrameWithNoPoseIsDroppedAndCounted) {
@@ -923,7 +1267,7 @@ TEST_F(MediaTest, AFrameWithNoPoseIsDroppedAndCounted) {
   config.name = "front";
   config.topic = "/image";
   config.rate_hz = 100.0;
-  CameraCapture capture(config);
+  CameraCapture capture(config, "ffmpeg", fakes_.Factory());
 
   EXPECT_FALSE(capture.Handle("sensor_msgs/msg/Image", Serialize(MakeImage(32, 32, "rgb8")),
                               environment_, *runner_));
@@ -939,6 +1283,7 @@ class MediaHoldTest : public MediaTest {
     MediaTest::SetUp();
     environment_.pose_wait_s = 0.05;
     environment_.arrival_time = [this]() { return now_; };
+    fakes_.clock = [this]() { return now_; };
   }
 
   static LidarConfig Scanner() {
@@ -964,26 +1309,31 @@ class MediaHoldTest : public MediaTest {
   double now_ = 2000.0;
 };
 
-TEST_F(MediaHoldTest, AFrameAheadOfItsChainIsHeldAndRecordedWhenTheChainCatchesUp) {
+TEST_F(MediaHoldTest, AFrameAheadOfItsChainIsHeldAndFedWhenTheChainCatchesUp) {
   pose_until_ = 100.0;
   CameraConfig config;
   config.name = "front";
   config.topic = "/image";
   config.rate_hz = 1000.0;
-  CameraCapture capture(config);
+  auto capture = OnFakes(config);
 
   const auto image = Serialize(MakeImage(32, 32, "rgb8", "camera_link", 100.03));
-  EXPECT_FALSE(capture.Handle("sensor_msgs/msg/Image", image, environment_, *runner_));
-  EXPECT_EQ(capture.held(), 1u);
-  EXPECT_EQ(capture.stats().frames, 0u);
-  EXPECT_EQ(capture.stats().pose_failures, 0u) << "a frame still inside its wait is not a failure";
+  EXPECT_FALSE(capture->Handle("sensor_msgs/msg/Image", image, environment_, *runner_));
+  EXPECT_EQ(capture->held(), 1u);
+  EXPECT_EQ(fakes_.built(), 0u) << "nothing is fed before it has a pose";
+  EXPECT_EQ(capture->stats().frames, 0u);
+  EXPECT_EQ(capture->stats().pose_failures, 0u) << "a frame still inside its wait is not a failure";
 
   now_ += 0.02;
   pose_until_ = 100.05;
-  capture.ServiceHeld(environment_, *runner_);
-  EXPECT_EQ(capture.held(), 0u);
-  EXPECT_EQ(capture.stats().frames, 1u);
-  EXPECT_EQ(capture.stats().pose_failures, 0u);
+  capture->ServiceHeld(environment_, *runner_);
+  EXPECT_EQ(capture->held(), 0u);
+  ASSERT_EQ(fakes_.built(), 1u);
+  EXPECT_EQ(fakes_.last().fed_sizes.size(), 1u);
+  EXPECT_EQ(capture->stats().frames, 1u);
+  ASSERT_EQ(runner_->calls().size(), 1u);
+  EXPECT_EQ(runner_->calls()[0].time_ms, 1788383013500u);
+  EXPECT_EQ(capture->stats().pose_failures, 0u);
 }
 
 TEST_F(MediaHoldTest, AHeldScanWhosePoseNeverArrivesIsDroppedAtItsDeadline) {
@@ -1082,13 +1432,917 @@ TEST_F(MediaTest, AnEmptyFrameIdWithNoConfiguredFrameIsRefusedWithAnExplanation)
   config.name = "front";
   config.topic = "/image";
   config.rate_hz = 100.0;
-  CameraCapture capture(config);
+  CameraCapture capture(config, "ffmpeg", fakes_.Factory());
 
   EXPECT_FALSE(capture.Handle("sensor_msgs/msg/Image", Serialize(MakeImage(32, 32, "rgb8", "")),
                               environment_, *runner_));
   EXPECT_EQ(capture.stats().pose_failures, 1u);
   ASSERT_EQ(warnings_.size(), 1u);
   EXPECT_NE(warnings_[0].find("camera.front.frame"), std::string::npos) << warnings_[0];
+}
+
+// ---------------------------------------------------------------------------
+// The encoder: what reaches the session, restarts, stops and the tail
+// ---------------------------------------------------------------------------
+
+namespace {
+
+c3d::EncoderFailure Failure(const std::string& why, int exit_code, bool killed,
+                            std::uint64_t abandoned) {
+  c3d::EncoderFailure failure;
+  failure.why = why;
+  failure.exit_code = exit_code;
+  failure.killed = killed;
+  failure.abandoned = abandoned;
+  return failure;
+}
+
+}  // namespace
+
+// Each unit reaches the session with its own frame's pose (in ROS axes: the runner converts), wire
+// time and seq, and a context carrying the frame's size, frame id, field of view and the rate.
+TEST_F(MediaTest, AccessUnitsReachTheSessionWithTheFramesPoseAndTime) {
+  CameraConfig config = Front();
+  config.hfov_degrees = 61.0;
+  config.vfov_degrees = 45.5;
+  auto capture = OnFakes(config);
+  for (int k = 0; k < 3; ++k) ASSERT_TRUE(FrameAt(*capture, 0.1 * k));
+
+  const auto calls = runner_->calls();
+  ASSERT_EQ(calls.size(), 3u);
+  for (std::uint32_t k = 0; k < 3; ++k) {
+    SCOPED_TRACE("frame " + std::to_string(k));
+    EXPECT_EQ(calls[k].camera_id, "front");
+    EXPECT_EQ(calls[k].seq, k);
+    EXPECT_EQ(calls[k].time_ms, 1788383013500u);
+    EXPECT_EQ(calls[k].frame_id, "camera_link");
+    EXPECT_EQ(calls[k].position.x, 1.0);
+    EXPECT_EQ(calls[k].position.y, 2.0);
+    EXPECT_EQ(calls[k].position.z, 3.0);
+    EXPECT_EQ(calls[k].rotation.w, 1.0);
+    EXPECT_EQ(calls[k].context.frame_id, "camera_link");
+    EXPECT_EQ(calls[k].context.width, 32);
+    EXPECT_EQ(calls[k].context.height, 24);
+    EXPECT_EQ(calls[k].context.hfov_deg, 61.0f);
+    EXPECT_EQ(calls[k].context.vfov_deg, 45.5f);
+    EXPECT_EQ(calls[k].context.nominal_fps, 1000.0f);
+    // From the unit, not from wherever the capture's encoder pointer is now.
+    EXPECT_EQ(calls[k].context.codec_params, std::string("\x01" "fake"));
+    EXPECT_EQ(calls[k].context.encoder_settings, "fake ultrafast crf=28");
+    EXPECT_EQ(calls[k].bytes, "unit-" + std::to_string(k));
+    EXPECT_EQ(calls[k].keyframe, k == 0);
+  }
+  EXPECT_EQ(capture->stats().frames, 3u);
+  EXPECT_EQ(capture->stats().bytes, 3u * 6u);
+  EXPECT_EQ(runner_->session()->stats().camera_frames, 3u);
+  // The encoder was built from the camera's own settings.
+  const c3d::H264EncoderSettings& settings = fakes_.last().settings;
+  EXPECT_EQ(settings.ffmpeg_path, "ffmpeg");
+  EXPECT_EQ(settings.preset, "ultrafast");
+  EXPECT_EQ(settings.crf, 28);
+  EXPECT_EQ(settings.max_bitrate_kbps, 0);
+  EXPECT_EQ(settings.fps, 1000.0);
+}
+
+// A stream cannot change size or frame mid-chunk, so either starts a fresh encoder, whose first unit
+// is a keyframe. Neither is a failure nor a gap.
+TEST_F(MediaTest, AResolutionOrFrameChangeRestartsTheEncoder) {
+  auto capture = OnFakes(Front());
+  ASSERT_TRUE(FrameAt(*capture, 0.0));
+  ASSERT_TRUE(FrameAt(*capture, 0.1));
+  ASSERT_TRUE(FrameAt(*capture, 0.2, 64, 48));
+  ASSERT_EQ(fakes_.built(), 2u);
+  EXPECT_EQ(fakes_.record(0).finish_timeouts, std::vector<double>{c3d::kH264FinishTimeoutSeconds});
+  EXPECT_EQ(fakes_.record(1).settings.width, 64);
+  ASSERT_TRUE(FrameAt(*capture, 0.3, 64, 48, "other_link"));
+  ASSERT_EQ(fakes_.built(), 3u);
+  ASSERT_TRUE(FrameAt(*capture, 0.4, 64, 48, "other_link"));
+  EXPECT_EQ(fakes_.built(), 3u);
+
+  const auto calls = runner_->calls();
+  ASSERT_EQ(calls.size(), 5u);
+  std::vector<bool> keyframes;
+  for (const auto& call : calls) keyframes.push_back(call.keyframe);
+  EXPECT_EQ(keyframes, (std::vector<bool>{true, false, true, true, false}));
+  EXPECT_EQ(calls[4].context.frame_id, "other_link");
+  EXPECT_EQ(capture->stats().encoder_restarts, 0u);
+  EXPECT_EQ(capture->stats().gap_restarts, 0u);
+}
+
+// The chunk length is chosen at the encoder's start, from the frame it starts on: the longest the
+// estimate fits, said once when it is under 3 s. The quiet-gap row waits that length, not 3 s.
+TEST_F(MediaTest, TheEncoderStartsWithTheChunkLengthItsFrameSizeFits) {
+  CameraConfig config = Front();
+  config.rate_hz = 30.0;
+  config.crf = 24;
+  config.max_width_px = 0;
+  auto capture = OnFakes(config);
+  ASSERT_TRUE(FrameAt(*capture, 0.0, 2560, 1440));
+  ASSERT_EQ(fakes_.built(), 1u);
+  EXPECT_DOUBLE_EQ(fakes_.record(0).settings.chunk_s, 1.7);
+  ASSERT_EQ(warnings_.size(), 1u);
+  EXPECT_NE(warnings_[0].find("its chunks are 1.7 seconds"), std::string::npos) << warnings_[0];
+  ASSERT_TRUE(FrameAt(*capture, 1.6, 2560, 1440));
+  EXPECT_EQ(fakes_.built(), 1u);
+  ASSERT_TRUE(FrameAt(*capture, 3.4, 2560, 1440));
+  EXPECT_EQ(fakes_.built(), 2u) << "a quiet gap of a chunk's length restarted nothing";
+  EXPECT_EQ(capture->stats().gap_restarts, 1u);
+  EXPECT_EQ(warnings_.size(), 1u);
+
+  ASSERT_TRUE(FrameAt(*capture, 3.5, 640, 480));
+  EXPECT_DOUBLE_EQ(fakes_.last().settings.chunk_s, 3.0);
+}
+
+// An encoder for frames whose replay overflows replay_max_mb starts with a bitrate cap sized to its
+// chunk; an operator's max_bitrate_kbps always wins, and a frame that fits gets none.
+TEST_F(MediaTest, AFrameSizeTheReplayStoreCannotHoldStartsWithABitrateCap) {
+  CameraConfig config = Front();
+  config.rate_hz = 30.0;
+  config.replay_max_mb = 1;
+  auto capped = OnFakes(config);
+  ASSERT_TRUE(FrameAt(*capped, 0.0, 640, 480));
+  EXPECT_EQ(fakes_.last().settings.max_bitrate_kbps, DefaultCameraBitrateKbps(3.0));
+  EXPECT_EQ(fakes_.last().settings.bufsize_kbps, DefaultCameraBitrateKbps(3.0))
+      << "the default cap's buffer is not one second of it";
+  capped->StopEncoder();
+
+  config.max_bitrate_kbps = 800;
+  auto explicit_cap = OnFakes(config);
+  ASSERT_TRUE(FrameAt(*explicit_cap, 1.0, 640, 480));
+  EXPECT_EQ(fakes_.last().settings.max_bitrate_kbps, 800);
+  EXPECT_EQ(fakes_.last().settings.bufsize_kbps, 0) << "an operator's cap keeps twice its buffer";
+  explicit_cap->StopEncoder();
+
+  auto uncapped = OnFakes(Front());
+  ASSERT_TRUE(FrameAt(*uncapped, 2.0, 640, 480));
+  EXPECT_EQ(fakes_.last().settings.max_bitrate_kbps, 0);
+}
+
+// A camera whose chunks keep reaching the byte cap escalates every 3 size restarts in a session:
+// the next encoder's chunk is half the last, down to 1 s, and after that its bitrate is capped. It
+// is said once, and a new session starts from the full length again.
+TEST_F(MediaTest, RepeatedSizeRestartsHalveTheChunkThenCapTheBitrate) {
+  fakes_.next.unit_bytes = [](int) { return std::size_t{3} << 20; };
+  auto capture = OnFakes(Front());
+  std::vector<double> chunks;
+  std::vector<int> bitrates;
+  double t = 0.0;
+  while (fakes_.built() < 11) {
+    ASSERT_TRUE(FrameAt(*capture, t));
+    t += 0.01;
+    ASSERT_LT(t, 10.0) << "the restarts stopped coming";
+  }
+  for (std::size_t i = 0; i < fakes_.built(); ++i) {
+    chunks.push_back(fakes_.record(i).settings.chunk_s);
+    bitrates.push_back(fakes_.record(i).settings.max_bitrate_kbps);
+  }
+  EXPECT_EQ(chunks, (std::vector<double>{3, 3, 3, 1.5, 1.5, 1.5, 1, 1, 1, 1, 1}));
+  EXPECT_EQ(bitrates, (std::vector<int>{0, 0, 0, 0, 0, 0, 0, 0, 0, 50331, 50331}));
+  EXPECT_EQ(fakes_.last().settings.bufsize_kbps, 50331);
+  EXPECT_EQ(capture->stats().size_restarts, 10u);
+  std::size_t said = 0;
+  for (const std::string& warning : warnings_) {
+    if (warning.find("3 times this session") != std::string::npos) {
+      ++said;
+      EXPECT_NE(warning.find("its chunks are now 1.5 seconds"), std::string::npos) << warning;
+    }
+  }
+  EXPECT_EQ(said, 1u);
+
+  capture->Reset();
+  ASSERT_TRUE(FrameAt(*capture, t));
+  EXPECT_EQ(fakes_.last().settings.chunk_s, 3.0) << "the escalation outlived Reset";
+  EXPECT_EQ(fakes_.last().settings.max_bitrate_kbps, 0);
+}
+
+// A frame size at which not even a 1-second chunk fits refuses the camera at its first frame: no
+// encoder starts, no backoff runs, every frame is counted as refused, and it is said once.
+TEST_F(MediaTest, ACameraWhoseFrameFitsNoChunkIsRefusedAtItsFirstFrame) {
+  CameraConfig config = Front();
+  config.rate_hz = 30.0;
+  config.crf = 24;
+  config.max_width_px = 0;
+  auto capture = OnFakes(config);
+  EXPECT_FALSE(FrameAt(*capture, 0.0, 3840, 2160));
+  EXPECT_FALSE(FrameAt(*capture, 0.1, 3840, 2160));
+  EXPECT_EQ(fakes_.built(), 0u);
+  EXPECT_EQ(capture->stats().refused, 2u);
+  EXPECT_EQ(capture->stats().dropped_backlog, 0u);
+  ASSERT_EQ(warnings_.size(), 1u);
+  EXPECT_NE(warnings_[0].find("camera 'front' is refused"), std::string::npos) << warnings_[0];
+  EXPECT_NE(warnings_[0].find("max_width_px"), std::string::npos) << warnings_[0];
+  ASSERT_TRUE(FrameAt(*capture, 0.2, 1920, 1080)) << "a smaller frame is still refused";
+  EXPECT_EQ(fakes_.built(), 1u);
+}
+
+// The quiet-gap row and the backoff run on the steady clock, as the encoder's chunks do. Under
+// sim_time_on_wire the arrival clock is simulated time: a paused simulation stops it while the
+// encoder's clock runs on, and a fast-forwarded one races it while real time does not.
+TEST_F(MediaTest, TheGapRowAndTheBackoffRunOnTheSteadyClockNotTheArrivalClock) {
+  auto capture = OnFakes(Front());
+  environment_.steady_time = [this]() { return steady_; };
+  environment_.wall_time = [this]() { return wall_; };
+  const auto arrive = [&](double arrival, double real_seconds) {
+    environment_.arrival_time = [this]() { return clock_; };
+    clock_ = kClockStart + arrival;
+    steady_ += real_seconds;
+    wall_ += real_seconds;
+    return capture->Handle("sensor_msgs/msg/Image",
+                           Serialize(MakeImage(32, 24, "rgb8", "camera_link", 100.0 + arrival)),
+                           environment_, *runner_);
+  };
+  ASSERT_TRUE(arrive(0.0, 0.0));
+  ASSERT_TRUE(arrive(0.1, 60.0)) << "a minute of real time went by while the simulation paused";
+  ASSERT_EQ(fakes_.built(), 2u) << "the pause was not seen as a quiet gap";
+  EXPECT_EQ(capture->stats().gap_restarts, 1u);
+  ASSERT_TRUE(arrive(30.0, 0.1)) << "half a minute of simulated time in a tenth of a second";
+  EXPECT_EQ(fakes_.built(), 2u) << "simulated time was taken for a quiet gap";
+
+  fakes_.live(1).Die(Failure("ffmpeg exited", 1, false, 0));
+  EXPECT_FALSE(arrive(40.0, 0.1)) << "simulated time ended the backoff";
+  EXPECT_EQ(fakes_.built(), 2u);
+  ASSERT_TRUE(arrive(40.1, 5.0));
+  EXPECT_EQ(fakes_.built(), 3u);
+  EXPECT_EQ(capture->stats().encoder_restarts, 1u);
+}
+
+// A unit that would take its chunk past c3d::kMaxVideoChunkBytes is refused by the session. The next
+// frame kills that encoder at once -- no backoff, nothing counted as dropped or failed -- and a
+// replacement re-encodes the refused frame under its own token, so it keeps its seq, time and pose,
+// as the keyframe that opens the next chunk; the frame that triggered the restart follows it.
+TEST_F(MediaTest, AChunkAtItsByteCapRestartsTheEncoderAndReEncodesTheRefusedFrame) {
+  fakes_.next.unit_bytes = [](int) { return std::size_t{3} << 20; };
+  auto capture = OnFakes(Front());
+  ASSERT_TRUE(FrameAt(*capture, 0.0));
+  ASSERT_TRUE(FrameAt(*capture, 0.1));
+  ASSERT_TRUE(FrameAt(*capture, 0.2)) << "the frame whose unit is refused was fed";
+  EXPECT_EQ(fakes_.built(), 1u) << "restarted on the reader's delivery, not on the next frame";
+  ASSERT_TRUE(FrameAt(*capture, 0.3));
+  ASSERT_EQ(fakes_.built(), 2u);
+  EXPECT_EQ(fakes_.record(0).finish_timeouts, std::vector<double>{0.0});
+  EXPECT_EQ(fakes_.record(1).refed_tokens, std::vector<std::uint64_t>{2});
+  EXPECT_EQ(fakes_.record(1).fed_tokens, std::vector<std::uint64_t>{3});
+
+  const auto calls = runner_->calls();
+  ASSERT_EQ(calls.size(), 5u);
+  std::vector<std::uint32_t> seqs;
+  std::vector<bool> keyframes;
+  std::vector<c3d::VideoUnitFate> fates;
+  for (const auto& call : calls) {
+    seqs.push_back(call.seq);
+    keyframes.push_back(call.keyframe);
+    fates.push_back(call.fate);
+  }
+  EXPECT_EQ(seqs, (std::vector<std::uint32_t>{0, 1, 2, 2, 3}));
+  EXPECT_EQ(keyframes, (std::vector<bool>{true, false, false, true, false}));
+  EXPECT_EQ(fates[2], c3d::VideoUnitFate::kRefused);
+  EXPECT_EQ(fates[3], c3d::VideoUnitFate::kAppended);
+  EXPECT_EQ(calls[3].time_ms, calls[2].time_ms);
+  EXPECT_EQ(calls[3].position.x, calls[2].position.x);
+
+  const CameraStats stats = capture->stats();
+  EXPECT_EQ(stats.size_restarts, 1u);
+  EXPECT_EQ(stats.encoder_restarts + stats.gap_restarts, 0u);
+  EXPECT_EQ(stats.dropped_backlog + stats.dropped_at_stop + stats.dropped_replay, 0u);
+  EXPECT_EQ(stats.frames, 4u) << "a refused unit was counted as recorded";
+  ASSERT_EQ(warnings_.size(), 1u);
+  EXPECT_NE(warnings_[0].find("c3d.camera.front.size_restarts"), std::string::npos)
+      << warnings_[0];
+
+  ASSERT_TRUE(FrameAt(*capture, 0.4));
+  EXPECT_EQ(fakes_.built(), 2u);
+  EXPECT_EQ(warnings_.size(), 1u);
+}
+
+// The encoder hands a unit back only once the next has begun, so units after the refused one can
+// arrive before the restart, a keyframe among them: they are held, not recorded, and re-encoded
+// after it in order, with the frames the kill abandoned, so the chunks keep the frames' order.
+TEST_F(MediaTest, UnitsAfterTheRefusedOneAreHeldAndReEncodedInOrder) {
+  for (const bool delivered_at_kill : {true, false}) {
+    SCOPED_TRACE(delivered_at_kill ? "the last unit delivered at the kill" : "abandoned at it");
+    const std::size_t first = fakes_.built();
+    const std::size_t first_call = runner_->calls().size();
+    fakes_.next.unit_bytes = [](int) { return std::size_t{3} << 20; };
+    fakes_.next.lag_units = 1;
+    fakes_.next.deliver_held_at_kill = delivered_at_kill;
+    auto capture = OnFakes(Front());
+    // The fourth frame comes 3 s after the first, so the encoder makes it a keyframe.
+    for (const double t : {0.0, 0.1, 0.2, 3.1, 3.2}) ASSERT_TRUE(FrameAt(*capture, t)) << t;
+    ASSERT_EQ(fakes_.built(), first + 2);
+    EXPECT_EQ(fakes_.record(first + 1).refed_tokens, (std::vector<std::uint64_t>{2, 3}));
+    EXPECT_EQ(fakes_.record(first + 1).fed_tokens, std::vector<std::uint64_t>{4});
+    std::vector<std::uint32_t> recorded;
+    const auto calls = runner_->calls();
+    for (std::size_t k = first_call; k < calls.size(); ++k) {
+      if (calls[k].fate == c3d::VideoUnitFate::kAppended) recorded.push_back(calls[k].seq);
+    }
+    EXPECT_EQ(recorded, (std::vector<std::uint32_t>{0, 1, 2, 3}));
+    const CameraStats stats = capture->stats();
+    EXPECT_EQ(stats.size_restarts, 1u);
+    EXPECT_EQ(stats.dropped_at_stop + stats.dropped_replay, 0u);
+    capture->StopEncoder();
+    capture->Reset();
+  }
+}
+
+// A frame the replay store had no room for cannot be re-encoded: it is dropped and counted, and the
+// replacement starts from the next frame.
+TEST_F(MediaTest, AFrameTheReplayStoreCouldNotKeepIsDroppedAndCounted) {
+  fakes_.next.unit_bytes = [](int) { return std::size_t{3} << 20; };
+  CameraConfig config = Front();
+  config.rate_hz = 30.0;
+  config.max_width_px = 0;
+  config.replay_max_mb = 1;
+  auto capture = OnFakes(config);
+  // 1024 x 768 is 1.125 MiB as yuv420p, more than the whole store.
+  for (int i = 0; i < 4; ++i) ASSERT_TRUE(FrameAt(*capture, 0.1 * i, 1024, 768)) << "frame " << i;
+  ASSERT_EQ(fakes_.built(), 2u);
+  EXPECT_TRUE(fakes_.record(1).refed_tokens.empty());
+  const CameraStats stats = capture->stats();
+  EXPECT_EQ(stats.dropped_replay, 1u);
+  EXPECT_EQ(stats.size_restarts, 1u);
+  const auto calls = runner_->calls();
+  ASSERT_EQ(calls.size(), 4u);
+  EXPECT_EQ(calls[3].seq, 3u);
+  EXPECT_TRUE(calls[3].keyframe);
+}
+
+// A stop that ends the session before the restart loses the held units: counted in dropped_at_stop,
+// with no restart.
+TEST_F(MediaTest, AStopBeforeTheSizeRestartCountsTheHeldUnitsAsDroppedAtStop) {
+  fakes_.next.unit_bytes = [](int) { return std::size_t{3} << 20; };
+  auto capture = OnFakes(Front());
+  for (int i = 0; i < 3; ++i) ASSERT_TRUE(FrameAt(*capture, 0.1 * i));
+  capture->StopEncoder();
+  EXPECT_EQ(capture->stats().dropped_at_stop, 1u);
+  EXPECT_EQ(capture->stats().size_restarts, 0u);
+  ASSERT_TRUE(FrameAt(*capture, 0.3));
+  EXPECT_EQ(fakes_.built(), 2u);
+  EXPECT_TRUE(fakes_.record(1).refed_tokens.empty()) << "a stop kept the refused frame";
+}
+
+// An ffmpeg that returns more units than it was fed frames leaves every later unit paired with
+// the wrong frame's time and pose: the extra unit is dropped, never recorded, and said once.
+TEST_F(MediaTest, AUnitWithNoFrameToPairIsDroppedAndSaidOnce) {
+  fakes_.next.unpaired_after_call = 1;
+  auto capture = OnFakes(Front());
+  for (const double t : {0.0, 0.1, 0.2}) ASSERT_TRUE(FrameAt(*capture, t));
+  const auto calls = runner_->calls();
+  ASSERT_EQ(calls.size(), 3u);
+  for (const auto& call : calls) EXPECT_NE(call.bytes, "unpaired");
+  ASSERT_EQ(warnings_.size(), 1u);
+  EXPECT_NE(warnings_[0].find("more access units than it was fed frames"), std::string::npos)
+      << warnings_[0];
+  EXPECT_EQ(capture->stats().frames, 3u);
+}
+
+// `frames` and `bytes` count the units a chunk took: one the session dropped, after a chunk was
+// cut short, is not in them.
+TEST_F(MediaTest, AUnitTheSessionDroppedIsNotCountedAsAFrame) {
+  auto capture = OnFakes(Front());
+  ASSERT_TRUE(FrameAt(*capture, 0.0));
+  ASSERT_TRUE(FrameAt(*capture, 0.1));
+  runner_->session()->Flush();
+  ASSERT_TRUE(FrameAt(*capture, 0.2));
+  EXPECT_EQ(runner_->session()->stats().camera_access_units_dropped, 1u);
+  EXPECT_EQ(capture->stats().frames, 2u);
+  EXPECT_EQ(capture->stats().bytes, 2u * 6u);
+  EXPECT_EQ(runner_->session()->stats().camera_frames, 2u);
+}
+
+// The encoder stamps frames by the wall clock, so a step in it -- NTP correcting a clock that booted
+// stale -- would make every frame a chunk of its own, or let one chunk grow for the length of the
+// step. A step of more than a second restarts the encoder, which stamps from its own start, drained
+// with the full timeout, said, and counted as neither a failure nor a gap.
+TEST_F(MediaTest, AWallClockStepRestartsTheEncoderOnce) {
+  for (const double step : {3600.0, -10.0}) {
+    SCOPED_TRACE("a step of " + std::to_string(step) + " s");
+    warnings_.clear();
+    const std::size_t first = fakes_.built();
+    auto capture = OnFakes(Front());
+    ASSERT_TRUE(FrameAt(*capture, 0.0));
+    ASSERT_TRUE(FrameAt(*capture, 0.1));
+    wall_ += step;
+    ASSERT_TRUE(FrameAt(*capture, 0.2));
+    ASSERT_EQ(fakes_.built(), first + 2) << "the step did not restart the encoder";
+    EXPECT_EQ(fakes_.record(first).finish_timeouts,
+              std::vector<double>{c3d::kH264FinishTimeoutSeconds});
+    EXPECT_TRUE(runner_->calls().back().keyframe);
+    ASSERT_TRUE(FrameAt(*capture, 0.3));
+    EXPECT_EQ(fakes_.built(), first + 2) << "the replacement restarted for the step it began after";
+    EXPECT_EQ(capture->stats().encoder_restarts, 0u);
+    EXPECT_EQ(capture->stats().gap_restarts, 0u);
+    EXPECT_EQ(capture->stats().dropped_backlog, 0u);
+    ASSERT_EQ(warnings_.size(), 1u);
+    EXPECT_NE(warnings_[0].find("camera 'front'"), std::string::npos) << warnings_[0];
+    const std::string size = step > 0.0 ? "forward by 3600 seconds" : "back by 10 seconds";
+    EXPECT_NE(warnings_[0].find(size), std::string::npos) << warnings_[0];
+  }
+}
+
+// Said once a session, as every warning is: a second step restarts the encoder unsaid, and the next
+// session is told again.
+TEST_F(MediaTest, AWallClockStepIsSaidOnceASession) {
+  auto capture = OnFakes(Front());
+  ASSERT_TRUE(FrameAt(*capture, 0.0));
+  wall_ += 3600.0;
+  ASSERT_TRUE(FrameAt(*capture, 0.1));
+  wall_ -= 10.0;
+  ASSERT_TRUE(FrameAt(*capture, 0.2));
+  EXPECT_EQ(fakes_.built(), 3u);
+  EXPECT_EQ(warnings_.size(), 1u) << "said twice in one session";
+  capture->Reset();
+  ASSERT_TRUE(FrameAt(*capture, 0.3));
+  wall_ += 3600.0;
+  ASSERT_TRUE(FrameAt(*capture, 0.4));
+  EXPECT_EQ(fakes_.built(), 5u);
+  EXPECT_EQ(warnings_.size(), 2u) << "the next session was not told";
+}
+
+// What NTP's slewing does stays far under a second, and time that passes on both clocks is no step:
+// neither is restarted for. Exactly a second is not past the bound. A suspend that passes on both
+// clocks is a quiet gap on the steady clock, and is restarted for as one.
+TEST_F(MediaTest, WallClockDriftOfUpToASecondRestartsNothing) {
+  auto capture = OnFakes(Front());
+  // Eighths of a second, which the epoch-sized wall clock holds exactly, so the drift is exact.
+  ASSERT_TRUE(FrameAt(*capture, 0.0));
+  wall_ += 0.5;
+  ASSERT_TRUE(FrameAt(*capture, 0.125));
+  wall_ -= 1.0;
+  ASSERT_TRUE(FrameAt(*capture, 0.25));
+  wall_ += 1.5;
+  ASSERT_TRUE(FrameAt(*capture, 0.375));
+  EXPECT_EQ(fakes_.built(), 1u) << "a drift of exactly a second restarted the encoder";
+  wall_ += 100.0;
+  steady_ += 100.0;
+  ASSERT_TRUE(FrameAt(*capture, 0.5));
+  EXPECT_EQ(capture->stats().gap_restarts, 1u);
+  EXPECT_TRUE(warnings_.empty()) << "time that passed on both clocks was taken for a step: "
+                                 << warnings_.front();
+}
+
+// Nothing fed for a chunk's length on a healthy encoder: the next frame drains it and starts a new
+// one, counted as a gap. Under that, the same encoder carries on.
+TEST_F(MediaTest, AGapOfThreeSecondsRestartsTheEncoder) {
+  auto capture = OnFakes(Front());
+  for (const double t : {0.0, 1.0, 2.0, 4.9}) ASSERT_TRUE(FrameAt(*capture, t));
+  EXPECT_EQ(fakes_.built(), 1u) << "a 2.9 s gap restarted the encoder";
+  ASSERT_TRUE(FrameAt(*capture, 8.4));
+  ASSERT_EQ(fakes_.built(), 2u);
+  EXPECT_EQ(fakes_.record(0).finish_timeouts, std::vector<double>{c3d::kH264FinishTimeoutSeconds});
+  EXPECT_TRUE(runner_->calls().back().keyframe);
+  EXPECT_EQ(capture->stats().gap_restarts, 1u);
+  EXPECT_EQ(capture->stats().encoder_restarts, 0u);
+  EXPECT_EQ(capture->stats().dropped_backlog, 0u);
+}
+
+// An encoder that takes nothing for a chunk's length while frames keep coming is wedged: killed at
+// once, no encoder for 5 s, every frame until the restart counted in dropped_backlog. One that
+// takes a frame in four is slow, not wedged, and is never stopped.
+TEST_F(MediaTest, AnEncoderThatRefusesEveryFrameForThreeSecondsIsKilledAndBackedOff) {
+  fakes_.next.accept = [](int) { return false; };
+  auto capture = OnFakes(Front());
+  int stop_frame = -1;
+  int restart_frame = -1;
+  for (int k = 0; k < 9 * 30 && restart_frame < 0; ++k) {
+    FrameAt(*capture, k / 30.0);
+    if (stop_frame < 0 && !fakes_.record(0).finish_timeouts.empty()) {
+      stop_frame = k;
+      EXPECT_FALSE(capture->has_encoder());
+      fakes_.next = FakeBehaviour{};  // the replacement is healthy
+    }
+    if (fakes_.built() > 1) restart_frame = k;
+  }
+  ASSERT_GE(stop_frame, 0) << "never stopped";
+  EXPECT_EQ(stop_frame, 90) << "stopped at " << stop_frame / 30.0 << " s, not at 3 s";
+  EXPECT_EQ(fakes_.record(0).finish_timeouts, std::vector<double>{0.0});
+  ASSERT_GE(restart_frame, 0) << "never restarted";
+  EXPECT_EQ(restart_frame, stop_frame + 150) << "restarted " << (restart_frame - stop_frame) / 30.0
+                                             << " s after the kill, not 5";
+  EXPECT_EQ(capture->stats().dropped_backlog, static_cast<std::uint64_t>(restart_frame));
+  EXPECT_EQ(capture->stats().encoder_restarts, 1u);
+  EXPECT_EQ(capture->stats().gap_restarts, 0u);
+  ASSERT_EQ(runner_->calls().size(), 1u);
+  EXPECT_TRUE(runner_->calls()[0].keyframe);
+  // Finish(0) on a running child kills it, and the kill is said, once, as the wedge it was.
+  ASSERT_EQ(warnings_.size(), 1u);
+  EXPECT_NE(warnings_[0].find("was wedged"), std::string::npos) << warnings_[0];
+  EXPECT_NE(warnings_[0].find("was killed"), std::string::npos) << warnings_[0];
+  EXPECT_EQ(warnings_[0].find("did not finish in time"), std::string::npos) << warnings_[0];
+
+  fakes_.next.accept = [](int call) { return call % 4 == 0; };
+  auto slow = OnFakes(Front());
+  const std::size_t before = fakes_.built();
+  for (int k = 0; k < 9 * 30; ++k) FrameAt(*slow, 20.0 + k / 30.0);
+  EXPECT_EQ(fakes_.built(), before + 1);
+  EXPECT_TRUE(fakes_.last().finish_timeouts.empty()) << "a slow encoder was stopped";
+  EXPECT_EQ(slow->stats().encoder_restarts + slow->stats().gap_restarts, 0u);
+}
+
+// A quiet-gap stop is a full drain, and one that had to kill is a failure: backed off, the frame
+// under that backoff dropped, the next start counted as an encoder restart -- and while the
+// replacement has delivered nothing, the next quiet-gap stop pays the reap time alone, not the full
+// timeout again.
+TEST_F(MediaTest, AQuietGapStopThatHadToKillBacksOffAndCountsAsAFailure) {
+  fakes_.next.finish_failure = Failure("killed at the deadline", -1, true, 1);
+  auto capture = OnFakes(Front());
+  ASSERT_TRUE(FrameAt(*capture, 0.0));
+  EXPECT_FALSE(FrameAt(*capture, 5.0));
+  EXPECT_EQ(fakes_.record(0).finish_timeouts, std::vector<double>{c3d::kH264FinishTimeoutSeconds});
+  EXPECT_FALSE(capture->has_encoder());
+  EXPECT_EQ(fakes_.built(), 1u) << "started under the backoff its own stop raised";
+  EXPECT_EQ(capture->stats().dropped_backlog, 1u);
+  EXPECT_EQ(capture->stats().dropped_at_stop, 1u);
+  ASSERT_EQ(warnings_.size(), 1u);
+  EXPECT_NE(warnings_[0].find("did not finish in time and was killed"), std::string::npos)
+      << warnings_[0];
+  EXPECT_EQ(warnings_[0].find("wedged"), std::string::npos) << warnings_[0];
+  EXPECT_NE(warnings_[0].find("no encoder starts for 5 seconds"), std::string::npos)
+      << warnings_[0];
+
+  fakes_.next.hold_units = true;
+  ASSERT_TRUE(FrameAt(*capture, 10.0));
+  ASSERT_EQ(fakes_.built(), 2u);
+  EXPECT_EQ(capture->stats().encoder_restarts, 1u);
+  EXPECT_EQ(capture->stats().gap_restarts, 0u);
+
+  EXPECT_FALSE(FrameAt(*capture, 15.0));
+  EXPECT_EQ(fakes_.record(1).finish_timeouts, std::vector<double>{c3d::kH264ReapSeconds});
+}
+
+// Only the LAST stop's kill shortens a quiet-gap stop: after a kill the next quiet-gap stop pays
+// the reap time alone, and once a stop has drained cleanly the one after it gets the full timeout
+// again.
+TEST_F(MediaTest, OnlyTheLastStopsKillShortensTheNextQuietGapStop) {
+  fakes_.next.finish_failure = Failure("killed at the deadline", -1, true, 1);
+  auto capture = OnFakes(Front());
+  ASSERT_TRUE(FrameAt(*capture, 0.0));
+  // Every later instance drains cleanly and delivers nothing before its stop -- the first refuses
+  // its frame, the second holds it -- so the stops alone decide the timeouts.
+  fakes_.next.finish_failure.reset();
+  fakes_.next.accept = [](int) { return false; };
+  EXPECT_FALSE(FrameAt(*capture, 5.0)) << "the quiet-gap stop killed, so a backoff follows";
+  EXPECT_EQ(fakes_.record(0).finish_timeouts, std::vector<double>{c3d::kH264FinishTimeoutSeconds});
+  EXPECT_FALSE(FrameAt(*capture, 10.0));
+  ASSERT_EQ(fakes_.built(), 2u);
+  fakes_.next.accept = nullptr;
+  fakes_.next.hold_units = true;
+  ASSERT_TRUE(FrameAt(*capture, 15.0));
+  EXPECT_EQ(fakes_.record(1).finish_timeouts, std::vector<double>{c3d::kH264ReapSeconds});
+  ASSERT_TRUE(FrameAt(*capture, 20.0));
+  EXPECT_EQ(fakes_.record(2).finish_timeouts, std::vector<double>{c3d::kH264FinishTimeoutSeconds})
+      << "a kill two stops ago still shortened the stop";
+  EXPECT_EQ(capture->stats().encoder_restarts, 1u);
+  EXPECT_EQ(capture->stats().gap_restarts, 2u);
+}
+
+// A kill or a crash just before a session's end never darkens the next session's first seconds:
+// Reset forgets the backoff, the reason the next start would count by, and the kill that would
+// shorten the next quiet-gap stop. The replacement delivers nothing, so only Reset can have
+// forgotten the kill.
+TEST_F(MediaTest, AResetForgetsAKillOrACrashSoTheNextSessionStartsClean) {
+  fakes_.next.finish_failure = Failure("killed at the deadline", -1, true, 1);
+  auto capture = OnFakes(Front());
+  ASSERT_TRUE(FrameAt(*capture, 0.0));
+  capture->StopEncoder();
+  ASSERT_FALSE(capture->has_encoder());
+  capture->Reset();
+  fakes_.next.finish_failure.reset();
+  fakes_.next.hold_units = true;
+  EXPECT_TRUE(FrameAt(*capture, 0.1)) << "the kill's backoff outlived Reset";
+  EXPECT_EQ(fakes_.built(), 2u);
+  EXPECT_EQ(capture->stats().dropped_backlog, 0u);
+  EXPECT_EQ(capture->stats().encoder_restarts, 0u) << "the kill's start reason outlived Reset";
+  ASSERT_TRUE(FrameAt(*capture, 3.6));
+  EXPECT_EQ(fakes_.record(1).finish_timeouts, std::vector<double>{c3d::kH264FinishTimeoutSeconds})
+      << "the kill outlived Reset and shortened a quiet-gap stop";
+  EXPECT_EQ(capture->stats().gap_restarts, 1u);
+
+  fakes_.live(fakes_.built() - 1).Die(Failure("ffmpeg died", -1, false, 0));
+  capture->Reset();
+  EXPECT_TRUE(FrameAt(*capture, 3.7)) << "the crash's backoff outlived Reset";
+  EXPECT_EQ(capture->stats().encoder_restarts, 0u) << "the crash's start reason outlived Reset";
+}
+
+// A frame the encoder refuses is dropped and counted; the next is fed to the same encoder, so the
+// chunk has no hole, and seq shows where the frame was.
+TEST_F(MediaTest, ADroppedFrameLeavesNoHoleInTheChunk) {
+  fakes_.next.accept = [](int call) { return call != 1; };
+  auto capture = OnFakes(Front());
+  EXPECT_TRUE(FrameAt(*capture, 0.0));
+  EXPECT_FALSE(FrameAt(*capture, 0.1));
+  EXPECT_TRUE(FrameAt(*capture, 0.2));
+  EXPECT_EQ(capture->stats().dropped_backlog, 1u);
+  EXPECT_EQ(fakes_.built(), 1u);
+  const auto calls = runner_->calls();
+  ASSERT_EQ(calls.size(), 2u);
+  EXPECT_EQ(calls[0].seq, 0u);
+  EXPECT_EQ(calls[1].seq, 2u);
+  EXPECT_FALSE(calls[1].keyframe);
+  EXPECT_EQ(runner_->session()->stats().camera_access_units_dropped, 0u);
+}
+
+// An encoder that dies while running is said once and backed off: frames in the next 5 s are
+// dropped -- the backoff outranks the 3 s gap rule, so nothing starts or stops -- and the first
+// after it stops the dead one and starts a new one, counted as an encoder restart. The replacement
+// is a clean start: a 2 s pause later is not a gap.
+TEST_F(MediaTest, AnEncoderFailureIsWarnedOnceAndRestartedWithTheNextFrame) {
+  auto capture = OnFakes(Front());
+  ASSERT_TRUE(FrameAt(*capture, 0.0));
+  ASSERT_TRUE(FrameAt(*capture, 0.1));
+  fakes_.live(0).Die(Failure("ffmpeg exited", 1, false, 0));
+  for (const double t : {1.1, 3.6}) {
+    EXPECT_FALSE(FrameAt(*capture, t)) << t;
+    EXPECT_TRUE(fakes_.record(0).finish_timeouts.empty()) << "stopped under the backoff at " << t;
+    EXPECT_EQ(fakes_.built(), 1u) << "started under the backoff at " << t;
+  }
+  EXPECT_EQ(capture->stats().dropped_backlog, 2u);
+
+  ASSERT_TRUE(FrameAt(*capture, 5.2));
+  EXPECT_EQ(fakes_.record(0).finish_timeouts, std::vector<double>{0.0});
+  ASSERT_EQ(fakes_.built(), 2u);
+  EXPECT_EQ(capture->stats().encoder_restarts, 1u);
+  ASSERT_EQ(warnings_.size(), 1u);
+  EXPECT_NE(warnings_[0].find("camera 'front'"), std::string::npos) << warnings_[0];
+  EXPECT_NE(warnings_[0].find("exited with code 1"), std::string::npos) << warnings_[0];
+  EXPECT_NE(warnings_[0].find("no encoder starts for 5 seconds"), std::string::npos)
+      << warnings_[0];
+
+  ASSERT_TRUE(FrameAt(*capture, 7.2));
+  EXPECT_EQ(fakes_.built(), 2u);
+  EXPECT_EQ(capture->stats().encoder_restarts, 1u);
+  EXPECT_EQ(capture->stats().gap_restarts, 0u);
+  EXPECT_EQ(warnings_.size(), 1u);
+
+  // The reason that start was counted by is spent: a stop from outside, then a start, counts none.
+  capture->StopEncoder();
+  ASSERT_TRUE(FrameAt(*capture, 7.3));
+  EXPECT_EQ(fakes_.built(), 3u);
+  EXPECT_EQ(capture->stats().encoder_restarts, 1u);
+}
+
+// The two ways a camera can go 3 s without a frame taken, told apart by whether frames kept coming:
+// refused all along is a wedge, killed at once; quiet is a gap, drained with the full timeout --
+// one refused frame followed by a pause included.
+TEST_F(MediaTest, AWedgedEncoderIsKilledAtOnceAndAQuietGapDrainsFirst) {
+  {
+    SCOPED_TRACE("wedged");
+    fakes_.next.accept = [](int) { return false; };
+    auto capture = OnFakes(Front());
+    double stopped_at = -1.0;
+    for (int k = 0; k < 4 * 30 && stopped_at < 0.0; ++k) {
+      FrameAt(*capture, k / 30.0);
+      if (!fakes_.last().finish_timeouts.empty()) stopped_at = k / 30.0;
+    }
+    ASSERT_GE(stopped_at, 0.0);
+    EXPECT_EQ(fakes_.last().finish_timeouts, std::vector<double>{0.0});
+    EXPECT_FALSE(capture->has_encoder());
+    fakes_.next = FakeBehaviour{};
+    fakes_.next.hold_units = true;
+    EXPECT_FALSE(FrameAt(*capture, stopped_at + 4.9));
+    EXPECT_FALSE(capture->has_encoder());
+    EXPECT_TRUE(FrameAt(*capture, stopped_at + 5.0));
+    EXPECT_EQ(capture->stats().encoder_restarts, 1u);
+    EXPECT_EQ(capture->stats().gap_restarts, 0u);
+    // The wedge's stop had to kill, and the replacement has delivered nothing since, so its first
+    // quiet-gap stop pays the reap time alone.
+    ASSERT_TRUE(FrameAt(*capture, stopped_at + 8.5));
+    EXPECT_EQ(fakes_.record(1).finish_timeouts, std::vector<double>{c3d::kH264ReapSeconds});
+  }
+  {
+    SCOPED_TRACE("quiet");
+    fakes_.next = FakeBehaviour{};
+    auto capture = OnFakes(Front());
+    ASSERT_TRUE(FrameAt(*capture, 20.0));
+    const std::size_t first = fakes_.built() - 1;
+    ASSERT_TRUE(FrameAt(*capture, 23.5));
+    EXPECT_EQ(fakes_.record(first).finish_timeouts,
+              std::vector<double>{c3d::kH264FinishTimeoutSeconds});
+    EXPECT_EQ(fakes_.built(), first + 2) << "the frame after the gap starts a new one at once";
+    EXPECT_EQ(capture->stats().gap_restarts, 1u);
+    EXPECT_EQ(capture->stats().encoder_restarts, 0u);
+  }
+  {
+    SCOPED_TRACE("one refusal, then quiet");
+    fakes_.next.accept = [](int call) { return call != 1; };
+    auto capture = OnFakes(Front());
+    ASSERT_TRUE(FrameAt(*capture, 40.0));
+    const std::size_t first = fakes_.built() - 1;
+    EXPECT_FALSE(FrameAt(*capture, 40.1));
+    ASSERT_TRUE(FrameAt(*capture, 43.6));
+    EXPECT_EQ(fakes_.record(first).finish_timeouts,
+              std::vector<double>{c3d::kH264FinishTimeoutSeconds});
+    EXPECT_EQ(capture->stats().gap_restarts, 1u);
+    EXPECT_EQ(capture->stats().encoder_restarts, 0u);
+  }
+}
+
+// An instance that refused a frame and then died is released for its death, not mistaken for a
+// wedge: its on_failure already set the backoff, and the first frame after it starts the next
+// encoder at once, with no second backoff.
+TEST_F(MediaTest, AFailedInstanceIsReleasedWithoutBeingCalledAWedge) {
+  fakes_.next.accept = [](int call) { return call != 1; };
+  auto capture = OnFakes(Front());
+  ASSERT_TRUE(FrameAt(*capture, 0.0));
+  EXPECT_FALSE(FrameAt(*capture, 0.1));
+  fakes_.live(0).Die(Failure("ffmpeg died", -1, false, 0));
+  fakes_.next = FakeBehaviour{};
+  for (const double t : {1.0, 2.0, 3.0, 4.0, 5.0}) EXPECT_FALSE(FrameAt(*capture, t)) << t;
+  EXPECT_EQ(capture->stats().dropped_backlog, 6u);
+
+  EXPECT_TRUE(FrameAt(*capture, 5.2));
+  EXPECT_EQ(fakes_.record(0).finish_timeouts, std::vector<double>{0.0});
+  EXPECT_EQ(fakes_.built(), 2u);
+  EXPECT_TRUE(FrameAt(*capture, 5.3));
+  EXPECT_EQ(capture->stats().encoder_restarts, 1u);
+  EXPECT_EQ(capture->stats().gap_restarts, 0u);
+  EXPECT_EQ(capture->stats().dropped_backlog, 6u);
+}
+
+// ffmpeg removed or replaced under a running node: Start fails, which is said once, and costs the
+// backoff like a crash -- one spawn per 5 s, every frame between dropped -- and no restart counter.
+TEST_F(MediaTest, AStartThatFailsBacksOffLikeACrash) {
+  fakes_.next.start_fails = true;
+  auto capture = OnFakes(Front());
+  for (int k = 0; k < 30; ++k) EXPECT_FALSE(FrameAt(*capture, k / 30.0));
+  EXPECT_FALSE(capture->has_encoder());
+  EXPECT_EQ(fakes_.built(), 1u) << "tried again inside the backoff";
+  EXPECT_EQ(capture->stats().dropped_backlog, 30u);
+  ASSERT_EQ(warnings_.size(), 1u);
+  EXPECT_NE(warnings_[0].find("ENOENT"), std::string::npos) << warnings_[0];
+  EXPECT_NE(warnings_[0].find("ffmpeg_path 'ffmpeg'"), std::string::npos) << warnings_[0];
+
+  EXPECT_FALSE(FrameAt(*capture, 5.0));
+  EXPECT_EQ(fakes_.built(), 2u) << "not tried again once the backoff ran out";
+  fakes_.next.start_fails = false;
+  EXPECT_TRUE(FrameAt(*capture, 10.0));
+  EXPECT_EQ(fakes_.built(), 3u);
+  EXPECT_EQ(warnings_.size(), 1u);
+  EXPECT_EQ(capture->stats().encoder_restarts, 0u);
+  EXPECT_EQ(capture->stats().gap_restarts, 0u);
+}
+
+// A stop from outside -- a session's end, Reset -- releases the encoder; the next frame starts a
+// fresh one with a keyframe, and is neither a failure nor a gap.
+TEST_F(MediaTest, AStoppedEncoderIsReleasedAndTheNextFrameStartsAFreshOne) {
+  auto capture = OnFakes(Front());
+  ASSERT_TRUE(FrameAt(*capture, 0.0));
+  ASSERT_TRUE(FrameAt(*capture, 0.1));
+  capture->StopEncoder();
+  EXPECT_FALSE(capture->has_encoder());
+  EXPECT_EQ(fakes_.record(0).finish_timeouts, std::vector<double>{c3d::kH264FinishTimeoutSeconds});
+  capture->StopEncoder();
+  EXPECT_EQ(fakes_.record(0).finish_timeouts.size(), 1u) << "a second stop did something";
+  ASSERT_TRUE(FrameAt(*capture, 0.6));
+  ASSERT_EQ(fakes_.built(), 2u);
+  ASSERT_EQ(runner_->calls().size(), 3u);
+  EXPECT_TRUE(runner_->calls()[2].keyframe);
+  EXPECT_EQ(capture->stats().encoder_restarts, 0u);
+  EXPECT_EQ(capture->stats().gap_restarts, 0u);
+}
+
+// The stop that ends a session comes after that session's last telemetry tick, so frames lost there
+// are counted for the life of the capture and show in the next session's series.
+TEST_F(MediaTest, DroppedAtStopSurvivesReset) {
+  fakes_.next.finish_failure = Failure("3 frames abandoned", 0, false, 3);
+  auto capture = OnFakes(Front());
+  ASSERT_TRUE(FrameAt(*capture, 0.0));
+  capture->StopEncoder();
+  capture->Reset();
+  EXPECT_EQ(capture->stats().dropped_at_stop, 3u);
+  EXPECT_EQ(capture->stats().frames, 0u) << "a per-session count survived Reset";
+}
+
+TEST_F(MediaTest, FramesAbandonedAtAStopAreCountedAndSaidOnce) {
+  fakes_.next.finish_failure = Failure("3 frames abandoned", 0, false, 3);
+  auto capture = OnFakes(Front());
+  ASSERT_TRUE(FrameAt(*capture, 0.0));
+  capture->StopEncoder();
+  EXPECT_EQ(capture->stats().dropped_at_stop, 3u);
+  ASSERT_EQ(warnings_.size(), 1u);
+  EXPECT_NE(warnings_[0].find("3 frame(s)"), std::string::npos) << warnings_[0];
+  ASSERT_TRUE(FrameAt(*capture, 0.1));
+  capture->StopEncoder();
+  EXPECT_EQ(capture->stats().dropped_at_stop, 6u);
+  EXPECT_EQ(warnings_.size(), 1u) << "said again in the same session";
+  // A stop that drained but reported is no failure: no backoff, and the next frame is fed.
+  EXPECT_TRUE(FrameAt(*capture, 0.2));
+  EXPECT_EQ(capture->stats().encoder_restarts, 0u);
+}
+
+// A stop that drained with a non-zero exit is said, and sets no backoff, so the warning promises
+// none.
+TEST_F(MediaTest, AStopThatDrainedWithAnErrorIsSaidWithoutABackoff) {
+  fakes_.next.finish_failure = Failure("ffmpeg exited", 1, false, 0);
+  auto capture = OnFakes(Front());
+  ASSERT_TRUE(FrameAt(*capture, 0.0));
+  capture->StopEncoder();
+  ASSERT_EQ(warnings_.size(), 1u);
+  EXPECT_NE(warnings_[0].find("exited with code 1"), std::string::npos) << warnings_[0];
+  EXPECT_EQ(warnings_[0].find("no encoder starts"), std::string::npos) << warnings_[0];
+  EXPECT_TRUE(FrameAt(*capture, 0.1)) << "the drained stop backed off after all";
+}
+
+// After a kill, only a replacement that has delivered nothing -- one that may be wedged as well --
+// is stopped with the short timeout. One that has delivered a unit is healthy, and a quiet gap on it
+// gets the full drain: on a slow CPU a healthy drain can take longer than the short timeout.
+TEST_F(MediaTest, AReplacementThatDeliversIsDrainedWithTheFullTimeout) {
+  fakes_.next.finish_failure = Failure("killed at the deadline", -1, true, 1);
+  auto capture = OnFakes(Front());
+  ASSERT_TRUE(FrameAt(*capture, 0.0));
+  fakes_.next.finish_failure.reset();
+  EXPECT_FALSE(FrameAt(*capture, 5.0)) << "the quiet-gap stop killed, so a backoff follows";
+  ASSERT_TRUE(FrameAt(*capture, 10.0));
+  ASSERT_EQ(fakes_.built(), 2u);
+  ASSERT_EQ(runner_->calls().size(), 2u) << "the replacement delivered no unit";
+  ASSERT_TRUE(FrameAt(*capture, 15.0));
+  EXPECT_EQ(fakes_.record(1).finish_timeouts, std::vector<double>{c3d::kH264FinishTimeoutSeconds})
+      << "a replacement that delivered was stopped as though it might be wedged";
+  EXPECT_EQ(capture->stats().encoder_restarts, 1u);
+  EXPECT_EQ(capture->stats().gap_restarts, 1u);
+}
+
+TEST_F(MediaTest, StopEncoderDeliversTheTailBeforeReturning) {
+  fakes_.next.hold_units = true;
+  auto capture = OnFakes(Front());
+  for (int k = 0; k < 3; ++k) ASSERT_TRUE(FrameAt(*capture, 0.1 * k));
+  EXPECT_TRUE(runner_->calls().empty());
+  capture->StopEncoder();
+  ASSERT_EQ(runner_->calls().size(), 3u);
+  EXPECT_EQ(runner_->calls()[2].seq, 2u);
+  EXPECT_EQ(capture->stats().frames, 3u);
+  EXPECT_EQ(capture->stats().dropped_no_session, 0u);
+}
+
+// A capture destroyed with its encoder running -- a node torn down without a cleanup -- drops the
+// tail rather than handing it to a runner that may be gone, and says nothing from its destructor.
+TEST_F(MediaTest, DestructionWithoutStopNeverTouchesTheRunner) {
+  fakes_.next.hold_units = true;
+  fakes_.next.deliver_held_at_kill = true;
+  fakes_.next.finish_failure = Failure("killed at the deadline", -1, true, 1);
+  auto capture = OnFakes(Front());
+  ASSERT_TRUE(FrameAt(*capture, 0.0));
+  ASSERT_TRUE(FrameAt(*capture, 0.1));
+  capture.reset();
+  EXPECT_TRUE(runner_->calls().empty()) << "the destructor delivered to the runner";
+  EXPECT_TRUE(warnings_.empty()) << warnings_.front();
+  EXPECT_EQ(fakes_.record(0).finish_timeouts, std::vector<double>{0.0});
+
+  // And with the runner really gone first.
+  auto orphan = OnFakes(Front());
+  ASSERT_TRUE(FrameAt(*orphan, 1.0));
+  runner_.reset();
+  orphan.reset();
+  EXPECT_TRUE(warnings_.empty());
+}
+
+// Each capture's stop runs on its own thread, so stopping three costs one Finish, not three.
+TEST_F(MediaTest, StoppingSeveralCamerasTakesOneTimeoutNotTheSum) {
+  fakes_.next.finish_sleep_s = 0.4;
+  std::vector<std::unique_ptr<CameraCapture>> cameras;
+  for (int k = 0; k < 3; ++k) {
+    cameras.push_back(OnFakes(Front()));
+    ASSERT_TRUE(FrameAt(*cameras.back(), 0.1 * k));
+  }
+  const auto start = std::chrono::steady_clock::now();
+  StopCameraEncoders(cameras);
+  const double took =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  EXPECT_LT(took, 0.8);
+  EXPECT_GE(took, 0.39) << "the stops did not wait for their encoders";
+  for (std::size_t k = 0; k < 3; ++k) {
+    EXPECT_FALSE(cameras[k]->has_encoder()) << k;
+    EXPECT_EQ(fakes_.record(k).finish_timeouts,
+              std::vector<double>{c3d::kH264FinishTimeoutSeconds})
+        << k;
+  }
+}
+
+// The real ffmpeg, end to end through the capture: frames in, at least one chunk closed out.
+TEST_F(MediaTest, TheRealEncoderProducesAChunk) {
+  std::string version;
+  const std::string unusable = c3d::ProbeFfmpeg("ffmpeg", &version);
+  if (!unusable.empty()) GTEST_SKIP() << "no usable ffmpeg here: " << unusable;
+  CameraConfig config = Front();
+  config.rate_hz = 2.0;
+  config.max_width_px = 160;
+  CameraCapture capture(config, "ffmpeg", DefaultH264EncoderFactory());
+  std::uint64_t fed = 0;
+  for (int k = 0; k < 10; ++k) {
+    if (FrameAt(capture, 0.5 * k, 160, 120)) ++fed;
+    // Wall time between frames too, so a child still starting up finds its queue free.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  ASSERT_GT(fed, 0u);
+  capture.StopEncoder();
+  EXPECT_GT(capture.stats().frames, 0u);
+  EXPECT_EQ(capture.stats().frames + capture.stats().dropped_at_stop, fed);
+  EXPECT_EQ(capture.stats().dropped_no_session, 0u);
+  runner_->End("test");
+  EXPECT_GE(runner_->session()->stats().camera_chunks, 1u);
+  ASSERT_FALSE(runner_->calls().empty());
+  EXPECT_TRUE(runner_->calls()[0].keyframe);
+  EXPECT_FALSE(runner_->calls()[0].context.codec_params.empty()) << "no avcC on the first unit";
 }
 
 // ---------------------------------------------------------------------------
@@ -1610,6 +2864,50 @@ TEST(PointCloudExtract, ABufferLongerThanTheCloudItDescribesContributesNothingEx
 // Lidar capture
 // ---------------------------------------------------------------------------
 
+// A camera frame or a scan whose time is earlier than the one before it is counted per sensor and
+// recorded as it came, in arrival order and with its own time: never sorted, never clamped.
+TEST_F(MediaTest, AStampThatStepsBackIsCountedAndRecordedAsItCame) {
+  environment_.wire_time = [](const rclcpp::Time& stamp) { return 1788383000.0 + stamp.seconds(); };
+  auto camera = OnFakes(Front());
+  for (const double stamp : {100.0, 99.5, 100.2, 99.0}) {
+    ASSERT_TRUE(camera->Handle("sensor_msgs/msg/Image",
+                               Serialize(MakeImage(32, 24, "rgb8", "camera_link", stamp)),
+                               environment_, *runner_))
+        << stamp;
+  }
+  EXPECT_EQ(camera->stats().backward_stamps, 2u);
+  std::vector<std::uint64_t> times;
+  for (const auto& call : runner_->calls()) times.push_back(call.time_ms);
+  EXPECT_EQ(times, (std::vector<std::uint64_t>{1788383100000ull, 1788383099500ull,
+                                              1788383100200ull, 1788383099000ull}));
+  camera->Reset();
+  EXPECT_EQ(camera->stats().backward_stamps, 0u);
+  ASSERT_TRUE(camera->Handle("sensor_msgs/msg/Image",
+                             Serialize(MakeImage(32, 24, "rgb8", "camera_link", 50.0)),
+                             environment_, *runner_));
+  EXPECT_EQ(camera->stats().backward_stamps, 0u) << "a new session's first frame is backward";
+
+  LidarConfig config;
+  config.name = "scan";
+  config.topic = "/scan";
+  config.rate_hz = 1000.0;
+  LidarCapture lidar(config);
+  for (const int stamp : {200, 199, 201}) {
+    sensor_msgs::msg::LaserScan scan;
+    scan.header.frame_id = "base_scan";
+    scan.header.stamp.sec = stamp;
+    scan.angle_min = -3.14f;
+    scan.angle_max = 3.14f;
+    scan.angle_increment = 0.01f;
+    scan.range_min = 0.1f;
+    scan.range_max = 12.0f;
+    scan.ranges.assign(64, 1.5f);
+    ASSERT_TRUE(lidar.Handle("sensor_msgs/msg/LaserScan", Serialize(scan), environment_, *runner_))
+        << stamp;
+  }
+  EXPECT_EQ(lidar.stats().backward_stamps, 1u);
+}
+
 TEST_F(MediaTest, LaserScanIntensitiesAreDroppedUnlessAskedFor) {
   sensor_msgs::msg::LaserScan scan;
   scan.header.frame_id = "base_scan";
@@ -1635,6 +2933,100 @@ TEST_F(MediaTest, LaserScanIntensitiesAreDroppedUnlessAskedFor) {
   LidarCapture with(config);
   ASSERT_TRUE(with.Handle("sensor_msgs/msg/LaserScan", message, environment_, *runner_));
   EXPECT_EQ(with.stats().bytes, 2u * 640u * sizeof(float));
+}
+
+// A block stores its ray count in 16 bits, so a longer scan is refused before it is posed -- the
+// lidar's series never counts a scan the session would drop -- and said once, naming the limit.
+TEST_F(MediaTest, AScanWithTooManyRaysIsRefusedByTheLidarAndSaidOnce) {
+  sensor_msgs::msg::LaserScan scan;
+  scan.header.frame_id = "base_scan";
+  scan.header.stamp.sec = 100;
+  scan.angle_increment = 0.0001f;
+  scan.range_max = 12.0f;
+  scan.ranges.assign(65536, 1.5f);
+  const auto message = Serialize(scan);
+
+  LidarConfig config;
+  config.name = "scan";
+  config.topic = "/scan";
+  config.rate_hz = 100.0;
+  LidarCapture capture(config);
+  EXPECT_FALSE(capture.Handle("sensor_msgs/msg/LaserScan", message, environment_, *runner_));
+  EXPECT_FALSE(capture.Handle("sensor_msgs/msg/LaserScan", message, environment_, *runner_));
+  EXPECT_EQ(capture.stats().refused, 2u);
+  EXPECT_EQ(capture.stats().scans, 0u);
+  EXPECT_TRUE(looked_up_frames_.empty()) << "posed before it was refused";
+  ASSERT_EQ(warnings_.size(), 1u);
+  EXPECT_NE(warnings_[0].find("lidar 'scan'"), std::string::npos) << warnings_[0];
+  EXPECT_NE(warnings_[0].find("65535"), std::string::npos) << warnings_[0];
+
+  scan.ranges.resize(65535);
+  EXPECT_TRUE(capture.Handle("sensor_msgs/msg/LaserScan", Serialize(scan), environment_, *runner_));
+  EXPECT_EQ(capture.stats().scans, 1u);
+}
+
+// doctor sizes a LaserScan the way the session stores it: through the block codec, as a block of
+// one scan. 640 identical rays code to almost nothing; as floats they were 2,560 bytes.
+TEST_F(MediaTest, ALaserScanIsSizedThroughTheBlockCodec) {
+  sensor_msgs::msg::LaserScan scan;
+  scan.header.frame_id = "base_scan";
+  scan.angle_min = -3.14f;
+  scan.angle_max = 3.14f;
+  scan.angle_increment = 0.01f;
+  scan.range_min = 0.1f;
+  scan.range_max = 12.0f;
+  scan.ranges.assign(640, 1.5f);
+  LidarConfig config;
+  config.name = "scan";
+  config.topic = "/scan";
+  LidarCapture capture(config);
+  std::uint64_t bytes = 0;
+  std::string why;
+  ASSERT_TRUE(capture.MeasureEncodedScan("sensor_msgs/msg/LaserScan", Serialize(scan),
+                                         PoseConvention::kRep103, &bytes, &why))
+      << why;
+  EXPECT_GT(bytes, 0u);
+  EXPECT_LT(bytes, 640u * sizeof(float));
+  const c3d::scanblock::EncodedScanBlock expected = [&] {
+    c3d::LaserScanData data;
+    data.angle_min = scan.angle_min;
+    data.angle_max = scan.angle_max;
+    data.angle_increment = scan.angle_increment;
+    data.range_min = scan.range_min;
+    data.range_max = scan.range_max;
+    data.ranges.assign(scan.ranges.begin(), scan.ranges.end());
+    return c3d::scanblock::Encode({data}, false, 1);
+  }();
+  ASSERT_TRUE(expected.ok);
+  EXPECT_EQ(bytes, expected.ranges.size());
+}
+
+// Handle keeps intensities only when they are configured and stores them only when there is one per
+// ray, so a configured lidar that publishes none is sized without them rather than refused.
+TEST_F(MediaTest, ALaserScanWithoutIntensitiesIsSizedEvenWhenTheyAreConfigured) {
+  sensor_msgs::msg::LaserScan scan;
+  scan.header.frame_id = "base_scan";
+  scan.angle_increment = 0.01f;
+  scan.range_max = 12.0f;
+  for (int i = 0; i < 640; ++i) scan.ranges.push_back(1.0f + 0.01f * (i % 50));
+  LidarConfig config;
+  config.name = "scan";
+  config.topic = "/scan";
+  config.intensities = true;
+  LidarCapture capture(config);
+  std::uint64_t without = 0;
+  std::string why;
+  ASSERT_TRUE(capture.MeasureEncodedScan("sensor_msgs/msg/LaserScan", Serialize(scan),
+                                         PoseConvention::kRep103, &without, &why))
+      << why;
+  EXPECT_GT(without, 0u);
+
+  for (int i = 0; i < 640; ++i) scan.intensities.push_back(static_cast<float>(i % 97));
+  std::uint64_t with = 0;
+  ASSERT_TRUE(capture.MeasureEncodedScan("sensor_msgs/msg/LaserScan", Serialize(scan),
+                                         PoseConvention::kRep103, &with, &why))
+      << why;
+  EXPECT_GT(with, without) << "configured intensities that are there were not sized";
 }
 
 TEST_F(MediaTest, AnOversizeCloudIsDroppedAndCountedAsOversize) {
@@ -1758,7 +3150,7 @@ TEST_F(MediaTest, ACamerasTwoWarningsAreEachSaidOnceAndNeitherHidesTheOther) {
 
   for (const bool frame_first : {true, false}) {
     warnings_.clear();
-    CameraCapture capture(config);
+    CameraCapture capture(config, "ffmpeg", fakes_.Factory());
     for (int i = 0; i < 3; ++i) {
       capture.Handle("sensor_msgs/msg/Image", frame_first ? unframed : depth, environment_,
                      *runner_);
@@ -1952,12 +3344,15 @@ TEST(DoctorMedia, ASilentTopicIsAdvisoryAndNamesTheQosPossibility) {
   EXPECT_NE(check.remedy.find("QoS"), std::string::npos);
 }
 
+// A lidar's sample is measured and reported as a size and a rate. A camera's cannot be -- video
+// bytes follow what moves -- so it reports what one frame prepares to and an estimated rate,
+// labelled as one.
 TEST(DoctorMedia, AMeasuredSampleIsReportedAsASizeAndARate) {
   doctor::MediaSensorFacts facts;
   facts.kind = "camera";
   facts.name = "front";
   facts.topic = "/image";
-  facts.rate_hz = 2.0;
+  facts.rate_hz = 30.0;
   facts.topic_present = true;
   facts.type = "sensor_msgs/msg/Image";
   facts.type_handled = true;
@@ -1965,50 +3360,41 @@ TEST(DoctorMedia, AMeasuredSampleIsReportedAsASizeAndARate) {
   facts.frame = "camera_link";
   facts.frame_resolves = true;
   facts.sample_seen = true;
-  facts.encoded_bytes = 20 * 1024;
-  const doctor::Check check = doctor::CheckMediaSensor(facts);
-  EXPECT_EQ(check.severity, doctor::Severity::kOk);
-  EXPECT_NE(check.detail.find("20.0 KB"), std::string::npos) << check.detail;
-  EXPECT_NE(check.detail.find("40.0 KB/s"), std::string::npos) << check.detail;
-}
+  facts.prepared_width = 640;
+  facts.prepared_height = 480;
+  facts.crf = 28;
+  const doctor::Check camera = doctor::CheckMediaSensor(facts);
+  EXPECT_EQ(camera.severity, doctor::Severity::kOk);
+  EXPECT_NE(camera.detail.find("one frame prepares to 640x480"), std::string::npos)
+      << camera.detail;
+  EXPECT_NE(camera.detail.find("about 150.0 KB/s estimated"), std::string::npos) << camera.detail;
+  EXPECT_NE(camera.detail.find("not measured on this camera"), std::string::npos)
+      << camera.detail;
 
-// The bandwidth check adds sensors up over a second. This is a different limit
-// with a different failure: the platform stores each frame or scan as ONE
-// record and drops a record over 1 MiB after the upload has already answered
-// 200, so a slow sensor can sail under the bandwidth budget while every one of
-// its records is dropped that way.
-TEST(DoctorMedia, AnOversizedSingleRecordWarnsWhileTheBandwidthIsFine) {
-  doctor::MediaSensorFacts lidar;
+  // A camera whose sample could not be prepared records nothing.
+  facts.prepared_width = 0;
+  facts.prepared_height = 0;
+  facts.encode_error = "encoding '32FC1' is DEPTH";
+  const doctor::Check unprepared = doctor::CheckMediaSensor(facts);
+  EXPECT_EQ(unprepared.severity, doctor::Severity::kFatal);
+  EXPECT_NE(unprepared.detail.find("could not be prepared: encoding '32FC1' is DEPTH"),
+            std::string::npos)
+      << unprepared.detail;
+
+  doctor::MediaSensorFacts lidar = facts;
   lidar.kind = "lidar";
-  lidar.name = "depth";
-  lidar.topic = "/points";
-  lidar.rate_hz = 1.0;
-  lidar.topic_present = true;
-  lidar.type = "sensor_msgs/msg/PointCloud2";
-  lidar.type_handled = true;
-  lidar.qos = "best_effort/volatile/keep_last(1)";
-  lidar.frame = "base_scan";
-  lidar.frame_resolves = true;
-  lidar.sample_seen = true;
-  lidar.encoded_bytes = 1200 * 1024;
-
-  const doctor::Check check = doctor::CheckMediaSensor(lidar);
-  EXPECT_EQ(check.severity, doctor::Severity::kAdvisory);
-  EXPECT_NE(check.remedy.find("depth"), std::string::npos) << check.remedy;
-  EXPECT_NE(check.remedy.find("1.2 MB"), std::string::npos) << check.remedy;
-  EXPECT_NE(check.remedy.find("max_points"), std::string::npos) << check.remedy;
-  EXPECT_EQ(doctor::CheckMediaBandwidth({lidar}).severity, doctor::Severity::kOk)
-      << "1.2 MB/s is inside the bandwidth budget, so nothing else would have said this";
-
-  // The knobs named are the ones the sensor actually has.
-  doctor::MediaSensorFacts camera = lidar;
-  camera.kind = "camera";
-  camera.name = "front";
-  camera.type = "sensor_msgs/msg/Image";
-  const doctor::Check camera_check = doctor::CheckMediaSensor(camera);
-  EXPECT_EQ(camera_check.severity, doctor::Severity::kAdvisory);
-  EXPECT_NE(camera_check.remedy.find("max_width_px"), std::string::npos) << camera_check.remedy;
-  EXPECT_NE(camera_check.remedy.find("jpeg_quality"), std::string::npos) << camera_check.remedy;
+  lidar.name = "scan";
+  lidar.topic = "/scan";
+  lidar.type = "sensor_msgs/msg/LaserScan";
+  lidar.rate_hz = 2.0;
+  lidar.encode_error.clear();
+  lidar.encoded_bytes = 20 * 1024;
+  const doctor::Check measured = doctor::CheckMediaSensor(lidar);
+  EXPECT_EQ(measured.severity, doctor::Severity::kOk);
+  EXPECT_NE(measured.detail.find("one sample encodes to 20.0 KB"), std::string::npos)
+      << measured.detail;
+  EXPECT_NE(measured.detail.find("40.0 KB/s at 2 Hz"), std::string::npos) << measured.detail;
+  EXPECT_EQ(measured.detail.find("estimated"), std::string::npos) << measured.detail;
 }
 
 namespace {
@@ -2167,24 +3553,31 @@ TEST(DoctorMedia, BandwidthWarnsAboveTheBudgetAndDeclinesWithNothingMeasured) {
   doctor::MediaSensorFacts camera;
   camera.kind = "camera";
   camera.name = "front";
-  camera.rate_hz = 5.0;
+  camera.rate_hz = 30.0;
   camera.sample_seen = true;
-  camera.encoded_bytes = 100 * 1024;  // 500 KB/s
+  camera.prepared_width = 640;
+  camera.prepared_height = 480;
+  camera.crf = 28;  // about 150 KB/s
 
   doctor::MediaSensorFacts lidar;
   lidar.kind = "lidar";
   lidar.name = "depth";
   lidar.rate_hz = 1.0;
   lidar.sample_seen = true;
-  lidar.encoded_bytes = 50 * 1024;
+  lidar.encoded_bytes = 1950 * 1000;  // 1.86 MiB/s, inside the budget alone
 
-  const doctor::Check under = doctor::CheckMediaBandwidth({camera, lidar});
-  EXPECT_EQ(under.severity, doctor::Severity::kOk);
-
-  camera.rate_hz = 30.0;  // 3 MB/s
+  EXPECT_EQ(doctor::CheckMediaBandwidth({lidar}).severity, doctor::Severity::kOk);
+  // The camera's estimate counts towards the budget, and here it is what crosses it.
   const doctor::Check over = doctor::CheckMediaBandwidth({camera, lidar});
-  EXPECT_EQ(over.severity, doctor::Severity::kAdvisory);
+  EXPECT_EQ(over.severity, doctor::Severity::kAdvisory) << over.detail;
   EXPECT_NE(over.remedy.find("rate_hz"), std::string::npos);
+  EXPECT_NE(over.remedy.find("crf"), std::string::npos);
+  EXPECT_NE(over.detail.find("across 2 sensor(s)"), std::string::npos) << over.detail;
+
+  // A camera that prepared nothing adds nothing.
+  camera.prepared_width = 0;
+  camera.prepared_height = 0;
+  EXPECT_EQ(doctor::CheckMediaBandwidth({camera, lidar}).severity, doctor::Severity::kOk);
 
   // A check that could not be asked is RENAMED, so it cannot be skim-read as one
   // that passed.

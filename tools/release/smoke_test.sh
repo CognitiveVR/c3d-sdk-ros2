@@ -108,6 +108,17 @@ check "cognitive3d-ros depends on exactly its cognitive3d-ros-msgs" \
 check "cognitive3d-ros-nav2 depends on exactly its cognitive3d-ros" \
   pins_siblings "$(deb_for cognitive3d-ros-nav2)" cognitive3d-ros
 
+# ffmpeg encodes cameras only, so a robot without one need not install it.
+recommends_ffmpeg() {
+  local deb="$1"
+  dpkg-deb -f "$deb" Recommends | tr ',' '\n' | sed 's/^ *//; s/ .*//' | grep -qx ffmpeg ||
+    { echo "        $(basename "$deb") does not recommend ffmpeg"; return 1; }
+  ! dpkg-deb -f "$deb" Depends | tr ',|' '\n\n' | sed 's/^ *//; s/ .*//' | grep -qx ffmpeg ||
+    { echo "        $(basename "$deb") depends on ffmpeg"; return 1; }
+}
+check "cognitive3d-ros recommends ffmpeg and does not depend on it" \
+  recommends_ffmpeg "$(deb_for cognitive3d-ros)"
+
 step "install into a fresh $DISTRO image"
 apt-get update -qq
 # Reported, not checked: what a robot without Nav2 pulls for the two debs it needs.
