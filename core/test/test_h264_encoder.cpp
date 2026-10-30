@@ -654,6 +654,29 @@ TEST(H264Encoder, TheEncodeProbePassesARealFfmpegWithTheCamerasSettings) {
   EXPECT_NE(ProbeFfmpegEncode(settings), "") << "the preset never reached ffmpeg";
 }
 
+// The SDK pairs each unit with the oldest frame fed and not yet returned. A unit with none left is
+// marked unpaired: ffmpeg returned more units than frames, and the pairing is in doubt.
+TEST(H264Encoder, AUnitWithNoFrameLeftToPairIsMarkedUnpaired) {
+  ScratchDir dir;
+  H264EncoderSettings settings = Small(30.0, 3.0);
+  // Three access units, each an AUD and a slice, whatever it is fed; then it reads to EOF.
+  const std::string unit = "\\000\\000\\000\\001\\011\\360\\000\\000\\001\\101\\232";
+  settings.ffmpeg_path = dir.Script(
+      "three_units.sh", "printf '" + unit + unit + unit + "'\ncat >/dev/null\nexit 0");
+  Collector c;
+  auto encoder = NewEncoder(settings, &c);
+  std::string error;
+  ASSERT_TRUE(encoder->Start(&error)) << error;
+  ASSERT_TRUE(encoder->Feed(Frame(64, 48, 0), 7));
+  encoder->Finish(2.0);
+  std::lock_guard<std::mutex> lock(c.mutex);
+  ASSERT_EQ(c.units.size(), 3u);
+  EXPECT_TRUE(c.units[0].paired);
+  EXPECT_EQ(c.units[0].token, 7u);
+  EXPECT_FALSE(c.units[1].paired);
+  EXPECT_FALSE(c.units[2].paired);
+}
+
 TEST(H264Encoder, AChildThatDiesReportsFailureOnce) {
   ScratchDir dir;
   H264EncoderSettings settings = Small(30.0, 3.0);

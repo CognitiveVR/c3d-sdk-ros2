@@ -258,10 +258,11 @@ refuses, so it builds none that large: a chunk's `data` closes at 8 MiB, a scan 
 
 Camera and lidar objects upload one at a time, each naming its session id, device id, scene id,
 scene version number and SDK version. The per-sensor `seq` numbers them from 0 per camera or lidar
-per session, and the platform keeps it with every object, so a missing or repeated `seq` shows an
-object that was lost or delivered twice. A lidar's scan blocks and its cloud objects are numbered
-apart, so a lidar whose topic changes message type mid-session can repeat a `seq` without anything
-being lost or delivered twice.
+per session, and the platform keeps it with every object, so a missing `seq` shows an object that
+was lost. The platform keeps one object per `seq`: an object delivered twice, as a retried upload
+is, replaces the first copy, so a repeat never shows. A lidar's scan blocks and its cloud objects
+are numbered apart, and kept apart, so a lidar whose topic changes message type mid-session
+repeats a `seq` without either replacing the other.
 
 ## Lidar blocks
 

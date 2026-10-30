@@ -542,6 +542,8 @@ void FfmpegH264Encoder::EmitUnit(std::string bytes) {
     if (!tokens_.empty()) {
       unit.token = tokens_.front();
       tokens_.pop_front();
+    } else {
+      unit.paired = false;
     }
     ++stats_.access_units;
     unit.codec_params = avcc_;

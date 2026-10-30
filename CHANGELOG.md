@@ -59,7 +59,8 @@ marks as provisional may change in a minor release, and its entry here says how 
   `CloudBlock` as [Data format](docs/data-format.md#point-cloud-objects) describes, and set
   `zstd_level: 1` to keep the old level.
 - **BREAKING:** `camera_flush_s`, `camera_flush_bytes`, `lidar_flush_s` and `lidar_flush_bytes` are
-  removed: a chunk, a block or an object closes by its own rule. Migrate: delete them.
+  removed: a chunk, a block or an object closes by its own rule, and configure refuses a params
+  file that sets one, naming the key. Migrate: delete them.
 - **BREAKING:** The camera and lidar payloads carry `formatVersion` `"2.0"`, under the schemas
   `CameraPayload` with `FrameMeta`, and `LidarPayload` with `ScanBlock` and `CloudBlock`. Migrate:
   deploy a gateway that reads them before this release; one that does not cannot read the

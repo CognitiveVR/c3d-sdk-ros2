@@ -155,6 +155,9 @@ struct FakeBehaviour {
   std::size_t lag_units = 0;
   // The size of the unit for the encoder's n-th frame, fed or refed; unset is "unit-<n>".
   std::function<std::size_t(int unit)> unit_bytes;
+  // After the unit for this feed call, one more that pairs with no frame, as an ffmpeg that
+  // duplicated a frame would return.
+  int unpaired_after_call = -1;
   // Reported once, from Finish, in place of what Finish would report itself.
   std::optional<c3d::EncoderFailure> finish_failure;
   double finish_sleep_s = 0.0;
@@ -193,6 +196,12 @@ class FakeH264Encoder : public c3d::IH264Encoder {
     if (behaviour_.accept && !behaviour_.accept(call)) return false;
     record_->fed_tokens.push_back(token);
     Encode(bgr24, token);
+    if (call == behaviour_.unpaired_after_call) {
+      c3d::EncodedAccessUnit extra;
+      extra.paired = false;
+      extra.bytes = "unpaired";
+      on_access_unit_(std::move(extra));
+    }
     return true;
   }
   bool Refeed(std::string bgr24, std::uint64_t token) override {
@@ -1766,6 +1775,35 @@ TEST_F(MediaTest, AStopBeforeTheSizeRestartCountsTheHeldUnitsAsDroppedAtStop) {
   ASSERT_TRUE(FrameAt(*capture, 0.3));
   EXPECT_EQ(fakes_.built(), 2u);
   EXPECT_TRUE(fakes_.record(1).refed_tokens.empty()) << "a stop kept the refused frame";
+}
+
+// An ffmpeg that returns more units than it was fed frames leaves every later unit paired with
+// the wrong frame's time and pose: the extra unit is dropped, never recorded, and said once.
+TEST_F(MediaTest, AUnitWithNoFrameToPairIsDroppedAndSaidOnce) {
+  fakes_.next.unpaired_after_call = 1;
+  auto capture = OnFakes(Front());
+  for (const double t : {0.0, 0.1, 0.2}) ASSERT_TRUE(FrameAt(*capture, t));
+  const auto calls = runner_->calls();
+  ASSERT_EQ(calls.size(), 3u);
+  for (const auto& call : calls) EXPECT_NE(call.bytes, "unpaired");
+  ASSERT_EQ(warnings_.size(), 1u);
+  EXPECT_NE(warnings_[0].find("more access units than it was fed frames"), std::string::npos)
+      << warnings_[0];
+  EXPECT_EQ(capture->stats().frames, 3u);
+}
+
+// `frames` and `bytes` count the units a chunk took: one the session dropped, after a chunk was
+// cut short, is not in them.
+TEST_F(MediaTest, AUnitTheSessionDroppedIsNotCountedAsAFrame) {
+  auto capture = OnFakes(Front());
+  ASSERT_TRUE(FrameAt(*capture, 0.0));
+  ASSERT_TRUE(FrameAt(*capture, 0.1));
+  runner_->session()->Flush();
+  ASSERT_TRUE(FrameAt(*capture, 0.2));
+  EXPECT_EQ(runner_->session()->stats().camera_access_units_dropped, 1u);
+  EXPECT_EQ(capture->stats().frames, 2u);
+  EXPECT_EQ(capture->stats().bytes, 2u * 6u);
+  EXPECT_EQ(runner_->session()->stats().camera_frames, 2u);
 }
 
 // The encoder stamps frames by the wall clock, so a step in it -- NTP correcting a clock that booted

@@ -70,8 +70,8 @@ struct Stats {
   // The binary streams, counted separately from `records_recorded` because they
   // are not comparable to it: one camera frame is worth tens of thousands of gaze
   // samples in bytes, and a single number covering both answers no question about
-  // either. `camera_frames` counts access units and `lidar_scans` scans and clouds,
-  // each with the bytes handed in.
+  // either. `camera_frames` counts the access units a chunk took and `lidar_scans`
+  // scans and clouds, each with the bytes handed in.
   std::uint64_t camera_frames = 0;
   std::uint64_t camera_bytes = 0;
   std::uint64_t lidar_scans = 0;

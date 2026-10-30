@@ -344,6 +344,7 @@ void CameraCapture::Reset() {
   pending_start_reason_ = StartReason::kNone;
   failure_warned_ = false;
   no_session_warned_ = false;
+  unpaired_warned_ = false;
   size_warned_ = false;
   recorded_chunk_s_ = c3d::kVideoChunkSeconds;
   recorded_bitrate_kbps_ = config_.max_bitrate_kbps;
@@ -879,6 +880,23 @@ void CameraCapture::StopEncoder(double timeout_s, bool for_replay) {
 }
 
 void CameraCapture::OnAccessUnit(c3d::EncodedAccessUnit unit) {
+  if (!unit.paired) {
+    std::function<void(const std::string&)> warn;
+    {
+      std::lock_guard<std::mutex> lock(pending_mu_);
+      if (!unpaired_warned_ && warn_once_) {
+        unpaired_warned_ = true;
+        warn = warn_once_;
+      }
+    }
+    if (warn) {
+      warn("camera '" + config_.name + "': ffmpeg returned more access units than it was fed "
+           "frames, so its units may be paired with the wrong frames' time and pose from here on. "
+           "The extra unit is dropped. Check ffmpeg_path '" + ffmpeg_path_ + "': this SDK needs "
+           "one unit per frame");
+    }
+    return;
+  }
   Pending pending;
   SessionRunner* runner = nullptr;
   {
@@ -937,6 +955,7 @@ void CameraCapture::OnAccessUnit(c3d::EncodedAccessUnit unit) {
     return;
   }
   settle();
+  if (fate != c3d::VideoUnitFate::kAppended) return;
   std::lock_guard<std::mutex> lock(stats_mu_);
   ++stats_.frames;
   stats_.bytes += bytes;

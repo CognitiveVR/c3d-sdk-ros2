@@ -113,7 +113,7 @@ class HeldRecords {
 };
 
 struct CameraStats {
-  // Access units that reached the session, and their encoded bytes.
+  // Access units a chunk took, and their encoded bytes.
   std::uint64_t frames = 0;
   std::uint64_t bytes = 0;
   std::uint64_t pose_failures = 0;
@@ -417,6 +417,7 @@ class CameraCapture {
   std::thread::id stopping_on_;
   bool failure_warned_ = false;
   bool no_session_warned_ = false;
+  bool unpaired_warned_ = false;
 };
 
 // Stops every camera's encoder at once, each on a thread of its own, then sweeps the leftover

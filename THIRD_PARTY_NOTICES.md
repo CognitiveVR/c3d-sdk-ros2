@@ -109,7 +109,7 @@ them from their own distributions, under their own licenses.
 | libcurl | curl (MIT-style) | the upload transport |
 | zstd | BSD-3-Clause or GPL-2.0 | point cloud compression |
 | Cap'n Proto runtime | MIT | the camera and lidar payloads |
-| OpenCV | Apache-2.0 | `cv_bridge`, and the camera frame encoder |
+| OpenCV | Apache-2.0 | `cv_bridge`, and decoding and scaling camera frames before they reach `ffmpeg` |
 | ROS 2 (rclcpp, tf2, cv_bridge, message packages, Nav2 messages) | Apache-2.0 and BSD | the node |
 
 ## Runtime programs
@@ -121,5 +121,5 @@ code from either program is compiled into any Cognitive3D binary, and the SDK sh
 
 | program | license | reached through |
 | -- | -- | -- |
-| FFmpeg (`ffmpeg`) | GPL-2.0-or-later, as distributed by Ubuntu | the camera H.264 encoder, as a child process |
+| FFmpeg (`ffmpeg`) | GPL-2.0-or-later, as distributed by Ubuntu; GPL-3.0-or-later where Debian or Ubuntu's `libavcodec-extra` replaces the stock codec library, since that build enables the version 3 licenses | the camera H.264 encoder, as a child process |
 | x264 (`libx264`, loaded by `ffmpeg`) | GPL-2.0-or-later | that same child process; the SDK never links it |

@@ -194,10 +194,10 @@ TEST_F(ConfigureRefusals, AnFfmpegThatCannotEncodeWithTheCamerasSettingsRefusesC
   EXPECT_NE(refusal.find("Unrecognized option 'vsync'"), std::string::npos) << refusal;
 }
 
-// A camera has no `jpeg_quality` or `format` field: a params file that carries one is refused as a
-// field the camera does not have, naming the fields it does, rather than configuring and applying
-// nothing of it.
-TEST_F(ConfigureRefusals, AJpegQualityKeyIsRefusedAsAFieldTheCameraNoLongerHas) {
+// A camera has no `jpeg_quality` or `format` field any more, and there are no flush keys: a 1.x
+// params file that carries one is refused naming the key and saying it was removed, rather than
+// configuring and applying nothing of it, or reading as a misspelling.
+TEST_F(ConfigureRefusals, ARemovedKeyIsRefusedNamingItAsRemoved) {
   for (const rclcpp::Parameter& gone : {rclcpp::Parameter("camera.front.jpeg_quality", 80),
                                         rclcpp::Parameter("camera.front.format",
                                                           std::string("jpeg"))}) {
@@ -205,11 +205,19 @@ TEST_F(ConfigureRefusals, AJpegQualityKeyIsRefusedAsAFieldTheCameraNoLongerHas) 
     parameters.push_back(gone);
     const auto node = MakeNode(parameters);
     const std::string refusal = Configure(*node);
-    EXPECT_EQ(refusal.rfind(gone.get_name() + " is not a parameter: a camera's fields are ", 0),
-              0u)
+    EXPECT_EQ(refusal.rfind(gone.get_name() + " was removed: a camera is encoded as H.264", 0), 0u)
         << refusal;
-    EXPECT_NE(refusal.find("crf"), std::string::npos) << refusal;
-    EXPECT_NE(refusal.find("preset"), std::string::npos) << refusal;
+    EXPECT_NE(refusal.find("preset and crf"), std::string::npos) << refusal;
+    EXPECT_EQ(refusal.find("spelling"), std::string::npos) << refusal;
+  }
+  for (const rclcpp::Parameter& gone :
+       {rclcpp::Parameter("camera_flush_s", 3.0), rclcpp::Parameter("camera_flush_bytes", 4096),
+        rclcpp::Parameter("lidar_flush_s", 3.0), rclcpp::Parameter("lidar_flush_bytes", 4096)}) {
+    auto parameters = SharedNodeParameters();
+    parameters.push_back(gone);
+    const auto node = MakeNode(parameters);
+    const std::string refusal = Configure(*node);
+    EXPECT_EQ(refusal.rfind(gone.get_name() + " was removed", 0), 0u) << refusal;
   }
 }
 

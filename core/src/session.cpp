@@ -2190,7 +2190,7 @@ VideoUnitFate Session::RecordCameraAccessUnit(const std::string& camera_id,
     impl_->stats.camera_access_units_dropped += video.dropped_before_keyframe() - dropped_before;
     if (fate == VideoUnitFate::kRefused) {
       ++impl_->stats.camera_access_units_refused;
-    } else {
+    } else if (fate == VideoUnitFate::kAppended) {
       ++impl_->stats.camera_frames;
       impl_->stats.camera_bytes += bytes;
     }

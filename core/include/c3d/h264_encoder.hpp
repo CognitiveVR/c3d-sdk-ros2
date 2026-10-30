@@ -50,6 +50,10 @@ struct EncoderFailure {
 // so a consumer never reads them through a pointer that a restart may have reassigned.
 struct EncodedAccessUnit {
   std::uint64_t token = 0;
+  // False for a unit that came back with no fed frame left to pair it with: ffmpeg returned more
+  // units than frames, so the pairing of every later unit with its frame is in doubt. `token` is
+  // then meaningless.
+  bool paired = true;
   std::string bytes;  // Annex B, from the access unit delimiter through the frame's last NAL
   bool keyframe = false;
   std::string codec_params;

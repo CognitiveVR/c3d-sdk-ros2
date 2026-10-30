@@ -955,6 +955,7 @@ TEST_F(BinaryStreamTest, AForcedCloseDropsTheFramesUntilTheNextKeyframe) {
   session_->RecordCameraAccessUnit("front", EntryAt(200, 3), context, "p3", false);
   session_->RecordCameraAccessUnit("front", EntryAt(233, 4), context, "p4", false);
   EXPECT_EQ(session_->stats().camera_access_units_dropped, 2u);
+  EXPECT_EQ(session_->stats().camera_frames, 3u) << "a dropped unit was counted as a frame";
   session_->RecordCameraAccessUnit("front", EntryAt(266, 5), context, "i5", true);
   session_->RecordCameraAccessUnit("front", EntryAt(300, 6), context, "p6", false);
   session_->End();

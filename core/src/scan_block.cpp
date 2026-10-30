@@ -75,10 +75,17 @@ ScanGeometry GeometryOf(const LaserScanData& scan) {
           scan.range_min, scan.range_max, static_cast<std::uint32_t>(scan.ranges.size())};
 }
 
+namespace {
+
+// NaN is the same field as NaN: a driver that publishes one would otherwise start a block per scan.
+bool Same(float a, float b) { return a == b || (std::isnan(a) && std::isnan(b)); }
+
+}  // namespace
+
 bool operator==(const ScanGeometry& a, const ScanGeometry& b) {
-  return a.angle_min == b.angle_min && a.angle_max == b.angle_max &&
-         a.angle_increment == b.angle_increment && a.range_min == b.range_min &&
-         a.range_max == b.range_max && a.rays == b.rays;
+  return Same(a.angle_min, b.angle_min) && Same(a.angle_max, b.angle_max) &&
+         Same(a.angle_increment, b.angle_increment) && Same(a.range_min, b.range_min) &&
+         Same(a.range_max, b.range_max) && a.rays == b.rays;
 }
 
 EncodedScanBlock Encode(const std::vector<LaserScanData>& scans, bool intensities,

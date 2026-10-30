@@ -172,6 +172,17 @@ constexpr const char* kApplicationKeyParameterRefused =
     "C3D_APPLICATION_API_KEY in its environment, because anything on the ROS graph can read a "
     "parameter. Remove application_key from the parameters and export C3D_APPLICATION_API_KEY.";
 
+// Keys a 1.x params file sets that this release no longer reads: refused naming the key, rather
+// than configuring with a setting that does nothing.
+constexpr const char* kRemovedFlushKeys[] = {"camera_flush_s", "camera_flush_bytes",
+                                             "lidar_flush_s", "lidar_flush_bytes"};
+constexpr const char* kRemovedFlushKeyWhy =
+    " was removed: a camera chunk, a scan block and a cloud object each close by their own rule. "
+    "Delete the key";
+constexpr const char* kRemovedCameraFields[] = {"format", "jpeg_quality"};
+constexpr const char* kRemovedCameraFieldWhy =
+    " was removed: a camera is encoded as H.264, its quality set by preset and crf. Delete the key";
+
 // A scene id is a UUID, 8-4-4-4-12 hex digits in either case. The collector answers 200 for one
 // that names no scene and discards the session, so a placeholder left in a params file is refused.
 bool IsSceneId(const std::string& value) {
@@ -584,6 +595,12 @@ bool Cognitive3DNode::LoadConfig(std::string* error) {
           kApplicationKeyParameter) != 0) {
     if (error) *error = kApplicationKeyParameterRefused;
     return false;
+  }
+  for (const char* removed : kRemovedFlushKeys) {
+    if (get_node_parameters_interface()->get_parameter_overrides().count(removed) != 0) {
+      if (error) *error = std::string(removed) + kRemovedFlushKeyWhy;
+      return false;
+    }
   }
   // Mandatory values the node resolves itself. They are reported together with
   // `Config::Validate`'s own, so one refusal names everything a fresh params file is missing.
@@ -1344,6 +1361,12 @@ std::string Cognitive3DNode::UnreadBlockKey(const std::string& block, const std:
              prefix + unlisted + ".* key";
     }
     if (has_parameter(key)) continue;
+    if (block == "camera" && rest.size() > name.size()) {
+      const std::string field = rest.substr(name.size() + 1);
+      for (const char* removed : kRemovedCameraFields) {
+        if (field == removed) return key + kRemovedCameraFieldWhy;
+      }
+    }
     const std::string own = prefix + name + ".";
     std::string fields;
     for (const std::string& declared : list_parameters({prefix + name}, 0).names) {

@@ -440,7 +440,9 @@ Configure refuses, naming the parameter:
 - a `rate_hz` of 0 or less
 - a negative `camera.<name>.max_width_px`, a `preset` other than `ultrafast` or `veryfast`, a `crf`
   outside 24 to 32, or a `max_bitrate_kbps` that is negative or above 1,000,000
-- a `camera.<name>.format` or `camera.<name>.jpeg_quality`, which a camera no longer has
+- a `camera.<name>.format` or `camera.<name>.jpeg_quality`, or any of `camera_flush_s`,
+  `camera_flush_bytes`, `lidar_flush_s` and `lidar_flush_bytes`: the refusal names the key and says
+  it was removed
 - a camera with `max_width_px` set at which not even a 1-second chunk is estimated under 6 MiB; see
   [How a camera is encoded](#how-a-camera-is-encoded)
 - a camera configured while the binary named by `ffmpeg_path` cannot run, lists no `libx264`
@@ -455,7 +457,7 @@ Configure refuses, naming the parameter:
 - a camera `qos` value that is not one of those under [QoS](#qos)
 
 `camera_flush_s`, `camera_flush_bytes`, `lidar_flush_s` and `lidar_flush_bytes` no longer exist: a
-chunk, a block or an object closes by its own rule, and a params file that sets them has no effect.
+chunk, a block or an object closes by its own rule.
 
 Four refusals come later, because they depend on what the robot publishes. Each is logged once per
 sensor:

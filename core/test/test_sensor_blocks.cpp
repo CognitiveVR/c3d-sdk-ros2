@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -417,6 +418,23 @@ TEST(ScanBlockAssembler, ABlockClosesBeforeItsCodesWouldPassTheCap) {
     EXPECT_EQ(closed[0].intensities, intensities);
     EXPECT_EQ(blocks.buffered_scans(), 1u);
   }
+}
+
+// A driver that publishes NaN in a geometry field publishes the same NaN every scan: its scans make
+// one block, not a block each.
+TEST(ScanBlockAssembler, ScansWhoseGeometryHoldsTheSameNaNShareABlock) {
+  ScanBlockAssembler blocks("scan");
+  LaserScanData scan = ScanOf(64);
+  scan.range_max = std::numeric_limits<float>::quiet_NaN();
+  scan.angle_increment = std::numeric_limits<float>::quiet_NaN();
+  for (std::uint32_t i = 0; i < 3; ++i) {
+    EXPECT_TRUE(blocks.Append(EntryAt(1000 + i, i), "laser", scan, 1.0).empty()) << "scan " << i;
+  }
+  EXPECT_EQ(blocks.buffered_scans(), 3u);
+  LaserScanData known = scan;
+  known.range_max = 12.0f;
+  EXPECT_EQ(blocks.Append(EntryAt(1004, 3), "laser", known, 1.0).size(), 1u)
+      << "a NaN field matched a number";
 }
 
 TEST(ScanBlockAssembler, AGeometryChangeClosesTheBlock) {
