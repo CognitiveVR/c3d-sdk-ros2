@@ -8,6 +8,12 @@ marks as provisional may change in a minor release, and its entry here says how 
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-25
+
+The platform now stores camera frames, laser scans and point clouds in the formats of this release
+only. From SDK 1.x it refuses all three with a 400, and the node discards them: upgrade every
+robot that records a camera or a lidar.
+
 ### Added
 
 - `ffmpeg_path`, the encoder binary, default `ffmpeg`, and per camera `camera.<name>.preset`,
@@ -142,5 +148,6 @@ Cognitive3D dashboard. Start with the [Quickstart](docs/quickstart.md).
 - The verifiers are diagnostics on an unversioned API, and the installed C++ headers are not a
   supported API: either can change in any release.
 
+[2.0.0]: https://github.com/CognitiveVR/c3d-sdk-ros2/releases/tag/v2.0.0
 [1.1.0]: https://github.com/CognitiveVR/c3d-sdk-ros2/releases/tag/v1.1.0
 [1.0.0]: https://github.com/CognitiveVR/c3d-sdk-ros2/releases/tag/v1.0.0
