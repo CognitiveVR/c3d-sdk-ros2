@@ -420,6 +420,7 @@ counts in none of the restart series.
 | `c3d.spool_write_failures` | parts the spool refused: no room under the cap, or a failed write | since configure |
 | `c3d.serialization_failures` | parts that could not be serialized | since configure |
 | `c3d.chunks_evicted` | chunks evicted at `spool_max_mb`, never to be uploaded | since configure |
+| `c3d.chunks_discarded` | chunks the platform rejected with 400, 413, 415 or 422, which were deleted and are never stored | since configure |
 | `c3d.upload_failures` | failed upload attempts, each of which kept its chunk | since configure |
 | `c3d.upload_auth_rejections` | uploads answered 401, 403 or 407 | since configure |
 | `c3d.upload_auth_paused` | 1 while every upload is paused for refused credentials | current |

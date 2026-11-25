@@ -111,6 +111,18 @@ TEST(UploadHealth, HeldDeferredAndEvictedChunksAreCountedAndOnlyAnEvictionWarns)
   EXPECT_EQ(Value(health, "chunks_evicted"), "4");
 }
 
+// A rejected chunk is gone for good, like an evicted one.
+TEST(UploadHealth, AChunkThePlatformRejectedIsAWarningThatCountsIt) {
+  c3d::Stats stats;
+  stats.chunks_discarded = 3;
+  const UploadHealth health = DescribeUploads(stats, 240.0);
+  EXPECT_EQ(health.level, DiagnosticStatus::WARN);
+  EXPECT_TRUE(Has(health.message, "3 chunk(s) rejected by the platform and discarded"))
+      << health.message;
+  EXPECT_EQ(health.report, "");
+  EXPECT_EQ(Value(health, "chunks_discarded"), "3");
+}
+
 TEST(UploadSeries, EveryCounterCoreKeepsHasItsOwnSeries) {
   c3d::Stats stats;
   stats.auth_rejections = 3;
@@ -124,6 +136,7 @@ TEST(UploadSeries, EveryCounterCoreKeepsHasItsOwnSeries) {
   stats.spool_write_failures = 8;
   stats.thread_exceptions = 9;
   stats.camera_access_units_dropped = 10;
+  stats.chunks_discarded = 11;
   std::map<std::string, double> series;
   for (const auto& [name, value] : cognitive3d_ros::UploadSeries(stats)) {
     EXPECT_TRUE(series.emplace(name, value).second) << name << " twice";
@@ -135,6 +148,7 @@ TEST(UploadSeries, EveryCounterCoreKeepsHasItsOwnSeries) {
       {"c3d.chunks_evicted", 6.0},
       {"c3d.serialization_failures", 7.0},      {"c3d.spool_write_failures", 8.0},
       {"c3d.thread_exceptions", 9.0},          {"c3d.camera_access_units_dropped", 10.0},
+      {"c3d.chunks_discarded", 11.0},
   };
   EXPECT_EQ(series, expected);
 }

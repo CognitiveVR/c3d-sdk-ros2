@@ -168,6 +168,7 @@ though it has sensors.
 | The camera encoder cannot run, because `ffmpeg` is not installed or refuses the arguments a camera's settings give it | doctor's `camera encoder` check, or the configure refusal naming `ffmpeg` | [How a camera is encoded](camera-and-lidar.md#how-a-camera-is-encoded) |
 | The encoder is saturated, or was restarted, and frames were dropped. `dropped_backlog` also counts a burst of frames held for their transform, up to 8 released at once when tf catches up, overflowing the encoder's 4-frame queue | `c3d.camera.<name>.dropped_backlog`, `encoder_restarts` | [CPU](camera-and-lidar.md#cpu) |
 | The spool evicted them at its cap, which evicts camera and lidar data first | `c3d.chunks_evicted`; a `cognitive3d: uploads` warning | [The size cap](sessions.md#the-size-cap) |
+| The platform rejected the chunks, as it does a payload format it no longer takes | `c3d.chunks_discarded`; a `cognitive3d: uploads` warning; the log line `upload rejected with status 400`, which carries the platform's reason | Install the current SDK release: [Outages and refused keys](sessions.md#outages-and-refused-keys) |
 
 ## A point cloud is on its side, or a scan is drawn rotated
 

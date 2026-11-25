@@ -33,6 +33,8 @@ marks as provisional may change in a minor release, and its entry here says how 
 - Per camera and lidar, `backward_stamps` counts records whose time is earlier than the one
   before; they are stored as they came, and a chunk's or block's `startMs` and `endMs` are its
   least and greatest time.
+- `c3d.chunks_discarded` counts the chunks the platform rejected with 400, 413, 415 or 422, which
+  are deleted, and `~/diagnostics` warns once any has been.
 - Per camera, `c3d.camera.<name>.rejected_too_large` counts chunks the platform refused with a 413
   as larger than its 10 MiB, which are deleted; the first in a session is logged.
 - `lidar.<name>.pointcloud.max_points` is bounded so one cloud encodes to at most 8 MiB, about

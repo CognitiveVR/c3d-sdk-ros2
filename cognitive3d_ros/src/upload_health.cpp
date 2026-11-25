@@ -68,6 +68,11 @@ UploadHealth DescribeUploads(const c3d::Stats& stats, double retry_max_s) {
                    "never to be uploaded");
     health.report += " EVICTED=" + std::to_string(stats.chunks_evicted);
   }
+  if (stats.chunks_discarded > 0) {
+    raise(DiagnosticStatus::WARN);
+    said.push_back(std::to_string(stats.chunks_discarded) + " chunk(s) rejected by the platform "
+                   "and discarded, never to be stored");
+  }
   if (said.empty()) said.push_back("uploading");
   for (std::size_t i = 0; i < said.size(); ++i) health.message += (i ? "; " : "") + said[i];
 
@@ -98,6 +103,7 @@ std::vector<std::pair<std::string, double>> UploadSeries(const c3d::Stats& stats
       {"c3d.chunks_deferred", static_cast<double>(stats.chunks_deferred)},
       {"c3d.upload_deferred_streams", static_cast<double>(stats.deferred_streams.size())},
       {"c3d.chunks_evicted", static_cast<double>(stats.chunks_evicted)},
+      {"c3d.chunks_discarded", static_cast<double>(stats.chunks_discarded)},
       {"c3d.serialization_failures", static_cast<double>(stats.serialization_failures)},
       {"c3d.spool_write_failures", static_cast<double>(stats.spool_write_failures)},
       {"c3d.thread_exceptions", static_cast<double>(stats.thread_exceptions)},
