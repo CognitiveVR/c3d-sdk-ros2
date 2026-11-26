@@ -122,14 +122,6 @@ std::string ValidateCameraConfig(const CameraConfig& camera) {
     return where + "hfov_degrees and vfov_degrees are set together or not at all; only " +
            (camera.hfov_degrees == 0.0 ? "vfov_degrees" : "hfov_degrees") + " is set";
   }
-  // Sized as a 16:9 frame, the widest common shape and so the fewest pixels at that width: what
-  // fails here fails for every camera. The node sizes the real frame again at its encoder's start.
-  const int width = camera.max_width_px & ~1;
-  const int height = (camera.max_width_px * 9 / 16) & ~1;
-  if (width >= 2 && height >= 2 && CameraChunkSeconds(camera, width, height) == 0.0) {
-    return where + "max_width_px is " + std::to_string(camera.max_width_px) +
-           ", and sized as a 16:9 frame " + CameraChunkTooLarge(camera, width, height);
-  }
   return ValidateQosOverride(camera.qos, "camera." + camera.name);
 }
 

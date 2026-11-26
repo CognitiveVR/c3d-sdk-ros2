@@ -92,6 +92,10 @@ constexpr int kReplayWindowFrames = 28;
 bool ReplayNeedsBitrateCap(const CameraConfig& camera, int width, int height);
 // The default cap then: kCameraChunkTargetBytes over a chunk of `chunk_s`, in kilobits per second.
 int DefaultCameraBitrateKbps(double chunk_s);
+// That cap's buffer, in kilobits: 1.5 MiB, the most a chunk of any length passes
+// kCameraChunkTargetBytes by, which keeps it under c3d::kMaxVideoChunkBytes. A buffer in proportion
+// to the rate does not: at one second of it, a 1-second chunk reaches twice its target.
+constexpr int kDefaultCameraBufferKbps = 12582;
 
 struct LidarConfig {
   std::string name;

@@ -59,9 +59,9 @@ quiet gap. A camera whose 3-second chunk the node estimates at more than
 estimate fits, chosen when its encoder starts from the size of the frame it starts on and logged
 once. The estimate is `doctor`'s, from the frame size, `crf` and `rate_hz`, capped by
 `max_bitrate_kbps` when that is set; `preset` is not in it. A camera at which not even a 1-second
-chunk fits is refused: with `max_width_px` set, configure refuses it, sizing the frame as a 16:9
-one that wide; with `max_width_px: 0`, the node refuses it at its first frame, logs it once and
-counts its frames in `refused`. Either way the message names `max_width_px`, `crf` and
+chunk fits is refused at its first frame: the node logs it once and counts its frames in
+`refused`. Configure cannot refuse it sooner, because `max_width_px` is a ceiling and a narrower
+camera is never scaled up to it. The message names `max_width_px`, `crf` and
 `max_bitrate_kbps`, the parameters that make the chunks smaller. Under `sim_time_on_wire`, 3 seconds of real time is 3 x the
 real-time factor seconds on the wire. `rate_hz` caps the frames fed to the encoder, as it caps
 every sensor's records: it does not set a chunk's length, so a camera that delivers 15 frames a
@@ -84,8 +84,8 @@ a larger one is dropped and counted in `c3d.camera_access_units_dropped`.
 
 Where 28 frames of the camera's size, as yuv420p, do not fit in `replay_max_mb`, a restart could
 lose the frames that memory cannot keep, so the encoder caps its bitrate by default at 6 MiB over
-the chunk's length, 16,777 kilobits per second for a 3-second chunk, with a buffer of one second
-of that rate, so a chunk reaches about 8 MiB at most. At the default 192 MiB that is
+the chunk's length, 16,777 kilobits per second for a 3-second chunk, with a buffer of 1.5 MiB
+whatever the chunk's length, so a chunk reaches about 7.5 MiB at most. At the default 192 MiB that is
 a frame of more than about 4.8 million pixels, so a 4K camera recorded with `max_width_px: 0` is
 capped and a 1440p one is not.
 `max_bitrate_kbps` always wins over the default. A camera whose chunks reach 8 MiB 3 times in a
@@ -444,8 +444,6 @@ Configure refuses, naming the parameter:
 - a `camera.<name>.format` or `camera.<name>.jpeg_quality`, or any of `camera_flush_s`,
   `camera_flush_bytes`, `lidar_flush_s` and `lidar_flush_bytes`: the refusal names the key and says
   it was removed
-- a camera with `max_width_px` set at which not even a 1-second chunk is estimated under 6 MiB; see
-  [How a camera is encoded](#how-a-camera-is-encoded)
 - a camera configured while the binary named by `ffmpeg_path` cannot run, lists no `libx264`
   encoder, or cannot encode two frames with a camera's `preset`, `crf` and `max_bitrate_kbps`: the
   refusal names the binary, the camera and what `ffmpeg` said, and says `sudo apt install ffmpeg`

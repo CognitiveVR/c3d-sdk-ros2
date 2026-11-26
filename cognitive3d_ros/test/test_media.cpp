@@ -508,29 +508,24 @@ TEST(CameraChunkSeconds, TheBitrateIsCappedByDefaultOnlyWhereTheReplayOverflows)
   EXPECT_TRUE(ReplayNeedsBitrateCap(camera, 1920, 1080));
   EXPECT_EQ(DefaultCameraBitrateKbps(3.0), 16777);
   EXPECT_EQ(DefaultCameraBitrateKbps(1.0), 50331);
+  // The rate over a chunk plus the whole buffer is the most a capped chunk holds.
+  for (const double chunk_s : {1.0, 1.5, 3.0}) {
+    const double most_bytes =
+        (DefaultCameraBitrateKbps(chunk_s) * chunk_s + kDefaultCameraBufferKbps) * 1000.0 / 8.0;
+    EXPECT_LT(most_bytes, 0.95 * static_cast<double>(c3d::kMaxVideoChunkBytes)) << chunk_s;
+  }
 }
 
-// With max_width_px set, configure sizes the camera as a 16:9 frame that wide and refuses it when
-// not even a 1-second chunk fits, naming the parameters that change that. Unset, the size is
-// known only at the first frame.
-TEST(MediaConfig, ACameraWhoseWidthFitsNoChunkIsRefusedNamingTheLevers) {
+// max_width_px is a ceiling: a narrower camera is never scaled up to it. So configure refuses no
+// camera by the frame that ceiling would allow; the size is known, and refused, at the first frame.
+TEST(MediaConfig, AWidthCeilingAtWhichNoChunkFitsIsNotRefusedAtConfigure) {
   CameraConfig camera;
   camera.name = "front";
   camera.topic = "/image";
   camera.rate_hz = 30.0;
   camera.crf = 24;
   camera.max_width_px = 3840;
-  const std::string refusal = ValidateCameraConfig(camera);
-  EXPECT_EQ(refusal.rfind("camera.front.max_width_px is 3840", 0), 0u) << refusal;
-  for (const char* lever : {"max_width_px", "crf", "max_bitrate_kbps", "10 MiB"}) {
-    EXPECT_NE(refusal.find(lever), std::string::npos) << lever << ": " << refusal;
-  }
-  camera.max_width_px = 2560;
-  EXPECT_EQ(ValidateCameraConfig(camera), "");
-  camera.max_width_px = 0;
-  EXPECT_EQ(ValidateCameraConfig(camera), "");
-  camera.max_width_px = 3840;
-  camera.max_bitrate_kbps = 20000;
+  EXPECT_EQ(CameraChunkSeconds(camera, 3840, 2160), 0.0);
   EXPECT_EQ(ValidateCameraConfig(camera), "");
 }
 
@@ -1562,8 +1557,8 @@ TEST_F(MediaTest, AFrameSizeTheReplayStoreCannotHoldStartsWithABitrateCap) {
   auto capped = OnFakes(config);
   ASSERT_TRUE(FrameAt(*capped, 0.0, 640, 480));
   EXPECT_EQ(fakes_.last().settings.max_bitrate_kbps, DefaultCameraBitrateKbps(3.0));
-  EXPECT_EQ(fakes_.last().settings.bufsize_kbps, DefaultCameraBitrateKbps(3.0))
-      << "the default cap's buffer is not one second of it";
+  EXPECT_EQ(fakes_.last().settings.bufsize_kbps, kDefaultCameraBufferKbps)
+      << "the default cap's buffer follows the rate";
   capped->StopEncoder();
 
   config.max_bitrate_kbps = 800;
@@ -1598,7 +1593,7 @@ TEST_F(MediaTest, RepeatedSizeRestartsHalveTheChunkThenCapTheBitrate) {
   }
   EXPECT_EQ(chunks, (std::vector<double>{3, 3, 3, 1.5, 1.5, 1.5, 1, 1, 1, 1, 1}));
   EXPECT_EQ(bitrates, (std::vector<int>{0, 0, 0, 0, 0, 0, 0, 0, 0, 50331, 50331}));
-  EXPECT_EQ(fakes_.last().settings.bufsize_kbps, 50331);
+  EXPECT_EQ(fakes_.last().settings.bufsize_kbps, kDefaultCameraBufferKbps);
   EXPECT_EQ(capture->stats().size_restarts, 10u);
   std::size_t said = 0;
   for (const std::string& warning : warnings_) {
@@ -1633,6 +1628,23 @@ TEST_F(MediaTest, ACameraWhoseFrameFitsNoChunkIsRefusedAtItsFirstFrame) {
   EXPECT_NE(warnings_[0].find("max_width_px"), std::string::npos) << warnings_[0];
   ASSERT_TRUE(FrameAt(*capture, 0.2, 1920, 1080)) << "a smaller frame is still refused";
   EXPECT_EQ(fakes_.built(), 1u);
+}
+
+// Under a width ceiling the frame does not reach, the frame's own size decides: a 1080p camera
+// below a 3840 ceiling records, and a frame that fills the ceiling is refused as above.
+TEST_F(MediaTest, AWidthCeilingRefusesOnlyTheFrameAtWhichNoChunkFits) {
+  CameraConfig config = Front();
+  config.rate_hz = 30.0;
+  config.crf = 24;
+  config.max_width_px = 3840;
+  auto narrower = OnFakes(config);
+  ASSERT_TRUE(FrameAt(*narrower, 0.0, 1920, 1080));
+  EXPECT_DOUBLE_EQ(fakes_.last().settings.chunk_s, 3.0);
+  narrower->StopEncoder();
+
+  auto filling = OnFakes(config);
+  EXPECT_FALSE(FrameAt(*filling, 1.0, 3840, 2160));
+  EXPECT_EQ(filling->stats().refused, 1u);
 }
 
 // The quiet-gap row and the backoff run on the steady clock, as the encoder's chunks do. Under

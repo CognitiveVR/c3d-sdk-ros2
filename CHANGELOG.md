@@ -23,9 +23,9 @@ marks as provisional may change in a minor release, and its entry here says how 
   `size_restarts`, with `dropped_replay` for any it could not keep. `camera.<name>.replay_max_mb`,
   default 192, bounds the memory that keeps them.
 - A camera whose 3 second chunk is estimated over 6 MiB gets chunks of 1 to 3 seconds, chosen when
-  its encoder starts and logged once. One at which not even 1 second fits is refused: by
-  configure with `max_width_px` set, at its first frame otherwise, counted in `refused`. `doctor`'s
-  `camera/<name>` check prints the chunk length and fails such a camera.
+  its encoder starts and logged once. One at which not even 1 second fits is refused at its first
+  frame, counted in `refused`. `doctor`'s `camera/<name>` check prints the chunk length and fails
+  such a camera.
 - Without `max_bitrate_kbps`, a camera whose replay does not fit in `replay_max_mb`, 4K at the
   default, runs with a bitrate cap of 6 MiB over its chunk length. A camera whose chunks reach
   8 MiB 3 times in a session gets chunks half as long, down to 1 second, then that cap.
