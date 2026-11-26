@@ -80,7 +80,7 @@ double CameraBytesPerSecond(const CameraConfig& camera, int width, int height);
 // kCameraChunkTargetBytes. 0 when not even kMinCameraChunkSeconds does.
 double CameraChunkSeconds(const CameraConfig& camera, int width, int height);
 // Why not even kMinCameraChunkSeconds fits at this frame size, naming the parameters that change
-// it, for configure, the node and doctor alike.
+// it, for the node and doctor alike.
 std::string CameraChunkTooLarge(const CameraConfig& camera, int width, int height);
 
 // The frames a size restart may have to encode again, at most: the encoder's queue, pipe and
