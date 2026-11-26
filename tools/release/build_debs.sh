@@ -18,6 +18,8 @@
 # pinned to the exact version of the deb built for it, so apt never pairs debs of two releases.
 # A package.xml cannot say this, because bloom writes `version_eq` as the bare version, which no
 # deb versioned `<version>-0<codename>` satisfies; tools/release/pin_control.py writes it instead.
+# It also writes Recommends, which package.xml has no tag for: a `<deb_recommends>` in a
+# manifest's `<export>` names a system package the deb recommends.
 #
 # The packages are built from a full checkout: cognitive3d_ros builds core/ as a CMake
 # subproject and installs files from tools/ and the repository root, so a package directory on
@@ -94,7 +96,7 @@ rosdep install --from-paths "$WORK" --ignore-src -y --rosdistro "$DISTRO" \
 
 # Dependency order, from the manifests: each package's deb must be installed before a package
 # that depends on it is generated. Each line also names the run dependencies the package has on
-# this repository's other packages, or `-` for none.
+# this repository's other packages, then the packages its deb recommends, each `-` for none.
 ORDER="$(python3 -c '
 import os, sys
 from catkin_pkg.topological_order import topological_order
@@ -104,7 +106,8 @@ for path, package in ordered:
     package.evaluate_conditions(os.environ)
     run = package.exec_depends + package.build_export_depends + package.buildtool_export_depends
     deps = sorted({d.name for d in run if d.name in ours and d.evaluated_condition is not False})
-    print(path, package.name, ",".join(deps) or "-")
+    recommends = [e.content.strip() for e in package.exports if e.tagname == "deb_recommends"]
+    print(path, package.name, ",".join(deps) or "-", ",".join(recommends) or "-")
 ' "$WORK")"
 echo "$ORDER"
 
@@ -112,9 +115,13 @@ deb_name_of() { printf 'ros-%s-%s' "$DISTRO" "$(printf '%s' "$1" | tr '_' '-')";
 
 built=()
 declare -A built_version=()
-while read -r path name deps; do
+while read -r path name deps recommends; do
   step "$name"
   pins=()
+  if [ "$recommends" != - ]; then
+    IFS=, read -r -a recommended <<< "$recommends"
+    for system_package in "${recommended[@]}"; do pins+=(--recommends "$system_package"); done
+  fi
   if [ "$deps" != - ]; then
     IFS=, read -r -a dep_names <<< "$deps"
     for dep in "${dep_names[@]}"; do
@@ -148,5 +155,7 @@ for deb in "${built[@]}"; do
   cp "$deb" /out/
   echo "$(basename "$deb")  $(du -k "$deb" | cut -f1) KB"
   dpkg-deb -f "$deb" Depends | tr ',' '\n' | sed 's/^ */    /'
+  recommends="$(dpkg-deb -f "$deb" Recommends)"
+  [ -z "$recommends" ] || echo "  recommends: $recommends"
 done
 [ -z "${OUT_OWNER:-}" ] || chown "$OUT_OWNER" /out/*.deb

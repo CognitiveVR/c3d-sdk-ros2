@@ -1,5 +1,5 @@
 // A camera feed pushed through a real CurlTransport into an uplink slower than the
-// feed. 7.5 Hz of ~98 KB JPEGs is ~735 KB/s, and if uploading delays cutting, a link
+// feed. 7.5 Hz of ~98 KB frames is ~735 KB/s, and if uploading delays cutting, a link
 // below that makes every camera part bigger than the one before it, until a part can
 // no longer be sent inside the request timeout and the spool grows without bound.
 // The bounds a part is cut on have to hold whatever the uploader is doing.
@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -103,16 +104,18 @@ class MemorySpool : public ISpool {
 };
 
 // Records the size of every part the session spools, which is where a part's size
-// is decided -- the uplink only decides how long it takes to leave.
+// is decided -- the uplink only decides how long it takes to leave -- and when.
 class RecordingSpool : public ISpool {
  public:
-  explicit RecordingSpool(std::shared_ptr<ISpool> inner) : inner_(std::move(inner)) {}
+  RecordingSpool(std::shared_ptr<ISpool> inner, Stream stream)
+      : inner_(std::move(inner)), stream_(stream) {}
 
   bool Write(const Chunk& c) override {
     const bool ok = inner_->Write(c);
-    if (ok && c.stream == Stream::kCamera) {
+    if (ok && c.stream == stream_) {
       std::lock_guard<std::mutex> lock(mu_);
-      camera_part_bytes_.push_back(c.body.size());
+      part_bytes_.push_back(c.body.size());
+      part_times_.push_back(std::chrono::steady_clock::now());
     }
     return ok;
   }
@@ -127,28 +130,34 @@ class RecordingSpool : public ISpool {
   std::vector<SessionMarker> OpenMarkers() const override { return inner_->OpenMarkers(); }
   void CloseMarker(const std::string& id) override { inner_->CloseMarker(id); }
 
-  std::vector<std::size_t> camera_part_bytes() const {
+  std::vector<std::size_t> part_bytes() const {
     std::lock_guard<std::mutex> lock(mu_);
-    return camera_part_bytes_;
+    return part_bytes_;
+  }
+  std::vector<std::chrono::steady_clock::time_point> part_times() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return part_times_;
   }
 
  private:
   std::shared_ptr<ISpool> inner_;
+  const Stream stream_;
   mutable std::mutex mu_;
-  std::vector<std::size_t> camera_part_bytes_;
+  std::vector<std::size_t> part_bytes_;
+  std::vector<std::chrono::steady_clock::time_point> part_times_;
 };
 
 struct Scale {
   double camera_hz;
   std::size_t frame_bytes;
-  double flush_s;
+  double chunk_s;
   double uplink_bytes_per_s;
   double run_s;
 };
 
 // The suite runs a compressed version of a robot's numbers: the same feed and a
-// uplink at a third of it, with 0.5 s parts so growth shows inside a few seconds.
-// C3D_STALL_REPRO_ROBOT=1 runs the full-scale 2 s parts for a minute.
+// uplink at a third of it, with 0.5 s chunks so growth shows inside a few seconds.
+// C3D_STALL_REPRO_ROBOT=1 runs the full-scale 2 s chunks for a minute.
 Scale ChosenScale() {
   const char* robot = std::getenv("C3D_STALL_REPRO_ROBOT");
   if (robot != nullptr && std::string(robot) == "1") return Scale{7.5, 98 * 1024, 2.0, 400e3, 60.0};
@@ -162,16 +171,29 @@ std::string Incompressible(std::size_t n, unsigned seed) {
   return s;
 }
 
+// The camera's encoder makes a keyframe every this many frames, so a chunk is never shorter
+// than chunk_s.
+std::uint32_t FramesPerChunk(const Scale& scale) {
+  return static_cast<std::uint32_t>(std::ceil(scale.chunk_s * scale.camera_hz));
+}
+
 struct Outcome {
   std::vector<std::size_t> parts;
   std::size_t largest = 0;
+  // The longest any part waited between being closed and being spooled, counting a part
+  // still unspooled when the run ended as waiting until then.
+  double longest_wait_s = 0.0;
   Stats stats;
 };
 
-// Feeds `scale`'s camera into a session whose uplink is `scale`'s, for its run
-// time, and reports every camera part the session cut.
-Outcome FeedThroughASlowUplink(const Scale& scale, double flush_s, std::uint64_t flush_bytes,
-                               const std::string& label) {
+std::uint64_t PartsClosed(const Stats& stats, Stream stream) {
+  return stream == Stream::kCamera ? stats.camera_chunks : stats.lidar_blocks;
+}
+
+// Feeds `scale`'s sensor into a session whose uplink is `scale`'s, for its run time, and
+// reports every part of `stream` the session spooled: a camera's access units of frame_bytes
+// with a keyframe every FramesPerChunk, or a depth sensor's clouds of frame_bytes.
+Outcome FeedThroughASlowUplink(const Scale& scale, Stream stream, const std::string& label) {
   Outcome outcome;
   const fs::path dir = fs::temp_directory_path() /
                        ("c3d_stall_" + std::to_string(::getpid()));
@@ -190,12 +212,10 @@ Outcome FeedThroughASlowUplink(const Scale& scale, double flush_s, std::uint64_t
   cfg.protocol = "http";
   cfg.gateway = server.host();
   cfg.auto_send_interval_s = 3600.0;
-  cfg.camera_flush_s = flush_s;
-  cfg.camera_flush_bytes = flush_bytes;
   cfg.retry_min_s = 0.2;
   cfg.retry_max_s = 0.2;
 
-  auto spool = std::make_shared<RecordingSpool>(std::make_shared<MemorySpool>());
+  auto spool = std::make_shared<RecordingSpool>(std::make_shared<MemorySpool>(), stream);
   auto transport = std::make_shared<CurlTransport>(UploadTimeouts(cfg));
   auto session = Session::Create(cfg, transport, spool, std::make_shared<NullLogger>());
   if (!session || !session->Begin()) {
@@ -204,37 +224,71 @@ Outcome FeedThroughASlowUplink(const Scale& scale, double flush_s, std::uint64_t
   }
 
   const std::string frame = Incompressible(scale.frame_bytes, 7);
+  VideoChunkContext context;
+  context.frame_id = "camera";
+  context.width = 640;
+  context.height = 480;
+  context.nominal_fps = static_cast<float>(scale.camera_hz);
+  EncodedPointCloud cloud;
+  cloud.ok = true;
+  cloud.point_count = 1000;
+  cloud.data = frame;
+  const std::uint32_t frames_per_chunk = FramesPerChunk(scale);
   const auto period = std::chrono::duration<double>(1.0 / scale.camera_hz);
   const auto started = std::chrono::steady_clock::now();
   auto next = started;
   std::uint32_t seq = 0;
+  // When each part closed: inside the Record* call that closed it.
+  std::vector<std::chrono::steady_clock::time_point> closed_at;
   while (std::chrono::steady_clock::now() - started < std::chrono::duration<double>(scale.run_s)) {
     const auto wall_ms = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch())
             .count());
-    session->RecordCameraFrame("front", wall_ms, seq++, "camera", Pose{}, "jpeg", 640, 480,
-                               frame);
+    const std::uint64_t closed_before = PartsClosed(session->stats(), stream);
+    if (stream == Stream::kCamera) {
+      SensorEntry entry;
+      entry.time_ms = wall_ms;
+      entry.seq = seq;
+      session->RecordCameraAccessUnit("front", entry, context, frame,
+                                      seq % frames_per_chunk == 0);
+    } else {
+      session->RecordPointCloud("depth", wall_ms, seq, "depth", Pose{}, cloud);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    for (std::uint64_t n = PartsClosed(session->stats(), stream); n > closed_before; --n) {
+      closed_at.push_back(now);
+    }
+    ++seq;
     next += std::chrono::duration_cast<std::chrono::steady_clock::duration>(period);
     std::this_thread::sleep_until(next);
   }
 
-  outcome.parts = spool->camera_part_bytes();
+  const auto ended = std::chrono::steady_clock::now();
+  outcome.parts = spool->part_bytes();
   outcome.stats = session->stats();
   for (std::size_t bytes : outcome.parts) outcome.largest = std::max(outcome.largest, bytes);
+  // Parts are spooled in the order they closed, so the i-th spooled is the i-th closed.
+  const auto spooled_at = spool->part_times();
+  for (std::size_t i = 0; i < closed_at.size(); ++i) {
+    const auto until = i < spooled_at.size() ? spooled_at[i] : ended;
+    outcome.longest_wait_s = std::max(
+        outcome.longest_wait_s, std::chrono::duration<double>(until - closed_at[i]).count());
+  }
 
   const double feed_bytes_per_s = scale.camera_hz * static_cast<double>(scale.frame_bytes);
   std::cout << "[stall repro: " << label << "] feed "
             << static_cast<int>(feed_bytes_per_s / 1000) << " kB/s into a "
             << static_cast<int>(scale.uplink_bytes_per_s / 1000) << " kB/s uplink, "
-            << scale.run_s << " s\n[stall repro: " << label
-            << "] camera part sizes (kB), in the order they were cut:";
+            << scale.run_s << " s\n[stall repro: " << label << "] " << StreamName(stream)
+            << " part sizes (kB), in the order they were cut:";
   for (std::size_t bytes : outcome.parts) std::cout << ' ' << bytes / 1000;
   std::cout << "\n[stall repro: " << label << "] parts=" << outcome.parts.size()
             << " largest=" << outcome.largest / 1000
             << " kB uploaded=" << outcome.stats.chunks_uploaded
             << " spooled=" << outcome.stats.spool_count
-            << " upload_failures=" << outcome.stats.upload_failures << "\n";
+            << " upload_failures=" << outcome.stats.upload_failures
+            << " longest_wait_s=" << outcome.longest_wait_s << "\n";
 
   server.SetBytesPerSecond(0.0);  // let the closing drain run at loopback speed
   session.reset();
@@ -247,40 +301,40 @@ Outcome FeedThroughASlowUplink(const Scale& scale, double flush_s, std::uint64_t
 
 TEST(UploadStall, CameraPartsStayWithinTheirTimeBoundWhileAnUploadIsInFlight) {
   const Scale scale = ChosenScale();
-  const Outcome outcome =
-      FeedThroughASlowUplink(scale, scale.flush_s, 32ull * 1024 * 1024, "time bound");
+  const Outcome outcome = FeedThroughASlowUplink(scale, Stream::kCamera, "time bound");
 
-  // A part holds at most flush_s of frames, plus the worker tick it waits to be
-  // cut on and the one frame that crosses the bound. Anything beyond that is
-  // frames the part collected because nobody was cutting.
-  const double feed_bytes_per_s = scale.camera_hz * static_cast<double>(scale.frame_bytes);
+  // A part holds one chunk: the frames from one keyframe to the next. Anything
+  // beyond that is frames the part collected because nobody was cutting.
   const double bound =
-      (scale.flush_s + Config{}.worker_tick_s + 1.0 / scale.camera_hz) * feed_bytes_per_s +
-      4096.0;
-  // With a part per flush_s the run cuts about run_s / flush_s of them. One thread
-  // cutting and uploading would cut one per upload instead: far fewer, far larger.
-  EXPECT_GE(outcome.parts.size(), static_cast<std::size_t>(0.8 * scale.run_s / scale.flush_s))
-      << "parts were cut on the uploader's schedule, not the camera_flush_s one";
+      FramesPerChunk(scale) * static_cast<double>(scale.frame_bytes) + 4096.0;
+  // With a part per chunk the run spools about run_s / chunk of them.
+  const double chunk_s = FramesPerChunk(scale) / scale.camera_hz;
+  EXPECT_GE(outcome.parts.size(), static_cast<std::size_t>(0.8 * scale.run_s / chunk_s))
+      << "parts were not closed on their keyframes";
   EXPECT_LE(static_cast<double>(outcome.largest), bound)
-      << "a camera part outgrew camera_flush_s while an upload was in flight";
+      << "a camera part outgrew its keyframe interval while an upload was in flight";
+  // A chunk closes on the recording thread whatever the worker is doing, so its size
+  // cannot show a worker stuck behind an upload; how long the chunk then waits for the
+  // spool does. The worker spools it on its next tick, and one thread spooling and
+  // uploading would leave it waiting for a whole upload, seconds on this uplink.
+  EXPECT_LT(outcome.longest_wait_s, 1.0)
+      << "a closed chunk waited " << outcome.longest_wait_s << " s to reach the spool";
   EXPECT_EQ(outcome.stats.upload_failures, 0u)
       << "a slow-but-moving upload failed; the transport gave up on a link that works";
 }
 
-TEST(UploadStall, CameraPartsStayWithinTheirByteBoundWhileAnUploadIsInFlight) {
+TEST(UploadStall, CloudObjectsStayWithinTheirByteBoundWhileAnUploadIsInFlight) {
   Scale scale = ChosenScale();
   scale.run_s = std::min(scale.run_s, 6.0);
-  const std::uint64_t flush_bytes = 300 * 1000;
-  const Outcome outcome = FeedThroughASlowUplink(scale, 3600.0, flush_bytes, "byte bound");
+  // Clouds large enough for several objects to close within the run.
+  scale.frame_bytes = 300 * 1000;
+  const Outcome outcome = FeedThroughASlowUplink(scale, Stream::kLidar, "byte bound");
 
-  // The part is cut on the first tick at or past the bound, so it may carry the
-  // frame that crossed it and whatever else arrived within that tick.
-  const double feed_bytes_per_s = scale.camera_hz * static_cast<double>(scale.frame_bytes);
-  const double bound = static_cast<double>(flush_bytes) + static_cast<double>(scale.frame_bytes) +
-                       Config{}.worker_tick_s * feed_bytes_per_s + 4096.0;
+  // An object closes before the cloud that would take it past the cap joins it.
+  const double bound = static_cast<double>(kCloudObjectMaxBytes) + 4096.0;
   ASSERT_GE(outcome.parts.size(), 3u);
   EXPECT_LE(static_cast<double>(outcome.largest), bound)
-      << "a camera part outgrew camera_flush_bytes while an upload was in flight";
+      << "a cloud object outgrew kCloudObjectMaxBytes while an upload was in flight";
 }
 
 // Stall detection legitimately lets one upload run for a minute and the ceiling

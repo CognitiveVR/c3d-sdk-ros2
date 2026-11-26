@@ -191,75 +191,203 @@ text in `session_properties` would be typed; `mount_yaw_radians` is always a dou
 | `c3d.ros.sensor.<name>.element_count` | `binary_array` | The number of elements |
 | `c3d.ros.sensor.<name>.meaning_0`, `.meaning_1` | `binary_array` | What a `0` and a `1` mean, when set |
 
-## Camera frames
+## Camera chunks
 
-A camera frame record is one picture and the pose it was taken from:
+A camera record is one chunk: one camera's frames for about 3 seconds of real time, or 1 to 3
+seconds for a camera whose 3-second chunks would be too large, encoded as H.264
+and stored as one object. A chunk is one closed group of pictures, so it decodes on its own, and its
+first frame is always a keyframe. The record is a `CameraPayload`:
 
 | field | type | what |
 | -- | -- | -- |
+| `userId`, `sessionId`, `sceneId`, `sceneVersion`, `formatVersion`, `sessionStartMs`, `sdkVersion` | | The session the chunk belongs to, the scene version number, `"2.0"` and the SDK version |
 | `cameraId` | text | The camera's name from `cameras` |
-| `time` | UInt64 | When the frame was taken, in epoch milliseconds, by the clock rule |
-| `seq` | UInt32 | The camera's frame counter: 0 for the first frame stored in the session, then 1, 2 and so on |
-| `frameId` | text | The tf frame the pose is for |
-| `pose` | 7 x Float32 | `px py pz qx qy qz qw`; see [Reading a sensor pose](#reading-a-sensor-pose) |
-| `format` | text | `jpeg` |
+| `seq` | UInt32 | The camera's chunk counter: 0 for the first chunk stored in the session, then 1, 2 and so on |
+| `startMs`, `endMs` | UInt64 | The least and the greatest of the frames' `time`, in epoch milliseconds |
+| `codec` | text | `h264` |
+| `codecParams` | bytes | The stream's SPS and PPS as an avcC record |
 | `width`, `height` | UInt16 | The stored image's size in pixels, after any scaling |
-| `data` | bytes | The JPEG image |
-| `hfovDegrees`, `vfovDegrees` | Float32 | The camera's horizontal and vertical field of view when the frame was taken, as full angles in degrees, both above 0 and below 180. Both are 0 when it was not recorded |
+| `nominalFps` | Float32 | The camera's `rate_hz`: the cap on what is fed to the encoder, not a measurement |
+| `frameId` | text | The tf frame the poses are for; the same for every frame in the chunk |
+| `hfovDegrees`, `vfovDegrees` | Float32 | The camera's horizontal and vertical field of view at the chunk's first frame, as full angles in degrees, both above 0 and below 180. Both are 0 when it was not recorded |
+| `encoderSettings` | text | What the encoder ran with, for diagnosis, such as `x264 ultrafast crf=28 threads=1 gop=3s`, followed by `maxrate=800k` when `max_bitrate_kbps` caps the bitrate at 800 |
+| `frames` | list of `FrameMeta` | One per frame, in decode order |
+| `data` | bytes | The H.264 stream: every frame's access unit, back to back |
 
-Camera and lidar records upload in parts, each naming its session id, device id, scene id, scene
-version number and SDK version. Parts are numbered from 1 per stream per session, and the platform
-keeps the part number with every record, so a missing or repeated part number shows a part that was
-lost or delivered twice.
-
-## Lidar scans
-
-A lidar scan record is one scan and the pose it was taken from:
+A `FrameMeta` is one frame and the pose it was taken from:
 
 | field | type | what |
 | -- | -- | -- |
-| `sensorId` | text | The lidar's name from `lidars` |
-| `time` | UInt64 | When the scan was taken, in epoch milliseconds, by the clock rule |
-| `seq` | UInt32 | The lidar's scan counter, from 0 in each session |
-| `frameId` | text | The tf frame the pose is for |
+| `time` | UInt64 | When the frame was taken, in epoch milliseconds, by the clock rule |
+| `seq` | UInt32 | The camera's frame counter: 0 for the first frame stored in the session, then 1, 2 and so on. A frame the node dropped leaves no hole in a chunk, but leaves one in `seq` |
 | `pose` | 7 x Float32 | `px py pz qx qy qz qw`; see [Reading a sensor pose](#reading-a-sensor-pose) |
+| `byteOffset`, `byteLength` | UInt32 | Where this frame's access unit lies inside `data` |
+| `keyframe` | Bool | `true` for the chunk's first frame, and for no other |
 
-followed by exactly one of a laser scan or a point cloud.
+The stream is Annex-B: each access unit starts with an access unit delimiter and its NAL units carry
+start codes. The SPS and PPS are in-band, before every IDR, so the chunk's first access unit carries
+them and a chunk is self-contained. A chunk's frames are decoded in the order of
+`frames`, the order they were taken in. `time` is usually increasing in that order but need not
+be: a stamp can step back, and the SDK keeps each frame's own time rather than sort or clamp it,
+so a reader that sorts the frames by `time` decodes them out of order.
 
-### Laser scan
+`codecParams` is the avcC record for the stream's parameter sets. It gives a reader the codec
+string, `avc1.` followed by the record's profile, constraint and level bytes as six hexadecimal
+digits (`avc1.PPCCLL`), and the profile. It is not a decoder configuration for the stored bytes:
 
-A laser scan is stored as the sensor published it, in its own units and frame:
+- **A WebCodecs reader configures the decoder with the `avc1.PPCCLL` string built from
+  `codecParams`, not with the payload's `codec` field, which says only `h264`, and with no
+  `description`.** WebCodecs reads
+  length-prefixed AVC whenever a `description` is given, and the stored units are Annex-B. A reader
+  that wants to pass the avcC record as `description` converts each access unit to length-prefixed
+  form before `decode()`.
+- **ffmpeg reads a chunk's `data` as a raw stream**, `ffmpeg -f h264 -i chunk.h264`. The stream
+  carries no timestamps: take each frame's time from its `FrameMeta`.
+
+Every frame in a chunk has the same size, and a change of image size or of the tf frame ends the
+chunk early and starts the next one. A camera whose field of view changes records a different angle
+in each chunk, not in each frame. A chunk also ends before its `data` would pass 8 MiB, and the
+next chunk starts with that frame, encoded again as a keyframe, so a chunk can be shorter than its
+time without a frame missing. A chunk's first frame is never encoded again: a keyframe over 9 MiB is
+dropped, with the camera's frames until the next keyframe, and counted in
+`c3d.camera_access_units_dropped`.
+
+The platform refuses an object larger than 10 MiB, and the SDK deletes an object the platform
+refuses, so it builds none that large: a chunk's `data` closes at 8 MiB, a scan block's codes at
+8 MiB, and `max_points` bounds one cloud to 8 MiB, which leaves room for the rest of the payload.
+
+Camera and lidar objects upload one at a time, each naming its session id, device id, scene id,
+scene version number and SDK version. The per-sensor `seq` numbers them from 0 per camera or lidar
+per session, and the platform keeps it with every object, so a missing `seq` shows an object that
+was lost. The platform keeps one object per `seq`: an object delivered twice, as a retried upload
+is, replaces the first copy, so a repeat never shows. A lidar's scan blocks and its cloud objects
+are numbered apart, and kept apart, so a lidar whose topic changes message type mid-session
+repeats a `seq` without either replacing the other.
+
+## Lidar blocks
+
+A lidar record is one block of one sensor's scans or clouds. It is a `LidarPayload`:
+
+| field | type | what |
+| -- | -- | -- |
+| `userId`, `sessionId`, `sceneId`, `sceneVersion`, `formatVersion`, `sessionStartMs`, `sdkVersion` | | As for a camera chunk |
+| `sensorId` | text | The lidar's name from `lidars` |
+| `seq` | UInt32 | The lidar's block counter, from 0 in each session |
+| `startMs`, `endMs` | UInt64 | The least and the greatest of the records' `time`, in epoch milliseconds |
+| `frameId` | text | The tf frame the poses are for; the same for every record in the block |
+
+followed by exactly one of `scans`, a `ScanBlock`, or `clouds`, a `CloudBlock`.
+
+### Laser scan blocks
+
+A `ScanBlock` holds the scans of one `LaserScan` sensor over about 3 seconds of stamps. A block
+also closes before its codes, 2 bytes a ray and twice that with intensities, would pass 8 MiB, so a
+lidar whose stamps stop advancing still makes bounded blocks. Its header is the scans' geometry,
+which every scan in the block shares; a scan with different geometry, or with a different number
+of rays, starts a new block:
 
 | field | type | what |
 | -- | -- | -- |
 | `angleMin`, `angleMax` | Float32 | The first and last ray's angle, in radians |
 | `angleIncrement` | Float32 | The angle between rays, in radians |
-| `timeIncrement` | Float32 | The time between rays, in seconds |
-| `scanTime` | Float32 | The time between scans, in seconds |
 | `rangeMin`, `rangeMax` | Float32 | The sensor's valid range, in meters |
-| `ranges` | list of Float32 | One range per ray, in meters. Infinities and NaNs are kept: they are the sensor saying there was no return |
-| `intensities` | list of Float32 | One per ray, or empty when the lidar is not configured to store them |
+| `rays` | UInt16 | The number of rays in each scan |
+| `rangeUnit` | enum | `millimetre` or `centimetre`: the size of one range code |
+| `encoding` | enum | `deltaShuffleZstd`, or `uint16` for the same codes with no transform |
+| `entries` | list of `ScanEntry` | One per scan, in the order they arrived, which is time order unless a stamp stepped back |
+| `ranges` | bytes | K x `rays` uint16 codes for K entries, laid out as `encoding` says |
+| `intensities` | bytes | Empty unless the lidar is configured to store them; otherwise the same layout as `ranges` |
 
-### Point cloud
-
-A point cloud is six fields describing one block of point data:
+A `ScanEntry` is one scan and the pose it was taken from:
 
 | field | type | what |
 | -- | -- | -- |
-| `pointCount` | UInt32 | N, the number of points in the block |
+| `time` | UInt64 | When the scan was taken, in epoch milliseconds, by the clock rule |
+| `seq` | UInt32 | The lidar's scan counter, from 0 in each session |
+| `pose` | 7 x Float32 | `px py pz qx qy qz qw`; see [Reading a sensor pose](#reading-a-sensor-pose) |
+| `timeIncrement` | Float32 | The time between rays in this scan, in seconds |
+| `scanTime` | Float32 | The time this sweep took, in seconds |
+
+The timing is per scan because drivers measure it per sweep: a spinning lidar reports a different
+`scanTime` and `timeIncrement` on almost every one.
+
+A range is stored as one uint16 code. The unit is `millimetre` when `rangeMax` is 65 meters or
+less, and `centimetre` otherwise; the block always says which. A finite range `r` in meters is
+stored as `r` divided by the unit, rounded to the nearest whole number and clipped to 0 to `0xFFFD`.
+The three values that are not ranges have codes of their own:
+
+| code | the sensor said |
+| -- | -- |
+| `0xFFFF` | `+inf`: no return |
+| `0xFFFE` | NaN |
+| `0x0000` | `-inf` |
+| `0x0001` to `0xFFFD` | the range, as `code` x the unit in meters (0.001 or 0.01) |
+
+A finite range above the top code, 65.533 meters in millimeters and 655.33 meters in centimeters,
+is clipped to it, and a negative finite range is clipped to 0, so it and a finite range that rounds
+to 0 are stored as `0x0000` and read as `-inf`. Every other finite range reads back within half a
+unit of the range the sensor published. A scan with more than 65,535 rays cannot
+be stored: it is refused and counted in the lidar's `refused`.
+
+The node writes `deltaShuffleZstd`. To read it, in this order:
+
+1. Decompress `ranges` with zstd. The result is 2 x K x `rays` bytes, K being the number of
+   `entries`: first the low byte of every value, then the high byte of every value, over the whole
+   block in scan order.
+2. Unshuffle: value `j` is `low[j] | (high[j] << 8)`, for `j` from 0 to K x `rays` - 1.
+3. Undo the delta, scan by scan: in each scan of `rays` values, the code at ray 0 is the value, and
+   the code at ray `i` is the code at ray `i - 1` plus the value, both modulo 65,536.
+
+Ray `i` of scan `k` is then at `codes[k * rays + i]`, and the scan's pose, `timeIncrement` and
+`scanTime` are in `entries[k]`. Ray `i`'s angle is `angleMin + i * angleIncrement`. With the
+`uint16` encoding there is nothing to decompress, unshuffle or undelta: `ranges` is `codes` in
+scan-major, little-endian order. `intensities`, when present, is read the same way. Each intensity
+is the sensor's value clamped to 0 to 65,535 and rounded to the nearest whole number, with a value
+that is not finite stored as 0; there is no sentinel.
+
+### Point cloud objects
+
+A `CloudBlock` holds one `PointCloud2` sensor's clouds, packed into one object that closes at 2 MiB
+of data or 5 seconds of stamps, whichever comes first. A cloud larger than 2 MiB is an object of
+its own, and its data is at most 8 MiB. The header describes every cloud in the object as written:
+
+| field | type | what |
+| -- | -- | -- |
 | `position` | text | `int16_mm` or `float32` |
 | `color` | text | `none`, `rgb565`, `rgb332` or `rgb888` |
 | `intensity` | text | `none` or `uint8` |
-| `voxelLeafMm` | UInt16 | The downsampling cube's size in millimeters; 0 when the cloud was not downsampled |
-| `zstdLevel` | UInt8 | 0 when the block is stored as it is; above 0, the block is zstd-compressed at that level |
-| `data` | bytes | The block |
+| `voxelLeafMm` | UInt16 | The downsampling cube's size in millimeters; 0 when the clouds were not downsampled |
+| `encoding` | enum | `planarDeltaShuffleZstd` or `planarZstd` |
+| `zstdLevel` | UInt8 | 0 when each cloud's block is stored as it is; above 0, each is zstd-compressed at that level |
+| `entries` | list of `CloudEntry` | One per cloud, in the order they arrived, which is time order unless a stamp stepped back |
+| `data` | bytes | The clouds' blocks, back to back |
 
-The fields describe the block as written. A cloud recorded with `color: rgb565` from a sensor with
-no color field is stored with `color` set to `none`, while the session property
-`c3d.ros.lidar.<name>.pointcloud.color` records the `rgb565` asked for.
+A `CloudEntry` is one cloud and the pose it was taken from:
 
-To read the block, decompress it when `zstdLevel` is above 0, then read these planes in this order,
-little-endian, each N values long:
+| field | type | what |
+| -- | -- | -- |
+| `time` | UInt64 | When the cloud was taken, in epoch milliseconds, by the clock rule |
+| `seq` | UInt32 | The lidar's cloud counter, from 0 in each session |
+| `pose` | 7 x Float32 | `px py pz qx qy qz qw`; see [Reading a sensor pose](#reading-a-sensor-pose) |
+| `pointCount` | UInt32 | N, the number of points in this cloud |
+| `byteOffset`, `byteLength` | UInt32 | Where this cloud's block lies inside `data` |
+
+Each block decodes on its own. The fields describe the clouds as written. A cloud recorded with
+`color: rgb565` from a sensor with no color field is stored with `color` set to `none`, while the
+session property `c3d.ros.lidar.<name>.pointcloud.color` records the `rgb565` asked for.
+
+To read a cloud, take `data[byteOffset .. byteOffset + byteLength)` and decompress it when
+`zstdLevel` is above 0. With `planarZstd` the result is the planar block, which the next paragraph
+reads. With `planarDeltaShuffleZstd`, which the node writes for `int16_mm` positions, the position
+planes are first transformed back, one plane at a time in the order X, Y, Z, each N values long:
+
+1. The plane is stored as its N low bytes followed by its N high bytes: value `i` is
+   `low[i] | (high[i] << 8)`.
+2. The value is the difference from the previous point: the plane's value `i` is the value `i - 1`
+   plus it, as int16 with wrap-around, the first against 0.
+
+The color and intensity planes follow the three position planes unchanged. What results is the
+planar block, which is read in this order, little-endian, each plane N values long:
 
 ```text
 X[N] Y[N] Z[N]   int16 each when position is "int16_mm" (millimeters: divide by 1000), float32 each when "float32"
@@ -299,15 +427,15 @@ depending on what the record's own coordinates are:
 
 | record | the rotation is | in the scene |
 | -- | -- | -- |
-| camera frame | The sensor's rotation in scene axes, by the Dynamic Object rule | A direction `v` in the frame's own ROS axes points along `rotate(q, M v)` |
-| point cloud | The sensor's rotation in scene axes, by the Dynamic Object rule | A stored point `p` is at `rotate(q, p) + position` |
-| laser scan | The rotation of the scan plane | A ray is at `rotate(q, (r cos t, r sin t, 0)) + position` |
+| camera frame, in a chunk | The sensor's rotation in scene axes, by the Dynamic Object rule | A direction `v` in the frame's own ROS axes points along `rotate(q, M v)` |
+| point cloud, in an object | The sensor's rotation in scene axes, by the Dynamic Object rule | A stored point `p` is at `rotate(q, p) + position` |
+| laser scan, in a block | The rotation of the scan plane | A ray is at `rotate(q, (r cos t, r sin t, 0)) + position` |
 
 `M` is the session's position map from [Coordinates and units](#coordinates-and-units). A camera on
 an optical frame looks along `v = (0, 0, 1)`, and one on a body frame along `v = (1, 0, 0)`. A stored
 point cloud point is already `M` applied to the sensor's own point. For a laser scan, ray `i` has
-angle `t = angleMin + i * angleIncrement` and range `r = ranges[i]`; skip a ray whose range is not
-finite or lies outside `rangeMin` to `rangeMax`. The point cloud and laser scan rules need nothing
+angle `t = angleMin + i * angleIncrement` and range `r`, the decoded range of ray `i` of that scan;
+skip a ray whose range is not finite or lies outside `rangeMin` to `rangeMax`. The point cloud and laser scan rules need nothing
 but the record; a camera's viewing direction also needs `M`, which `c3d.ros.pose_convention`
 names.
 
@@ -321,8 +449,10 @@ reader that applies the point cloud rule to a laser scan draws the scan turned o
 ## Schemas
 
 The camera and lidar records are defined by Cap'n Proto schemas, and the node uploads them as
-packed Cap'n Proto messages. The schemas are in the repository, in
-`core/capnp/camera_payload.capnp`, `core/capnp/lidar_payload.capnp` and
-`core/capnp/common_payload.capnp`, which holds the `Pose` both use. A `Pose` that was never written
-reads as the identity rotation at the origin, because `qw` defaults to 1; a pose the node stores is
-always a real tf lookup.
+packed Cap'n Proto messages, each with `formatVersion` `"2.0"`. The schemas are in the repository,
+in `core/capnp/camera_payload.capnp`, `core/capnp/lidar_payload.capnp` and
+`core/capnp/common_payload.capnp`, which holds the `Pose` all of them use. A camera object is a
+`CameraPayload` of `FrameMeta`. A lidar object is a `LidarPayload` holding a union of a `ScanBlock`
+of `ScanEntry` or a `CloudBlock` of `CloudEntry`. A `Pose` that was never written reads as the
+identity rotation at the origin, because `qw` defaults to 1; a pose the node stores is always a real
+tf lookup.

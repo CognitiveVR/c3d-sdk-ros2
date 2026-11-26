@@ -7,27 +7,36 @@ $Java.outerClassname("CameraSerialization");
 $Cxx.namespace("cvr::capnp");
 
 struct CameraPayload {
-  userId         @0 :Text;      # deviceId, same as the JSON streams' "userid"
-  sessionId      @1 :Text;      # "<epochSeconds>_<deviceId>"
-  sceneId        @2 :Text;      # the scene UUID the session runs in
-  sceneVersion   @3 :UInt32;    # the version NUMBER (?version=N); ingestion resolves the id
-  formatVersion  @4 :Text;      # "1.0"
-  sessionStartMs @5 :UInt64;    # wall clock, epoch ms
-  sdkVersion     @6 :Text;      # the value that reaches the JSON streams as c3d.version
-  part           @7 :UInt32;    # monotonic per stream from 1, like the JSON envelopes
-  frames         @8 :List(Frame);
+  # one uploaded object: one camera, one closed GOP (3 s by default; a config change ends a chunk early)
+  userId          @0  :Text;      # deviceId, same as the JSON streams' "userid"
+  sessionId       @1  :Text;      # "<epochSeconds>_<deviceId>"
+  sceneId         @2  :Text;      # the scene UUID the session runs in
+  sceneVersion    @3  :UInt32;    # the version NUMBER (?version=N); ingestion resolves the id
+  formatVersion   @4  :Text;      # "2.0"
+  sessionStartMs  @5  :UInt64;    # wall clock, epoch ms
+  sdkVersion      @6  :Text;      # the value that reaches the JSON streams as c3d.version
+  cameraId        @7  :Text;      # the configured camera name
+  seq             @8  :UInt32;    # chunk index per camera from 0; also in the object key
+  startMs         @9  :UInt64;    # epoch ms of the first frame
+  endMs           @10 :UInt64;    # epoch ms of the last frame
+  codec           @11 :Text;      # "h264" (Annex-B, closed GOP, IDR first); "h265" reserved
+  codecParams     @12 :Data;      # SPS/PPS as an avcC record, for the codec string and profile; the stream itself is Annex-B with in-band parameter sets
+  width           @13 :UInt16;
+  height          @14 :UInt16;
+  nominalFps      @15 :Float32;
+  frameId         @16 :Text;      # ROS frame the poses are for, constant per chunk
+  hfovDegrees     @17 :Float32;   # 0 = not recorded
+  vfovDegrees     @18 :Float32;
+  encoderSettings @19 :Text;      # diagnostic: "x264 ultrafast crf=28 threads=1 gop=3s"
+  frames          @20 :List(FrameMeta);   # one per frame, in decode order
+  data            @21 :Data;      # the bitstream, every frame's access unit back to back
 }
 
-struct Frame {
-  cameraId @0 :Text;            # the configured camera name, e.g. "front"
-  time     @1 :UInt64;          # epoch ms, wall clock
-  seq      @2 :UInt32;          # per-sensor monotonic counter from session start
-  frameId  @3 :Text;            # the ROS frame the pose is for
-  pose     @4 :Common.Pose;
-  format   @5 :Text;            # "jpeg" ("jpegxl" reserved); lowercase, the gateway rejects unknown values
-  width    @6 :UInt16;          # pixels; unsigned, but the Java binding reads it as short -- widen with & 0xFFFF
-  height   @7 :UInt16;          # pixels; same narrowing as width
-  data     @8 :Data;            # the encoded image bytes
-  hfovDegrees @9 :Float32;      # horizontal field of view, full angle in degrees; 0 = not recorded
-  vfovDegrees @10 :Float32;     # vertical field of view, full angle in degrees; 0 = not recorded
+struct FrameMeta {
+  time       @0 :UInt64;          # epoch ms, wall clock
+  seq        @1 :UInt32;          # per-camera counter from session start
+  pose       @2 :Common.Pose;
+  byteOffset @3 :UInt32;          # this frame's access unit inside data
+  byteLength @4 :UInt32;
+  keyframe   @5 :Bool;            # true for the first frame of every chunk
 }

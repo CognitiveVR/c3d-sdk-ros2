@@ -84,14 +84,24 @@ session, and then asserts on what would actually have been transmitted:
 
   resolves them into a throwaway environment and the interpreter every other tool
   runs on stays clean. Everything that does not need the schemas (the planar
-  point decoder, the color decoders, the name-to-stream rule) is a plain
-  function there, and `test_capnp_dump.py` covers that half unconditionally and
-  skips the rest when `pycapnp` is absent. That is what keeps the
-  standard-library-only CI job honest rather than merely green.
+  point decoder, the color decoders, the inverse scan and cloud transforms, the
+  NAL unit splitter, the name-to-stream rule) is a plain function there, and
+  `test_capnp_dump.py` covers that half unconditionally and skips the rest when
+  `pycapnp` is absent. That is what keeps the standard-library-only CI job
+  honest rather than merely green.
 
-  `--scan-ranges` adds each `LaserScan`'s ranges and intensities to the document.
-  Off by default because a 640-ray sweep is most of the document and almost no
-  assertion needs it; a reader placing a ray does.
+  A camera chunk is described with its frames, and each frame carries the
+  chunk's camera, tf frame, size and field of view; a scan block with its
+  entries, each carrying the block's lidar, tf frame, `angleMin` and
+  `angleIncrement`. So a reader that walks frames or scans, as
+  `verify_scan_plane.py` does, needs nothing from the object around them.
+
+  `--scan-ranges` adds each scan's decoded ranges, in meters with the three
+  sentinels restored as `inf`, `NaN` and `-inf`, and its intensities to the
+  document. Off by default because a 640-ray sweep is most of the document and
+  almost no assertion needs it; a reader placing a ray does. `--extract-h264 DIR`
+  writes each camera chunk's `data` to DIR as `<sessionId>-<cameraId>-<seq>.h264`,
+  a raw Annex-B stream that `ffmpeg -f h264 -i` reads as it is.
 
 **Why a fake action server rather than a simulator.** A simulator hands you
 `SUCCEEDED` almost every time. An objective translator's bugs live in `ABORTED`,
@@ -104,11 +114,30 @@ The script is its own container entry point: it resolves the same image
 `build_and_test.sh` uses, re-runs itself inside it, and builds the workspace there,
 so a host with no ROS runs this tier without installing anything. There is no list
 of files to stage anywhere: the repository is mounted read-only and everything is
-read from it. It asserts on the decoded payloads itself (record counts against the
-configured rates, every time inside the run's own window, `part` monotonic from 1
-per stream, the JSON and binary streams carrying one `sessionId`, and each point
-block decoding to the count its own header claims) rather than leaving a directory
-for a human to read. It runs on Jazzy only.
+read from it. It asserts on the decoded payloads itself rather than leaving a
+directory for a human to read:
+
+- record counts against the configured rates, and one camera chunk and one scan
+  block per 3 seconds of the run;
+- every record time inside the run's own window, `seq` running from 0 with none
+  missing per camera and per lidar, `formatVersion` 2.0, and the JSON and binary
+  streams carrying one `sessionId`;
+- each camera's frames continuous across its chunks: their frame `seq` with none
+  missing, and no more than twice the gate's worst spacing between one chunk's last
+  frame and the next chunk's first;
+- every camera chunk opening on a keyframe, its frames' access units tiling its
+  `data`, each opening on an access unit delimiter and flagged a keyframe exactly
+  when it carries an IDR slice, and the chunk decoding with ffmpeg on its own to
+  exactly its frames' worth of pixels; the field of view the parameters or the
+  zooming `CameraInfo` set, per chunk;
+- every scan decoding to the publisher's ray count, with the rays the publisher
+  made `inf` or `NaN` coming back as that, read from `fake_laserscan_publisher.py`'s
+  own constants, and every other ray finite, inside the published range and
+  smooth from one ray to the next; every intensity the publisher's own for its ray;
+- every cloud decoding from its own slice to the point count its entry claims,
+  with the points inside the publisher's box.
+
+It runs on Jazzy only.
 
 ```bash
 tools/build_and_test.sh synthetic                                  # how CI runs it
@@ -120,6 +149,8 @@ With a capture directory kept, the same bytes are readable by hand:
 
 ```bash
 uv run tools/capnp_dump.py /tmp/c3d_capture/*-camera.bin | head -40
+uv run tools/capnp_dump.py --extract-h264 /tmp/c3d_h264 /tmp/c3d_capture/*-camera.bin > /dev/null
+ffplay -f h264 "$(ls /tmp/c3d_h264/*.h264 | head -1)"     # one chunk, decoded on its own
 python3 - <<'PY'
 import json, glob, collections
 c = collections.Counter()
@@ -134,8 +165,8 @@ PY
 The first pass runs `pose_convention: rep103`, where every axis map is the identity, so it cannot
 tell the pose a `LaserScan` record carries from the pose a camera frame carries: under `rep103`
 they are the same numbers. Under `unity` and `gltf_authored` the position map is a REFLECTION and
-they are not: a laserscan's rays reach the wire as the sensor published them, so its record
-carries the scan plane's rotation and a reader rebuilds a ray as
+they are not: a laserscan's rays reach the wire unconverted, in the sensor's own frame, so its
+record carries the scan plane's rotation and a reader rebuilds a ray as
 `rotate(pose.q, (r cos t, r sin t, 0)) + pose.position` ([data format](../docs/data-format.md)).
 
 So the tier drives the session twice more, under `gltf_authored` and then `unity`, with the camera
@@ -158,6 +189,10 @@ convention:
   convention's own position map, with no SDK code anywhere in it;
 - as a control, that the camera's rotation would have put those same rays meters away, so a pass
   cannot come from the two rules having quietly become the same thing.
+
+Both ends of each ray are built from the range as decoded, so these passes pin the rotation a
+record carries and not its ranges: a range decode that is wrong passes them, and the capture
+assertions above are what catch it.
 
 This is the only check in the tree on the CALL SITE rather than on the conversion: `colcon test`
 pins the rule in `cognitive3d_ros/test/test_media.cpp` and cannot see which rule

@@ -60,6 +60,11 @@ from the manifests, so an undeclared dependency fails the image build rather tha
 clean checkout. Builds go to container-local paths and the source is mounted read-only:
 nothing lands in your tree.
 
+Keep the checkout where Docker can mount it. Colima and Docker Desktop on macOS share the home
+directory by default, and from a checkout outside it, under `/tmp` say, the container starts
+without the source and reports `bash: /src/tools/...: No such file or directory`. The same holds
+for `tools/release/build_debs.sh`.
+
 ### The test tiers
 
 [tools/README.md](tools/README.md) describes each tier and its tools in detail.

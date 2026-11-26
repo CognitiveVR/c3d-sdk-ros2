@@ -1,7 +1,7 @@
 # The Cognitive3D SDK for ROS 2
 
 The Cognitive3D SDK for ROS 2 records a robot's runs as Cognitive3D sessions: its path through a 3D
-scene of the site, its sensors, events and action outcomes, and optionally its camera frames and
+scene of the site, its sensors, events and action outcomes, and optionally its camera video and
 lidar scans. It runs as one more node on the robot's ROS 2 graph and subscribes to what the robot
 already publishes, and you replay each session in Session Replay and analyze it on the Cognitive3D
 dashboard.
@@ -77,7 +77,7 @@ misplaced or filed under another project. `doctor` finds most of them before you
 | Batteries and diagnostics | every `BatteryState` and `DiagnosticArray` topic, found by type |
 | Objectives | action servers' goal outcomes, Nav2's and the iRobot Create 3's by default |
 | Events | diagnostics and battery changes, localization jumps, Nav2 recoveries, and your own, published on `~/events` |
-| Camera frames and lidar scans | topics you name, posed in the scene; off by default |
+| Camera video and lidar scans | camera frames as H.264 chunks encoded by the host's `ffmpeg`, laser scans as compressed blocks and point clouds as delta coded objects, all posed in the scene, from topics you name; off by default |
 | The SDK's own health | spool, upload and pose counters, in every session |
 
 ## Documentation
@@ -91,7 +91,7 @@ misplaced or filed under another project. `doctor` finds most of them before you
 | [Sessions](docs/sessions.md) | The lifecycle, the session services, time, the spool, the report line, containers and systemd |
 | [Coordinates](docs/coordinates.md) | The pose convention, reference frames, the gaze channel |
 | [Recording](docs/recording.md) | The allowlist, sensor series, events, objectives, Nav2, health series |
-| [Camera and lidar](docs/camera-and-lidar.md) | Camera frames, laser scans and point clouds, and what they cost |
+| [Camera and lidar](docs/camera-and-lidar.md) | Camera chunks, laser scans and point clouds, and what they cost |
 | [Remote variables](docs/remote-variables.md) | Remote variables and A/B tests |
 | [Doctor and verification](docs/doctor-and-verification.md) | Every `doctor` check, and checking a stored session |
 | [Troubleshooting](docs/troubleshooting.md) | What goes wrong, by symptom |

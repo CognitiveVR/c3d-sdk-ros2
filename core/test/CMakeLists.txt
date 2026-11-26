@@ -10,6 +10,9 @@ add_executable(c3d_core_tests
   test_recovery.cpp
   test_remote_variables.cpp
   test_pointcloud.cpp
+  test_scan_block.cpp
+  test_sensor_blocks.cpp
+  test_h264_encoder.cpp
   test_binary_streams.cpp
   test_upload_stall.cpp
   test_transport_curl.cpp
@@ -33,7 +36,8 @@ target_include_directories(c3d_core_tests PRIVATE
 # The environment cases are shared with tools/test_c3d_api_env.py, which reads the same file.
 target_compile_definitions(c3d_core_tests PRIVATE
   C3D_ENVIRONMENT_CASES="${CMAKE_CURRENT_SOURCE_DIR}/environment_cases.json")
-gtest_discover_tests(c3d_core_tests)
+# A hung test fails at the timeout instead of holding the run; the slowest takes about 13 s.
+gtest_discover_tests(c3d_core_tests PROPERTIES TIMEOUT 120)
 
 # Its own executable, because it replaces fsync, fdatasync and rename for everything linked into
 # it, and Linux-only, because it names each call's file through /proc/self/fd.
@@ -41,5 +45,5 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(c3d_spool_durability_tests test_spool_durability.cpp)
   target_link_libraries(c3d_spool_durability_tests PRIVATE c3d_core GTest::gtest GTest::gtest_main
                         ${CMAKE_DL_LIBS})
-  gtest_discover_tests(c3d_spool_durability_tests)
+  gtest_discover_tests(c3d_spool_durability_tests PROPERTIES TIMEOUT 120)
 endif()

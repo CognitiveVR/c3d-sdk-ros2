@@ -114,23 +114,55 @@ def ranges():
 
 
 def document(convention, scan_rotation=None, scans=3, frames=2):
+    """A decoded capture in capnp_dump's shape: one scan block and one camera chunk.
+
+    Each scan entry and each frame carries the sensor, frame and geometry of the block or chunk
+    around it, as capnp_dump copies them, and the verifier reads nothing else.
+    """
     position = list(verify.POSITION_MAPS[convention](*MOUNT_XYZ))
     scan_rotation = list(scan_rotation or scan_plane_rotation(convention))
-    scan_records = [{
-        'sensorId': LIDAR, 'time': 1757000000000 + index, 'seq': index, 'frameId': FRAME,
-        'pose': position + scan_rotation, 'kind': 'laserscan',
-        'angleMin': -math.pi, 'angleMax': math.pi,
-        'angleIncrement': 2.0 * math.pi / RAY_COUNT,
-        'rangeCount': RAY_COUNT, 'intensityCount': 0, 'finiteRangeCount': RAY_COUNT - 8,
-        'ranges': ranges(), 'intensities': [],
-    } for index in range(scans)]
-    frame_records = [{
-        'cameraId': CAMERA, 'time': 1757000000000 + index, 'seq': index, 'frameId': FRAME,
-        'pose': position + list(camera_rotation(convention)),
-        'format': 'jpeg', 'width': 160, 'height': 120, 'dataBytes': 512, 'jpegSoi': True,
-    } for index in range(frames)]
-    return {'files': [{'stream': 'lidar', 'scans': scan_records},
-                      {'stream': 'camera', 'frames': frame_records}]}
+    increment = 2.0 * math.pi / RAY_COUNT
+    scan_block = {
+        'stream': 'lidar', 'sensorId': LIDAR, 'seq': 0, 'frameId': FRAME, 'kind': 'scans',
+        'angleMin': -math.pi, 'angleMax': math.pi, 'angleIncrement': increment,
+        'rangeMin': 0.1, 'rangeMax': 12.0, 'rays': RAY_COUNT, 'rangeUnit': 'millimetre',
+        'encoding': 'deltaShuffleZstd', 'finiteRangeCount': scans * (RAY_COUNT - 8),
+        'entries': [{
+            'time': 1757000000000 + index, 'seq': index, 'pose': position + scan_rotation,
+            'timeIncrement': 0.0001, 'scanTime': 0.25,
+            'sensorId': LIDAR, 'frameId': FRAME, 'angleMin': -math.pi,
+            'angleIncrement': increment, 'kind': 'scans',
+            'ranges': ranges(), 'intensities': [],
+        } for index in range(scans)],
+    }
+    chunk = {
+        'stream': 'camera', 'cameraId': CAMERA, 'seq': 0, 'frameId': FRAME,
+        'width': 160, 'height': 120, 'hfovDegrees': 0.0, 'vfovDegrees': 0.0,
+        'frames': [{
+            'time': 1757000000000 + index, 'seq': index,
+            'pose': position + list(camera_rotation(convention)),
+            'byteOffset': 512 * index, 'byteLength': 512, 'keyframe': index == 0,
+            'nalTypes': [9, 7, 8, 5] if index == 0 else [9, 1], 'startsWithAud': True,
+            'cameraId': CAMERA, 'frameId': FRAME, 'width': 160, 'height': 120,
+            'hfovDegrees': 0.0, 'vfovDegrees': 0.0,
+        } for index in range(frames)],
+    }
+    return {'files': [scan_block, chunk]}
+
+
+def cloud_object(convention):
+    """A point cloud object from the same sensor name on the same frame, posed like a camera."""
+    position = list(verify.POSITION_MAPS[convention](*MOUNT_XYZ))
+    return {
+        'stream': 'lidar', 'sensorId': LIDAR, 'seq': 0, 'frameId': FRAME, 'kind': 'clouds',
+        'position': 'int16_mm', 'color': 'none', 'intensity': 'none', 'voxelLeafMm': 50,
+        'encoding': 'planarDeltaShuffleZstd', 'zstdLevel': 3,
+        'entries': [{
+            'time': 1757000000000, 'seq': 0, 'pose': position + list(camera_rotation(convention)),
+            'pointCount': 0, 'byteOffset': 0, 'byteLength': 0,
+            'decoded': {'points': 0, 'first': [], 'consistent': True},
+        }],
+    }
 
 
 def failures(results):
@@ -234,12 +266,12 @@ class PositionMaps(unittest.TestCase):
 
 class RaySelection(unittest.TestCase):
     def test_non_finite_rays_are_skipped(self):
-        scan = document('unity')['files'][0]['scans'][0]
+        scan = document('unity')['files'][0]['entries'][0]
         for _index, ray_range, _angle in verify.finite_rays(scan, 8):
             self.assertTrue(math.isfinite(ray_range))
 
     def test_the_angle_is_the_index_walked_from_angle_min(self):
-        scan = document('unity')['files'][0]['scans'][0]
+        scan = document('unity')['files'][0]['entries'][0]
         index, _range, angle = verify.finite_rays(scan, 1)[0]
         self.assertAlmostEqual(angle, scan['angleMin'] + index * scan['angleIncrement'], places=12)
 
@@ -289,7 +321,7 @@ class TheRuleHolds(unittest.TestCase):
     def test_a_shifted_position_fails_even_with_the_right_rotation(self):
         for convention in verify.REFLECTING_CONVENTIONS:
             doc = document(convention)
-            for scan in doc['files'][0]['scans']:
+            for scan in doc['files'][0]['entries']:
                 scan['pose'][0] += 0.05
             results = verify.check_document(doc, options(convention), convention)
             self.assertTrue(any('mapped mount position' in m for m in failures(results)),
@@ -301,10 +333,20 @@ class TheRuleHolds(unittest.TestCase):
 
     def test_records_on_another_frame_or_sensor_are_not_counted(self):
         doc = document('unity')
-        for scan in doc['files'][0]['scans']:
+        for scan in doc['files'][0]['entries']:
             scan['frameId'] = 'base_link'
         results = verify.check_document(doc, options('unity'), 'unity')
         self.assertTrue(any('laserscan records' in m for m in failures(results)))
+
+    def test_a_cloud_object_from_the_same_name_and_frame_is_not_a_scan(self):
+        # A lidar name can be either kind, and a cloud entry has a pose but no rays and none of a
+        # scan entry's copied fields. Only a scan block's entries are scans.
+        doc = document('unity')
+        doc['files'].insert(0, cloud_object('unity'))
+        results = verify.check_document(doc, options('unity'), 'unity')
+        self.assertEqual(failures(results), [])
+        self.assertIn("laserscan records for 'scan' on sensor_mount: 3",
+                      [message for _ok, message in results])
 
     def test_a_capture_with_no_camera_frames_is_a_failure_not_a_pass(self):
         doc = document('unity', frames=0)
@@ -313,7 +355,7 @@ class TheRuleHolds(unittest.TestCase):
 
     def test_too_few_reconstructable_rays_is_a_failure(self):
         doc = document('unity')
-        for scan in doc['files'][0]['scans']:
+        for scan in doc['files'][0]['entries']:
             scan['ranges'] = [math.inf] * RAY_COUNT
         results = verify.check_document(doc, options('unity'), 'unity')
         self.assertTrue(any('rays reconstructed' in m for m in failures(results)))

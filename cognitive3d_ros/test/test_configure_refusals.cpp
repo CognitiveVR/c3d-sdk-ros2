@@ -7,7 +7,11 @@
 
 #include <gtest/gtest.h>
 
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <fstream>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -137,8 +141,7 @@ TEST_F(ConfigureRefusals, ThresholdsAndIntervalsOutsideTheirRangeAreRefusedByNam
       {"relocalisation_jump_m", -1.0},       {"relocalisation_jump_m", 0.0},
       {"relocalisation_jump_m", kNaN},       {"relocalisation_jump_deg", -45.0},
       {"relocalisation_jump_deg", kNaN},     {"reference_frame_grace_s", -1.0},
-      {"reference_frame_grace_s", kNaN},     {"camera_flush_s", kNaN},
-      {"lidar_flush_s", kNaN},
+      {"reference_frame_grace_s", kNaN},
   };
   for (const auto& bad : refused) {
     const std::string refusal = RefusalWith(bad);
@@ -147,6 +150,75 @@ TEST_F(ConfigureRefusals, ThresholdsAndIntervalsOutsideTheirRangeAreRefusedByNam
   }
   EXPECT_EQ(RefusalWith({"reference_frame_grace_s", 0.0}), "")
       << "no grace is a choice: the fallback is adopted as soon as it resolves";
+}
+
+// A camera is encoded by the binary `ffmpeg_path` names, asked at configure: one that cannot run
+// would drop every frame while the run looked configured. The refusal names the binary and the
+// package to install.
+TEST_F(ConfigureRefusals, ACameraWithNoUsableFfmpegRefusesConfigureNamingThePackage) {
+  const std::string refusal = RefusalWith({"ffmpeg_path", std::string("/nonexistent/ffmpeg")});
+  EXPECT_EQ(refusal.rfind("ffmpeg_path '/nonexistent/ffmpeg'", 0), 0u) << refusal;
+  EXPECT_NE(refusal.find("sudo apt install ffmpeg"), std::string::npos) << refusal;
+  EXPECT_EQ(Configure(*node_), "") << "the shared node's own ffmpeg is the image's";
+
+  // Without a camera nothing runs it, so nothing is asked.
+  auto no_camera = MakeNode(DryRun({{"ffmpeg_path", std::string("/nonexistent/ffmpeg")}}));
+  EXPECT_EQ(Configure(*no_camera), "");
+}
+
+// An ffmpeg that runs and lists libx264 can still refuse one of the arguments a camera runs it
+// with, and would then fail at every start. Configure encodes two frames with each camera's own
+// preset and crf, and refuses naming the binary, the camera and what ffmpeg said.
+TEST_F(ConfigureRefusals, AnFfmpegThatCannotEncodeWithTheCamerasSettingsRefusesConfigure) {
+  char directory[] = "/tmp/c3d_ffmpeg_XXXXXX";
+  ASSERT_NE(::mkdtemp(directory), nullptr);
+  const std::string script = std::string(directory) + "/ffmpeg";
+  {
+    std::ofstream out(script);
+    out << "#!/bin/sh\n"
+           "case \"$*\" in\n"
+           "  *-version*) echo 'ffmpeg version 99'; exit 0 ;;\n"
+           "  *-encoders*) echo ' V....D libx264'; exit 0 ;;\n"
+           "esac\n"
+           "echo \"Unrecognized option 'vsync'.\" >&2\n"
+           "exit 8\n";
+  }
+  ::chmod(script.c_str(), 0755);
+  const std::string refusal = RefusalWith({"ffmpeg_path", script});
+  ::unlink(script.c_str());
+  ::rmdir(directory);
+  EXPECT_EQ(refusal.rfind("ffmpeg_path '" + script + "'", 0), 0u) << refusal;
+  EXPECT_NE(refusal.find("cannot encode camera 'front' (preset ultrafast, crf 28)"),
+            std::string::npos)
+      << refusal;
+  EXPECT_NE(refusal.find("Unrecognized option 'vsync'"), std::string::npos) << refusal;
+}
+
+// A camera has no `jpeg_quality` or `format` field any more, and there are no flush keys: a 1.x
+// params file that carries one is refused naming the key and saying it was removed, rather than
+// configuring and applying nothing of it, or reading as a misspelling.
+TEST_F(ConfigureRefusals, ARemovedKeyIsRefusedNamingItAsRemoved) {
+  for (const rclcpp::Parameter& gone : {rclcpp::Parameter("camera.front.jpeg_quality", 80),
+                                        rclcpp::Parameter("camera.front.format",
+                                                          std::string("jpeg"))}) {
+    auto parameters = SharedNodeParameters();
+    parameters.push_back(gone);
+    const auto node = MakeNode(parameters);
+    const std::string refusal = Configure(*node);
+    EXPECT_EQ(refusal.rfind(gone.get_name() + " was removed: a camera is encoded as H.264", 0), 0u)
+        << refusal;
+    EXPECT_NE(refusal.find("preset and crf"), std::string::npos) << refusal;
+    EXPECT_EQ(refusal.find("spelling"), std::string::npos) << refusal;
+  }
+  for (const rclcpp::Parameter& gone :
+       {rclcpp::Parameter("camera_flush_s", 3.0), rclcpp::Parameter("camera_flush_bytes", 4096),
+        rclcpp::Parameter("lidar_flush_s", 3.0), rclcpp::Parameter("lidar_flush_bytes", 4096)}) {
+    auto parameters = SharedNodeParameters();
+    parameters.push_back(gone);
+    const auto node = MakeNode(parameters);
+    const std::string refusal = Configure(*node);
+    EXPECT_EQ(refusal.rfind(gone.get_name() + " was removed", 0), 0u) << refusal;
+  }
 }
 
 // A camera's field of view is two full angles or none. One angle alone is half a frustum, and an

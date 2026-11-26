@@ -307,7 +307,8 @@ std::string RecordABacklog(const fs::path& dir, const std::string& key, const st
   if (!session || !session->Begin()) return {};
   const std::string id = session->session_id();
   session->RecordEvent("work", 1000.0, Vec3{});
-  session->RecordCameraFrame("front", 1000000ull, 0, "f", Pose{}, "jpeg", 2, 2, "ab");
+  session->RecordCameraAccessUnit("front", SensorEntry{1000000ull, 0, Pose{}}, VideoChunkContext{},
+                                  "ab", true);
   session->End();
   return id;
 }
@@ -331,7 +332,8 @@ std::string CrashWhileRecording(const fs::path& dir, const std::string& key,
                                    std::make_shared<NullLogger>());
     if (!session || !session->Begin()) return std::string();
     session->RecordEvent("work", 1000.0, Vec3{});
-    session->RecordCameraFrame("front", 1000000ull, 0, "f", Pose{}, "jpeg", 2, 2, "ab");
+    session->RecordCameraAccessUnit("front", SensorEntry{1000000ull, 0, Pose{}},
+                                    VideoChunkContext{}, "ab", true);
     session->Flush();
     const std::string id = session->session_id();
     session.release();

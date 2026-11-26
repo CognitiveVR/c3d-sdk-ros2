@@ -87,12 +87,6 @@ TEST(PartBase, EachJsonStreamStartsWhereTheUnitySdkStartsIt) {
   EXPECT_EQ(PartBase(Stream::kSensors), 1u);
 }
 
-TEST(PartBase, TheBinaryStreamsStartAtOne) {
-  // No reference implementation has these routes: docs/data-format.md fixes the base at 1.
-  EXPECT_EQ(PartBase(Stream::kCamera), 1u);
-  EXPECT_EQ(PartBase(Stream::kLidar), 1u);
-}
-
 TEST(StreamNames, TheTwoBinaryStreamsAreNamedAndFlagged) {
   // The name is the url segment, the chunk-id suffix the spool sorts and evicts
   // by, and what StreamFromName reads back on recovery -- one string, three jobs.
@@ -105,13 +99,13 @@ TEST(StreamNames, TheTwoBinaryStreamsAreNamedAndFlagged) {
   }
 }
 
-TEST(FormatVersion, SensorsAreTheOnlyStreamAtFormatVersionTwo) {
+TEST(FormatVersion, SensorsAndTheBinaryStreamsAreAtFormatVersionTwo) {
   EXPECT_STREQ(FormatVersion(Stream::kSensors), "2.0");
   EXPECT_STREQ(FormatVersion(Stream::kGaze), "1.0");
   EXPECT_STREQ(FormatVersion(Stream::kEvents), "1.0");
   EXPECT_STREQ(FormatVersion(Stream::kDynamics), "1.0");
-  EXPECT_STREQ(FormatVersion(Stream::kCamera), "1.0");
-  EXPECT_STREQ(FormatVersion(Stream::kLidar), "1.0");
+  EXPECT_STREQ(FormatVersion(Stream::kCamera), "2.0");
+  EXPECT_STREQ(FormatVersion(Stream::kLidar), "2.0");
 }
 
 // ---------------------------------------------------------------------------

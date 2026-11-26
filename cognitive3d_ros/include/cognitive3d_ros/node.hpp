@@ -155,6 +155,8 @@ class Cognitive3DNode : public rclcpp_lifecycle::LifecycleNode {
   // back rather than re-derived, for the same reason `resolved_config` is.
   const std::vector<CameraConfig>& resolved_cameras() const { return camera_configs_; }
   const std::vector<LidarConfig>& resolved_lidars() const { return lidar_configs_; }
+  // The camera encoder binary, as `ffmpeg_path` gave it.
+  const std::string& resolved_ffmpeg_path() const { return ffmpeg_path_; }
   // The described sensors, series included, as the node RESOLVED them.
   const std::vector<SensorConfig>& resolved_sensors() const { return sensor_configs_; }
 
@@ -339,6 +341,7 @@ class Cognitive3DNode : public rclcpp_lifecycle::LifecycleNode {
     std::string type;
     rclcpp::GenericSubscription::SharedPtr subscription;
   };
+  std::string ffmpeg_path_ = "ffmpeg";
   std::vector<CameraConfig> camera_configs_;
   std::vector<LidarConfig> lidar_configs_;
   std::vector<SensorConfig> sensor_configs_;

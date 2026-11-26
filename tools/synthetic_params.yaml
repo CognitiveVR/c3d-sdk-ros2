@@ -42,10 +42,11 @@
           durability: "transient_local"
           depth: 1
 
-    # The two binary streams. One camera and two lidars, which is the shape the
-    # capture tier asserts on: a JPEG stream that is resized on the way out, a
-    # LaserScan that keeps the sensor's own units, and a point cloud that goes
-    # through the voxel pass and zstd.
+    # The two binary streams. Two cameras and two lidars, which is the shape the
+    # capture tier asserts on: a raw stream that is resized before it is encoded
+    # and a JPEG stream that is decoded first, a LaserScan stored as range codes,
+    # and a point cloud that goes through the voxel pass and zstd. Neither camera
+    # sets `preset` or `crf`, so the defaults are what the tier exercises.
     cameras: ["front", "zoom"]
     camera:
       front:
@@ -54,14 +55,13 @@
         # Below the publisher's 320, so the resize path runs and the width on the
         # wire is the one that was SENT rather than the one that was configured.
         max_width_px: 160
-        jpeg_quality: 70
-        # Set by parameter, so every frame carries exactly these two Float32 values. 45.5 is
+        # Set by parameter, so every chunk carries exactly these two Float32 values. 45.5 is
         # not a whole number, so a value truncated anywhere on the way shows.
         hfov_degrees: 61.0
         vfov_degrees: 45.5
-      # The same camera's JPEG stream, with no field of view parameters: its frames take theirs
-      # from the sibling /fake/camera/camera_info, whose focal length changes every frame.
-      # "front" has that sibling too, and its parameters win over it.
+      # The same camera's JPEG stream, with no field of view parameters: each chunk takes its
+      # first frame's from the sibling /fake/camera/camera_info, whose focal length changes
+      # every frame. "front" has that sibling too, and its parameters win over it.
       zoom:
         topic: "/fake/camera/image_raw/compressed"
         rate_hz: 2.0
@@ -81,7 +81,3 @@
           intensity: "none"
           max_points: 100000
           zstd_level: 1
-    # Short, so a run of this length cuts several parts of each and the part
-    # counter is actually exercised.
-    camera_flush_s: 2.0
-    lidar_flush_s: 2.0

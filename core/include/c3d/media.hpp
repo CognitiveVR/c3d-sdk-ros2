@@ -32,8 +32,8 @@ struct Pose {
 
 // A camera's field of view when one frame was taken: two FULL angles in degrees,
 // edge to edge across the image, horizontal and vertical. It travels with every
-// frame rather than once per session because it is not a constant of the camera:
-// a zoom lens changes it frame to frame.
+// video chunk, taken from the chunk's first frame, rather than once per session
+// because it is not a constant of the camera: a zoom lens changes it.
 //
 // 0 means NOT RECORDED, and it is the default -- no real lens has a 0 degree field
 // of view, so the wire spends no flag on it. A reader that finds 0 draws no
@@ -49,8 +49,8 @@ struct CameraFov {
 
 // Whether `fov` is one a frame carries: BOTH angles finite and strictly between 0
 // and 180. Anything else -- 0 for unknown, one angle without the other, NaN or
-// infinity, a negative or reflex angle -- is not, and Session::RecordCameraFrame
-// writes such a frame with 0 for both, so a NaN never reaches the wire and a
+// infinity, a negative or reflex angle -- is not, and Session::RecordCameraAccessUnit
+// records such a frame with 0 for both, so a NaN never reaches the wire and a
 // frustum is never drawn from half a measurement.
 bool IsKnownCameraFov(const CameraFov& fov);
 
@@ -113,6 +113,11 @@ bool ParsePointPosition(const std::string& text, PointPosition* out);
 bool ParsePointColor(const std::string& text, PointColor* out);
 bool ParsePointIntensity(const std::string& text, PointIntensity* out);
 
+enum class PointCloudEncoding { kPlanarZstd, kPlanarDeltaShuffleZstd };
+
+// The schema enumerant spellings, for the session property.
+const char* PointCloudEncodingName(PointCloudEncoding e);
+
 struct PointCloudOptions {
   double voxel_leaf_m = 0.05;  // 0 keeps every point
   PointPosition position = PointPosition::kInt16Mm;
@@ -122,7 +127,9 @@ struct PointCloudOptions {
   // truncated: half a cloud is a cloud with a hole in it, and nothing on the
   // wire would say which half.
   std::size_t max_points = 100000;
-  int zstd_level = 1;  // 0 sends the raw planar block
+  int zstd_level = 3;  // 0 sends the raw planar block
+  // Honoured for int16 positions only; float32 is always written as kPlanarZstd.
+  PointCloudEncoding encoding = PointCloudEncoding::kPlanarDeltaShuffleZstd;
 };
 
 struct PointCloudInput {
@@ -152,6 +159,7 @@ struct EncodedPointCloud {
   PointIntensity intensity = PointIntensity::kNone;
   std::uint16_t voxel_leaf_mm = 0;  // 0 means the cloud was not downsampled
   std::uint8_t zstd_level = 0;      // 0 means `data` IS the raw planar block
+  PointCloudEncoding encoding = PointCloudEncoding::kPlanarZstd;  // what was written
   std::string data;
 
   // Points the filter and the int16 range check removed, reported separately
@@ -175,6 +183,25 @@ namespace pointcloud {
 // other in the byte stream, which is the only reason zstd earns its place, and
 // it is also what makes the output testable byte for byte.
 EncodedPointCloud Encode(const PointCloudInput& input, const PointCloudOptions& options);
+
+// The most points a cloud may have for Encode's output under `options` never to pass `bytes`,
+// whatever the points are: zstd's worst case over the planar block of 2 or 4 bytes a position
+// axis, the colour's bytes and the intensity's, or the block itself at zstd level 0.
+std::size_t MaxPointsWithin(std::uint64_t bytes, const PointCloudOptions& options);
+
+// The encoding Encode writes under `options`: planarDeltaShuffleZstd only for int16_mm positions
+// compressed at a zstd level above 0, whatever `options.encoding` asks for; planarZstd otherwise.
+PointCloudEncoding EffectiveEncoding(const PointCloudOptions& options);
+
+// Position planes only, int16 only: per plane, value[i] - value[i-1] (wrapping,
+// the first against 0), then that plane's low bytes, then its high bytes. The
+// colour and intensity planes follow unchanged. Any other position_bytes returns
+// the input as it is; the inverse returns an empty string for a block too short
+// to hold the position planes.
+std::string DeltaShufflePositionPlanes(const std::string& planar, std::size_t n,
+                                       std::size_t position_bytes);
+std::string InverseDeltaShufflePositionPlanes(const std::string& transformed, std::size_t n,
+                                              std::size_t position_bytes);
 
 }  // namespace pointcloud
 }  // namespace c3d

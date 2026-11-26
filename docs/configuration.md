@@ -241,7 +241,7 @@ power loss.
 
 ## Uploads
 
-An upload is judged by whether it is moving, not by how long it takes, so a large part on a slow
+An upload is judged by whether it is moving, not by how long it takes, so a large object on a slow
 uplink is not abandoned while it progresses. [Sessions](sessions.md) describes what happens to data
 the platform refuses.
 
@@ -251,7 +251,7 @@ the platform refuses.
 | `http_connect_timeout_s` | int | `10` | seconds | How long one upload may take to connect. A positive whole number, no larger than `http_timeout_s`. |
 | `http_low_speed_limit_bytes_per_s` | int | `1024` | bytes per second | An upload that moves fewer bytes per second than this for `http_low_speed_time_s` is abandoned and retried. A positive whole number. |
 | `http_low_speed_time_s` | int | `60` | seconds | The window for `http_low_speed_limit_bytes_per_s`. A positive whole number, shorter than `http_timeout_s`. |
-| `http_timeout_s` | int | `300` | seconds | The ceiling for one upload request. A positive whole number. The default carries a 4 MiB part at about 14 KB per second. |
+| `http_timeout_s` | int | `300` | seconds | The ceiling for one upload request. A positive whole number. The default carries a 2 MiB upload, the size at which a point-cloud object closes and well above a typical camera chunk or scan block, at about 7 KB per second. A single larger cloud, a camera chunk at a high resolution and a low `crf`, or a slow uplink needs a higher `http_timeout_s`. |
 | `retry_min_s` | double | `60.0` | seconds | The wait after a failed upload. It doubles with each failure up to `retry_max_s`, and resets on success. Must be positive, and no larger than `retry_max_s`. |
 | `retry_max_s` | double | `240.0` | seconds | The longest wait between retries. While the platform refuses the application key, uploads pause and try again this often. |
 
@@ -266,33 +266,32 @@ what is refused.
 | -- | -- | -- | -- | -- |
 | `cameras` | string[] | `[]` | — | The camera names, each configured under `camera.<name>.*`. A name must be non-empty, carry no `.` or `/`, and appear once. A `camera.<name>.<field>` key whose name is not listed here, or whose field is not one of those below, refuses configure, naming the key. |
 | `camera.<name>.topic` | string | `""` | — | A `sensor_msgs/msg/Image` or `sensor_msgs/msg/CompressedImage` topic. Required for every listed name: empty refuses configure. A topic of another type is refused when it appears on the graph, not at configure; `doctor` checks it. |
-| `camera.<name>.rate_hz` | double | `30.0` | Hz | Frames accepted per second, counted on arrival. Must be positive. |
-| `camera.<name>.format` | string | `"jpeg"` | — | The encoding. `jpeg` is the only accepted value. |
-| `camera.<name>.jpeg_quality` | int | `80` | — | The JPEG quality, from 1 to 100. |
+| `camera.<name>.rate_hz` | double | `30.0` | Hz | Frames accepted per second, counted on arrival. They are encoded into one H.264 chunk per 3 seconds of real time, or per 1 to 3 seconds when a 3-second chunk is estimated over 6 MiB; the rate does not set a chunk's length. Must be positive. |
+| `camera.<name>.preset` | string | `"ultrafast"` | — | x264's speed preset, `ultrafast` or `veryfast`. `veryfast` spends more CPU for fewer bytes. |
+| `camera.<name>.crf` | int | `28` | — | The constant rate factor, 24 to 32; lower is higher quality and more bytes. |
+| `camera.<name>.max_bitrate_kbps` | int | `0` | kilobits per second | A cap on the video's bitrate, at most 1,000,000 (1 Gbit/s). `0` sets no cap, except where the node sets one by default; see [Camera and lidar](camera-and-lidar.md#how-a-camera-is-encoded). Must not be negative. |
+| `camera.<name>.replay_max_mb` | int | `192` | MiB | Memory that keeps the frames fed to the encoder until they are in a chunk, so that a chunk that reaches 8 MiB can end and those frames be encoded again. 1 to 16,384. |
 | `camera.<name>.max_width_px` | int | `640` | pixels | Wider frames are scaled down to this width, keeping the aspect ratio. `0` never resizes. |
-| `camera.<name>.frame` | string | `""` | — | The tf frame each frame's pose is looked up for. Empty uses the message's `header.frame_id`. A record whose pose cannot be looked up is dropped, so a frame that never resolves records nothing. |
-| `camera.<name>.hfov_degrees` | double | `0.0` | degrees | The camera's horizontal field of view, a full angle, sent with every frame. `0` is unset. Set it with `vfov_degrees` or not at all; above 0 and below 180. Set, it wins over the CameraInfo. See [A camera's field of view](camera-and-lidar.md#a-cameras-field-of-view). |
+| `camera.<name>.frame` | string | `""` | — | The tf frame each frame's pose is looked up for. Empty uses the message's `header.frame_id`. A frame whose pose cannot be looked up is dropped, so a frame that never resolves records nothing. |
+| `camera.<name>.hfov_degrees` | double | `0.0` | degrees | The camera's horizontal field of view, a full angle, sent with every chunk. `0` is unset. Set it with `vfov_degrees` or not at all; above 0 and below 180. Set, it wins over the CameraInfo. See [A camera's field of view](camera-and-lidar.md#a-cameras-field-of-view). |
 | `camera.<name>.vfov_degrees` | double | `0.0` | degrees | The vertical field of view, as for `hfov_degrees`. |
-| `camera.<name>.camera_info_topic` | string | `"auto"` | — | The `sensor_msgs/msg/CameraInfo` topic each frame's field of view is computed from while `hfov_degrees` and `vfov_degrees` are unset. `"auto"` is the image topic's sibling, `/cam/camera_info` for `/cam/image_raw` or `/cam/image_raw/compressed`; `""` reads none. |
+| `camera.<name>.camera_info_topic` | string | `"auto"` | — | The `sensor_msgs/msg/CameraInfo` topic each chunk's field of view is computed from, as of its first frame, while `hfov_degrees` and `vfov_degrees` are unset. `"auto"` is the image topic's sibling, `/cam/camera_info` for `/cam/image_raw` or `/cam/image_raw/compressed`; `""` reads none. |
 | `camera.<name>.qos.reliability` | string | `""` | — | As for `topic_config.<key>.qos.reliability`. |
 | `camera.<name>.qos.durability` | string | `""` | — | As for `topic_config.<key>.qos.durability`. |
 | `camera.<name>.qos.history` | string | `""` | — | As for `topic_config.<key>.qos.history`. |
 | `camera.<name>.qos.depth` | int | `-1` | messages | As for `topic_config.<key>.qos.depth`. |
 | `lidars` | string[] | `[]` | — | The lidar names, each configured under `lidar.<name>.*`, with the same rules as `cameras`. A `lidar.<name>.<field>` key whose name is not listed here, or whose field is not one of those below, refuses configure, naming the key. A lidar has no `qos.*` fields. |
 | `lidar.<name>.topic` | string | `""` | — | A `sensor_msgs/msg/LaserScan` or `sensor_msgs/msg/PointCloud2` topic. Required for every listed name. |
-| `lidar.<name>.rate_hz` | double | `30.0` | Hz | Scans accepted per second, counted on arrival. Must be positive. |
+| `lidar.<name>.rate_hz` | double | `30.0` | Hz | Scans accepted per second, counted on arrival. A `LaserScan` is stored in one block per 3 seconds of scans; point clouds are packed into objects that close at 2 MiB or 5 seconds. Must be positive. |
 | `lidar.<name>.frame` | string | `""` | — | As for a camera. Also set it when a point cloud's header names a frame its points are not in, which `doctor`'s optical frame check detects. |
 | `lidar.<name>.intensities` | bool | `false` | — | `LaserScan` only. Record intensities too, which doubles a scan's size. |
 | `lidar.<name>.pointcloud.voxel_leaf_m` | double | `0.05` | meters | `PointCloud2` only. The downsampling cell size, from 0 to 65; `0` keeps every point. |
 | `lidar.<name>.pointcloud.position` | string | `"int16_mm"` | — | `int16_mm` or `float32`. `int16_mm` reaches 32.767 meters from the sensor's frame; a point beyond that is dropped and counted in `c3d.lidar.<name>.dropped_range`. Use `float32` for a long-range lidar. |
 | `lidar.<name>.pointcloud.color` | string | `"none"` | — | `none`, `rgb565`, `rgb332` or `rgb888`. |
 | `lidar.<name>.pointcloud.intensity` | string | `"none"` | — | `none` or `uint8`. |
-| `lidar.<name>.pointcloud.max_points` | int | `100000` | points | A cloud still larger than this after downsampling is dropped whole, and counted in `c3d.lidar.<name>.dropped_oversize`. At least 1. |
-| `lidar.<name>.pointcloud.zstd_level` | int | `1` | — | The compression level, from 0 to 22; `0` sends the points uncompressed. |
-| `camera_flush_s` | double | `2.0` | seconds | Camera records upload in parts, each cut at whichever bound comes first. Must be positive. |
-| `camera_flush_bytes` | int | `4194304` | bytes | From 1024 to 33554432 (32 MiB). |
-| `lidar_flush_s` | double | `2.0` | seconds | `camera_flush_s`, for lidar records. |
-| `lidar_flush_bytes` | int | `4194304` | bytes | `camera_flush_bytes`, for lidar records. |
+| `lidar.<name>.pointcloud.max_points` | int | `100000` | points | A cloud still larger than this after downsampling is dropped whole, and counted in `c3d.lidar.<name>.dropped_oversize`. At least 1, and at most the points whose worst case encoding stays under 8 MiB at the configured `position`, `color`, `intensity` and `zstd_level`: about 1.39 million at the defaults, about 522,000 at `float32` with `rgb888` and an intensity. |
+| `lidar.<name>.pointcloud.zstd_level` | int | `3` | — | The compression level, from 0 to 22; `0` sends the points uncompressed. |
+| `ffmpeg_path` | string | `"ffmpeg"` | — | The camera encoder binary, searched on `PATH` unless it contains a `/`. With a camera configured, configure refuses when it cannot run or lists no `libx264` encoder. |
 
 ## Described sensors
 

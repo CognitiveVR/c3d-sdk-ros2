@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -10,6 +11,7 @@
 #include "c3d/config.hpp"
 #include "c3d/logger.hpp"
 #include "c3d/media.hpp"
+#include "c3d/sensor_blocks.hpp"
 #include "c3d/spool.hpp"
 #include "c3d/transport.hpp"
 #include "c3d/types.hpp"
@@ -68,11 +70,25 @@ struct Stats {
   // The binary streams, counted separately from `records_recorded` because they
   // are not comparable to it: one camera frame is worth tens of thousands of gaze
   // samples in bytes, and a single number covering both answers no question about
-  // either.
+  // either. `camera_frames` counts the access units a chunk took and `lidar_scans`
+  // scans and clouds, each with the bytes handed in.
   std::uint64_t camera_frames = 0;
   std::uint64_t camera_bytes = 0;
   std::uint64_t lidar_scans = 0;
   std::uint64_t lidar_bytes = 0;
+  // Parts closed: video chunks, and scan blocks and cloud objects together.
+  std::uint64_t camera_chunks = 0;
+  std::uint64_t lidar_blocks = 0;
+  // Access units no chunk could take: those after a chunk was closed between
+  // keyframes, until the encoder's next keyframe, and any that changed the stream's
+  // size, frame or parameter sets without one.
+  std::uint64_t camera_access_units_dropped = 0;
+  // Access units refused because they would have taken their chunk past
+  // kMaxVideoChunkBytes. The caller re-encodes them, so they are not lost.
+  std::uint64_t camera_access_units_refused = 0;
+  // Camera chunks the gateway refused as too large (413) and that were deleted, by
+  // camera id: also in chunks_discarded.
+  std::map<std::string, std::uint64_t> camera_chunks_too_large;
 };
 
 // A Cognitive3D session.
@@ -91,8 +107,8 @@ struct Stats {
 //   * All state is mutex-guarded, so Record* may be called from any thread.
 //   * Data reaches disk before an upload is attempted, so a lost network loses
 //     nothing, and a lost robot at most what was batched since the last part was
-//     cut: up to auto_send_interval_s of records, and of camera and lidar up to
-//     their flush bounds.
+//     cut: up to auto_send_interval_s of records, each camera's open video chunk,
+//     and each lidar's open scan block or cloud object.
 class Session {
  public:
   // Fails, loudly, if the config is invalid. In particular an empty scene id or
@@ -161,26 +177,35 @@ class Session {
                      const Quat& rotation);
 
   // ---- The binary streams --------------------------------------------------
-  // Memory-only like every other Record*: the bytes are buffered and a part is
-  // cut on the worker thread when `camera_flush_s`/`camera_flush_bytes` (or the
-  // lidar twins) is reached. Nothing here encodes, compresses or writes.
+  // Memory-only like every other Record*: each sensor's records are grouped into
+  // the unit that becomes one part -- a video chunk, a scan block, a cloud object
+  // (c3d/sensor_blocks.hpp) -- and a closed unit is serialised and spooled on the
+  // worker thread. Nothing here encodes, compresses or writes.
   //
-  // `time_ms` is epoch WALL-CLOCK milliseconds, not the seconds the other
-  // Record* calls take and never ROS time -- the wire field is milliseconds, and
-  // a conversion done here rather than at the caller would be a second place for
-  // the clock rule to be got wrong. `seq` is the caller's per-sensor counter,
-  // because the caller is the one that knows what a sensor is.
+  // `time_ms` (and `entry.time_ms`) is epoch WALL-CLOCK milliseconds, not the
+  // seconds the other Record* calls take and never ROS time -- the wire field is
+  // milliseconds, and a conversion done here rather than at the caller would be a
+  // second place for the clock rule to be got wrong. `seq` is the caller's
+  // per-sensor counter, because the caller is the one that knows what a sensor is.
   //
-  // `fov` is the camera's field of view for THIS frame (see CameraFov), and the
-  // default, 0 by 0, records none. A field of view IsKnownCameraFov refuses is
-  // written as 0 by 0 as well -- the frame is kept, since losing a picture over
-  // its metadata is the worse failure -- and the first such frame per camera in a
-  // session is logged as a warning.
-  void RecordCameraFrame(const std::string& camera_id, std::uint64_t time_ms,
-                         std::uint32_t seq, const std::string& frame_id, const Pose& pose,
-                         const std::string& format, std::uint16_t width,
-                         std::uint16_t height, const std::string& bytes,
-                         const CameraFov& fov = CameraFov{});
+  // `access_unit` is one encoded frame. A keyframe closes the camera's open chunk
+  // and opens the next; any other frame joins the open chunk, or is dropped and
+  // counted in Stats::camera_access_units_dropped when no chunk is open. One that
+  // would take the chunk past kMaxVideoChunkBytes closes it and is refused, and so
+  // is every non-keyframe after it until a keyframe: the caller is to restart its
+  // encoder and re-encode them, from the refused one on (see VideoChunkAssembler).
+  // The fate is kDropped also when no session is active.
+  //
+  // `context.hfov_deg` and `vfov_deg` are the camera's field of view (see
+  // CameraFov), and 0 by 0 records none; a chunk carries its first frame's. A field
+  // of view IsKnownCameraFov refuses is recorded as 0 by 0 as well -- the frame is
+  // kept, since losing a picture over its metadata is the worse failure -- and the
+  // first such frame per camera in a session is logged as a warning.
+  VideoUnitFate RecordCameraAccessUnit(const std::string& camera_id, const SensorEntry& entry,
+                                       const VideoChunkContext& context, std::string access_unit,
+                                       bool keyframe);
+  // A scan with no ranges, or with more than scanblock::kMaxRaysPerScan, is refused
+  // and counted in Stats::records_dropped.
   void RecordLaserScan(const std::string& sensor_id, std::uint64_t time_ms, std::uint32_t seq,
                        const std::string& frame_id, const Pose& pose,
                        const LaserScanData& scan);
@@ -192,7 +217,10 @@ class Session {
                         const EncodedPointCloud& cloud);
 
   // Serialize whatever is batched and hand it to the spool, on the calling thread.
-  // Does not wait for upload.
+  // Does not wait for upload. Every open video chunk, scan block and cloud object
+  // is closed too. A video chunk closed here ends its GOP early, so the camera's
+  // access units until its encoder's next keyframe are dropped and counted in
+  // Stats::camera_access_units_dropped.
   void Flush();
 
   // One upload pass on the calling thread, up to 64 chunks. Intended for tests; the
